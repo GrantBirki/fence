@@ -184,7 +184,8 @@ Job logs can be read by anyone with access to the workflow run. Reports include 
 Fence adds a layer of protection to GitHub Actions jobs by limiting where later steps can send network traffic. Its default `block` mode also turns off passwordless `sudo` and Docker to make those protections harder to undo. Fence is not a complete sandbox, and allowed destinations remain reachable.
 
 - **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the most predictable runner image; `ubuntu-latest` is also regularly tested but can change over time. Fence refuses to start if the runner does not pass its security checks.
-- **Built-in connections:** Some GitHub and runner-platform connections remain open so the job can run and report results. Later steps can also reach those connections and destinations in your `allowlist`.
+- **Built-in GitHub connections:** Fence keeps a limited set of GitHub service and reporting connections open. Later workflow steps can still reach those destinations and anything in your `allowlist`.
+- **Azure platform connections:** Root-owned host processes can reach Azure WireServer (`168.63.129.16`, TCP ports `80` and `32526`). Azure IMDS (`169.254.169.254`, TCP port `80`) remains reachable from host and forwarded traffic, including later workflow steps. These platform exceptions are separate from your `allowlist`.
 - **Tighter GitHub access:** Set `disable_broad_github_domains: true` when your workflow does not need optional GitHub destinations.
 - **GitHub artifacts:** Set `allow_github_artifacts: true` only when the job needs GitHub artifact uploads, GitHub Pages, or caches. The option is off by default and permits a small, bounded artifact-storage egress channel that later workflow steps can also use.
 - **Audit mode:** Reports network activity without blocking it.
