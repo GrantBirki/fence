@@ -16,6 +16,7 @@ const {
   networkReportLines,
   readJsonBounded,
   readLauncherIntegrity,
+  resultsStorageWarnings,
   runtimePaths,
   structuredReportLine,
   summaryLines,
@@ -314,10 +315,8 @@ function main(): void {
       `Fence denied ${userWildcardRequestRejections} DNS request(s) after the user wildcard hostname authorization budget was exhausted`,
     );
   }
-  if (resultsStorageAttributionFailures > 0 || resultsStorageRequestRejections > 0) {
-    log.warning(
-      `Fence rejected ${resultsStorageRequestRejections} GitHub results-storage request(s); ${resultsStorageAttributionFailures} could not be attributed`,
-    );
+  for (const warning of resultsStorageWarnings(dnsEvidence)) {
+    log.warning(warning);
   }
   validateReport(report, true);
   const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
