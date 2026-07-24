@@ -419,7 +419,7 @@ if allow_github_artifacts:
         for item in dns["runner_authorized_results_storage"]
         if item["authorization_origin"] == "opt_in_github_artifact_dns"
     }
-    artifact_fixture_hostname = "productionresultssa17.blob.core.windows.net"
+    artifact_fixture_hostname = "productionresultssa8.blob.core.windows.net"
     require(
         artifact_fixture_hostname in artifact_hostnames,
         "GitHub artifact fixture must prove opt-in results-storage authorization",

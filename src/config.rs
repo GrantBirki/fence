@@ -800,7 +800,7 @@ mod tests {
     fn rejects_exact_runner_authorized_results_storage_destinations() {
         let error = parse_and_normalize(&one_allowance(
             "hostname",
-            "ProductionResultsSA17.Blob.Core.Windows.Net",
+            "ProductionResultsSA8.Blob.Core.Windows.Net",
             "tcp",
             8443,
         ))
@@ -809,17 +809,13 @@ mod tests {
         assert_eq!(error.field.as_deref(), Some("allowlist.destination"));
         assert_eq!(error.index, Some(0));
 
-        let trusted = parse_and_normalize(&one_allowance(
-            "hostname",
-            "productionresultssa19.blob.core.windows.net",
-            "tcp",
-            443,
-        ))
-        .unwrap();
-        assert_eq!(
-            trusted.requested_allowances[0].destination,
-            "productionresultssa19.blob.core.windows.net"
-        );
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            let trusted =
+                parse_and_normalize(&one_allowance("hostname", hostname, "tcp", 443)).unwrap();
+            assert_eq!(trusted.requested_allowances[0].destination, hostname);
+        }
     }
 
     #[test]

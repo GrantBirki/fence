@@ -801,9 +801,16 @@ mod tests {
         );
         assert_eq!(dns.max_dynamic_githubapp_suffix_authorizations, 8);
         assert_eq!(dns.max_dynamic_githubapp_suffix_prefix_labels, 1);
-        assert!(
-            dns.exact_compatibility_hostnames
-                .contains(&"productionresultssa19.blob.core.windows.net")
+        assert_eq!(
+            dns.exact_compatibility_hostnames,
+            [
+                "actions-results-receiver-production.githubapp.com",
+                "productionresultssa19.blob.core.windows.net",
+                "productionresultssa13.blob.core.windows.net",
+                "productionresultssa9.blob.core.windows.net",
+                "productionresultssa15.blob.core.windows.net",
+                "productionresultssa17.blob.core.windows.net",
+            ]
         );
         assert_eq!(dns.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(dns.https_materialization_port, 443);

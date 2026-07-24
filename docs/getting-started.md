@@ -24,7 +24,7 @@ With no inputs, the Action starts Fence in `block` mode with an empty user `allo
 
 Fence allows the core GitHub Actions status and finalization endpoints. The default compatibility profile also includes `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the exact optional hosted-runner watchdog endpoint, and a bounded class of GitHub application hostnames. Set `disable_broad_github_domains: true` to remove those broader platform-origin destinations while retaining the core Actions path.
 
-GitHub uploads job logs and summaries to per-run Azure storage accounts. Fence always permits the exact reviewed compatibility account and can authorize at most four additional exact results-storage hostnames when the DNS request is attributable to the pinned GitHub runner process; it never permits the general `*.blob.core.windows.net` suffix.
+GitHub uploads job logs and summaries to per-run Azure storage accounts. Fence always permits five exact reviewed static compatibility accounts: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. It can authorize at most four additional exact results-storage hostnames when the DNS request is attributable to the pinned GitHub runner process; it never permits the general `*.blob.core.windows.net` suffix.
 
 GitHub artifact uploads, Pages, and caches use a separate action process rather than the pinned runner process. If a job needs those operations, explicitly enable the bounded compatibility option:
 

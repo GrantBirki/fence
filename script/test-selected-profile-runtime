@@ -111,6 +111,26 @@ import re
 import sys
 import time
 
+trusted_results_storage_hostnames = [
+    "productionresultssa19.blob.core.windows.net",
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa9.blob.core.windows.net",
+    "productionresultssa15.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
+]
+expected_bootstrap_hostnames = [
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+    "actions-results-receiver-production.githubapp.com",
+    *trusted_results_storage_hostnames,
+]
+
 report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:5])
 scenario = sys.argv[5]
 deadline = time.monotonic() + 30
@@ -141,18 +161,7 @@ require(report["policy_hash_schema_version"] == 9)
 require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
-require(report["bootstrap_hostnames"] == [
-    "github.com",
-    "api.github.com",
-    "release-assets.githubusercontent.com",
-    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-    "vstoken.actions.githubusercontent.com",
-    "pipelines.actions.githubusercontent.com",
-    "payload.pipelines.actions.githubusercontent.com",
-    "results-receiver.actions.githubusercontent.com",
-    "actions-results-receiver-production.githubapp.com",
-    "productionresultssa19.blob.core.windows.net",
-])
+require(report["bootstrap_hostnames"] == expected_bootstrap_hostnames)
 require(report["network_application_status"] == "applied")
 require(report["network_verification_status"] == "verified")
 require(report["sudo_status"] == "disabled_verified")
@@ -198,18 +207,7 @@ require(dns["authorized_domain_patterns"] == [
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net",
 ])
-require(dns["bootstrap_hostnames"] == [
-    "github.com",
-    "api.github.com",
-    "release-assets.githubusercontent.com",
-    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-    "vstoken.actions.githubusercontent.com",
-    "pipelines.actions.githubusercontent.com",
-    "payload.pipelines.actions.githubusercontent.com",
-    "results-receiver.actions.githubusercontent.com",
-    "actions-results-receiver-production.githubapp.com",
-    "productionresultssa19.blob.core.windows.net",
-])
+require(dns["bootstrap_hostnames"] == expected_bootstrap_hostnames)
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
 require(dns["materialization_request_rejections"] == 0)
@@ -297,7 +295,7 @@ import struct
 
 for hostname in (
     b"codeload.github.com",
-    b"productionresultssa17.blob.core.windows.net",
+    b"productionresultssa8.blob.core.windows.net",
     b"uploads.github.com",
     b"lookalike.payload.pipelines.actions.githubusercontent.com",
 ):

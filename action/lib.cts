@@ -128,6 +128,13 @@ const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
+const STATIC_RESULTS_STORAGE_HOSTNAMES = new Set([
+  "productionresultssa19.blob.core.windows.net",
+  "productionresultssa13.blob.core.windows.net",
+  "productionresultssa9.blob.core.windows.net",
+  "productionresultssa15.blob.core.windows.net",
+  "productionresultssa17.blob.core.windows.net",
+]);
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
 const GITHUB_ARTIFACT_COMPATIBILITY_LIMITATIONS = [
   "github_artifact_compatibility_explicitly_enabled",
@@ -1539,6 +1546,7 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
       Object.keys(authorization).sort().join(",") !== "authorization_origin,hostname" ||
       typeof authorization.hostname !== "string" ||
       !RESULTS_STORAGE_HOSTNAME.test(authorization.hostname) ||
+      STATIC_RESULTS_STORAGE_HOSTNAMES.has(authorization.hostname) ||
       !(
         authorization.authorization_origin === "pinned_runner_worker_dns" ||
         (

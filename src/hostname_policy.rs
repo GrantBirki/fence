@@ -157,6 +157,7 @@ pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostna
 mod tests {
     use super::*;
     use crate::config::parse_and_normalize;
+    use crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES;
 
     fn parse(json: &str) -> NormalizedConfig {
         parse_and_normalize(json.as_bytes()).unwrap()
@@ -208,6 +209,10 @@ mod tests {
                 "results-receiver.actions.githubusercontent.com",
                 "actions-results-receiver-production.githubapp.com",
                 "productionresultssa19.blob.core.windows.net",
+                "productionresultssa13.blob.core.windows.net",
+                "productionresultssa9.blob.core.windows.net",
+                "productionresultssa15.blob.core.windows.net",
+                "productionresultssa17.blob.core.windows.net",
             ]
         );
         assert!(policy.allow_dynamic_githubapp_suffix);
@@ -319,6 +324,10 @@ mod tests {
                 "results-receiver.actions.githubusercontent.com",
                 "actions-results-receiver-production.githubapp.com",
                 "productionresultssa19.blob.core.windows.net",
+                "productionresultssa13.blob.core.windows.net",
+                "productionresultssa9.blob.core.windows.net",
+                "productionresultssa15.blob.core.windows.net",
+                "productionresultssa17.blob.core.windows.net",
             ]
         );
         assert!(!policy.allow_dynamic_githubapp_suffix);
@@ -340,16 +349,22 @@ mod tests {
                 .exact_entry("results-receiver.actions.githubusercontent.com")
                 .is_some()
         );
+        for hostname in GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES {
+            let entry = policy.exact_entry(hostname).unwrap();
+            assert_eq!(entry.origins, [HostnamePolicyOrigin::Platform]);
+            assert_eq!(
+                entry.transports,
+                [HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                }]
+            );
+        }
         assert!(
             policy
-                .exact_entry("productionresultssa19.blob.core.windows.net")
-                .is_some()
-        );
-        assert!(
-            policy
-                .exact_entry("productionresultssa17.blob.core.windows.net")
+                .exact_entry("productionresultssa8.blob.core.windows.net")
                 .is_none(),
-            "artifact storage accounts must remain dynamically mediated"
+            "other results-storage accounts must remain dynamically mediated"
         );
     }
 }

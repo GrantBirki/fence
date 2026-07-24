@@ -13,9 +13,20 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN: &str =
     "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME: &str =
     "productionresultssa19.blob.core.windows.net";
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 2] = [
-    "actions-results-receiver-production.githubapp.com",
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES: [&str; 5] = [
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME,
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa9.blob.core.windows.net",
+    "productionresultssa15.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
+];
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 6] = [
+    "actions-results-receiver-production.githubapp.com",
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES[0],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES[1],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES[2],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES[3],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES[4],
 ];
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 4] = [
     "github.com",
@@ -125,9 +136,12 @@ pub(crate) fn matches_results_storage_hostname(hostname: &str) -> bool {
     !account.is_empty() && account.len() <= 5 && account.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+pub(crate) fn is_trusted_results_storage_hostname(hostname: &str) -> bool {
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES.contains(&hostname)
+}
+
 pub(crate) fn is_runner_authorized_results_storage_hostname(hostname: &str) -> bool {
-    hostname != GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
-        && matches_results_storage_hostname(hostname)
+    matches_results_storage_hostname(hostname) && !is_trusted_results_storage_hostname(hostname)
 }
 
 pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
@@ -238,6 +252,10 @@ mod tests {
             [
                 "actions-results-receiver-production.githubapp.com",
                 "productionresultssa19.blob.core.windows.net",
+                "productionresultssa13.blob.core.windows.net",
+                "productionresultssa9.blob.core.windows.net",
+                "productionresultssa15.blob.core.windows.net",
+                "productionresultssa17.blob.core.windows.net",
             ]
         );
         assert_eq!(profile.max_dynamic_actions_suffix_authorizations, 8);
@@ -353,11 +371,16 @@ mod tests {
         ] {
             assert!(!matches_results_storage_hostname(hostname));
         }
-        assert!(!is_runner_authorized_results_storage_hostname(
-            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
+        for hostname in GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES {
+            assert!(matches_results_storage_hostname(hostname));
+            assert!(is_trusted_results_storage_hostname(hostname));
+            assert!(!is_runner_authorized_results_storage_hostname(hostname));
+        }
+        assert!(!is_trusted_results_storage_hostname(
+            "productionresultssa8.blob.core.windows.net"
         ));
         assert!(is_runner_authorized_results_storage_hostname(
-            "productionresultssa17.blob.core.windows.net"
+            "productionresultssa8.blob.core.windows.net"
         ));
         assert_eq!(
             opt_out.bootstrap_hostnames,
