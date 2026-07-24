@@ -1783,11 +1783,30 @@ test("validates stable runtime evidence", () => {
   validateDnsEvidence({
     ...dnsEvidence,
     runner_authorized_results_storage: [{
-      hostname: "productionresultssa17.blob.core.windows.net",
+      hostname: "productionresultssa8.blob.core.windows.net",
       authorization_origin: "pinned_runner_worker_dns",
     }],
     results_storage_authorization_count: 1,
   }, report);
+  for (const hostname of [
+    "productionresultssa19.blob.core.windows.net",
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa9.blob.core.windows.net",
+    "productionresultssa15.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
+  ]) {
+    assert.throws(
+      () => validateDnsEvidence({
+        ...dnsEvidence,
+        runner_authorized_results_storage: [{
+          hostname,
+          authorization_origin: "pinned_runner_worker_dns",
+        }],
+        results_storage_authorization_count: 1,
+      }, report),
+      /invalid results-storage authorization/,
+    );
+  }
   const wildcardPolicy = {
     exact: [],
     user_wildcards: [
@@ -1901,7 +1920,7 @@ test("validates stable runtime evidence", () => {
     () => validateDnsEvidence({
       ...dnsEvidence,
       runner_authorized_results_storage: [{
-        hostname: "productionresultssa17.blob.core.windows.net",
+        hostname: "productionresultssa8.blob.core.windows.net",
         authorization_origin: "workflow_dns",
       }],
       results_storage_authorization_count: 1,
@@ -1941,7 +1960,7 @@ test("validates bounded GitHub artifact authorizations against the opted-in poli
       authorization_origin: "pinned_runner_worker_dns",
     },
     {
-      hostname: "productionresultssa13.blob.core.windows.net",
+      hostname: "productionresultssa14.blob.core.windows.net",
       authorization_origin: "pinned_runner_worker_dns",
     },
   ];
@@ -1969,7 +1988,7 @@ test("validates bounded GitHub artifact authorizations against the opted-in poli
       runner_authorized_results_storage: [
         ...authorizations,
         {
-          hostname: "productionresultssa14.blob.core.windows.net",
+          hostname: "productionresultssa16.blob.core.windows.net",
           authorization_origin: "opt_in_github_artifact_dns",
         },
       ],
@@ -2984,11 +3003,11 @@ test("renders a concise healthy block results table without raw evidence fields"
         resolved_addresses: ["2001:db8::1"],
       },
       {
-        hostname: "productionresultssa17.blob.core.windows.net",
+        hostname: "productionresultssa8.blob.core.windows.net",
         query_type: "a",
         policy_classification: "runner_authorized_results_storage",
         occurrences: 1,
-        resolved_addresses: ["192.0.2.17"],
+        resolved_addresses: ["192.0.2.8"],
       },
       {
         hostname: "result-storage-cname.example.net",
@@ -3033,7 +3052,7 @@ test("renders a concise healthy block results table without raw evidence fields"
   assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 A queries \|/);
   assert.match(summary, /\| `github.com` \| ⛔ Blocked \| 1 TYPE15 query \|/);
   assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
-  assert.match(summary, /\| `productionresultssa17.blob.core.windows.net` \| ✅ Allowed \| 1 A query \|/);
+  assert.match(summary, /\| `productionresultssa8.blob.core.windows.net` \| ✅ Allowed \| 1 A query \|/);
   assert.match(summary, /\| `result-storage-cname.example.net` \| ✅ Allowed \| 1 AAAA query \|/);
   assert.match(summary, /\| `auth.docker.io` \| ✅ Allowed \| 1 A query \|/);
   assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);

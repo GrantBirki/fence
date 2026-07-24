@@ -51,10 +51,9 @@ use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
-    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
-    is_optional_github_hosted_workflow_bootstrap_hostname, matches_results_storage_hostname,
-    reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
+    is_optional_github_hosted_workflow_bootstrap_hostname, is_trusted_results_storage_hostname,
+    matches_results_storage_hostname, reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
 use crate::runtime::{
     ProductionRuntimeStore, RuntimeDocumentStore, RuntimeError, TestRuntimeStore,
@@ -5225,7 +5224,7 @@ fn requires_runner_results_storage_provenance(
     state: &CnameAuthorizationState,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
-    if hostname == GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
+    if is_trusted_results_storage_hostname(hostname)
         && matches_exact_platform_hostname(hostname, hostname_policy)
     {
         return false;
@@ -6561,7 +6560,7 @@ mod tests {
         let (submitter, requests) = materialization_request_channel();
         let (recorder, report_path) =
             test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
-        let hostname = "productionresultssa17.blob.core.windows.net";
+        let hostname = "productionresultssa8.blob.core.windows.net";
         {
             let mut authorizations = recorder.cname_authorizations.lock().unwrap();
             assert!(authorized_hostname(
@@ -6576,7 +6575,7 @@ mod tests {
             recorder.record_response(
                 hostname,
                 1,
-                &response_with_address(hostname, 1, 60, &[192, 0, 2, 17]),
+                &response_with_address(hostname, 1, 60, &[192, 0, 2, 8]),
                 None,
             )
         });
@@ -6881,7 +6880,7 @@ mod tests {
         )
         .unwrap();
         let exact_policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
-        let target = "productionresultssa17.blob.core.windows.net";
+        let target = "productionresultssa8.blob.core.windows.net";
 
         for (scope, hostname, policy) in [
             (
@@ -7498,12 +7497,18 @@ mod tests {
             "hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
             &opt_out
         ));
-        assert!(matches_selected_profile_pattern(
-            "productionresultssa19.blob.core.windows.net",
-            &policy
-        ));
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            assert!(matches_selected_profile_pattern(hostname, &policy));
+            assert!(matches_selected_profile_pattern(hostname, &opt_out));
+            assert_eq!(
+                policy_classification(hostname, &authorizations, &policy),
+                "platform_profile"
+            );
+        }
         assert!(!matches_selected_profile_pattern(
-            "productionresultssa17.blob.core.windows.net",
+            "productionresultssa8.blob.core.windows.net",
             &policy
         ));
         assert!(!matches_selected_profile_pattern(
@@ -7577,15 +7582,20 @@ mod tests {
         }
 
         let policy = test_hostname_policy(false);
+        let opt_out_policy = test_hostname_policy(true);
         let now = Instant::now();
         let mut authorizations = CnameAuthorizationState::default();
-        assert!(authorized_hostname(
-            "productionresultssa19.blob.core.windows.net",
-            &mut authorizations,
-            now,
-            &policy,
-            DnsQueryProvenance::Untrusted,
-        ));
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            assert!(authorized_hostname(
+                hostname,
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
         assert!(authorizations.runner_authorized_results_storage.is_empty());
         assert!(!authorized_hostname(
             "productionresultssa1.blob.core.windows.net",
@@ -7638,11 +7648,27 @@ mod tests {
         assert_eq!(evidence.results_storage_request_rejections, 1);
 
         let mut opt_out_authorizations = CnameAuthorizationState::default();
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            assert!(authorized_hostname(
+                hostname,
+                &mut opt_out_authorizations,
+                now,
+                &opt_out_policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        assert!(
+            opt_out_authorizations
+                .runner_authorized_results_storage
+                .is_empty()
+        );
         assert!(authorized_hostname(
-            "productionresultssa17.blob.core.windows.net",
+            "productionresultssa8.blob.core.windows.net",
             &mut opt_out_authorizations,
             now,
-            &test_hostname_policy(true),
+            &opt_out_policy,
             DnsQueryProvenance::TrustedRunnerWorker,
         ));
     }
@@ -7703,7 +7729,7 @@ mod tests {
             ),
             "runner_authorized_results_storage"
         );
-        for account in [12, 13] {
+        for account in [12, 14] {
             assert!(authorized_hostname(
                 &format!("productionresultssa{account}.blob.core.windows.net"),
                 &mut authorizations,
@@ -7718,7 +7744,7 @@ mod tests {
         );
         assert_eq!(authorizations.artifact_authorized_results_storage.len(), 3);
         assert!(!authorized_hostname(
-            "productionresultssa14.blob.core.windows.net",
+            "productionresultssa16.blob.core.windows.net",
             &mut authorizations,
             now,
             &artifact_policy,
@@ -7728,7 +7754,7 @@ mod tests {
         assert!(
             !authorizations
                 .artifact_authorized_results_storage
-                .contains("productionresultssa14.blob.core.windows.net")
+                .contains("productionresultssa16.blob.core.windows.net")
         );
 
         let evidence = evidence_from_state_and_authorizations(
@@ -7818,7 +7844,7 @@ mod tests {
         let policy = test_hostname_policy(false);
         let now = Instant::now();
         let mut authorizations = CnameAuthorizationState::default();
-        let root = "productionresultssa17.blob.core.windows.net";
+        let root = "productionresultssa8.blob.core.windows.net";
         assert!(authorized_hostname(
             root,
             &mut authorizations,
@@ -7862,7 +7888,7 @@ mod tests {
     fn results_storage_cname_targets_cannot_silently_admit_another_account() {
         let now = Instant::now();
         let policy = test_hostname_policy(false);
-        let root = "productionresultssa17.blob.core.windows.net";
+        let root = "productionresultssa8.blob.core.windows.net";
         let target = "productionresultssa18.blob.core.windows.net";
         let mut authorizations = CnameAuthorizationState::default();
         assert!(authorized_hostname(
@@ -7906,43 +7932,46 @@ mod tests {
         )
         .unwrap();
         let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
-        let target = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME;
-        let mut authorizations = CnameAuthorizationState::default();
-        let response = validate_dns_response_lineage(
-            "user.example",
-            &DnsAnswerRecords {
-                aliases: vec![DnsCnameAnswer {
-                    owner: "user.example".to_owned(),
-                    target: target.to_owned(),
-                    ttl_seconds: 60,
-                }],
-                addresses: vec![DnsAddressAnswer {
-                    hostname: target.to_owned(),
-                    address: "192.0.2.19".parse().unwrap(),
-                    ttl_seconds: 60,
-                }],
-            },
-            &authorizations,
-            Instant::now(),
-            &policy,
-        )
-        .unwrap();
+        for target in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            let mut authorizations = CnameAuthorizationState::default();
+            let response = validate_dns_response_lineage(
+                "user.example",
+                &DnsAnswerRecords {
+                    aliases: vec![DnsCnameAnswer {
+                        owner: "user.example".to_owned(),
+                        target: target.to_owned(),
+                        ttl_seconds: 60,
+                    }],
+                    addresses: vec![DnsAddressAnswer {
+                        hostname: target.to_owned(),
+                        address: "192.0.2.19".parse().unwrap(),
+                        ttl_seconds: 60,
+                    }],
+                },
+                &authorizations,
+                Instant::now(),
+                &policy,
+            )
+            .unwrap();
 
-        assert!(!response.requires_runner_provenance);
-        assert_eq!(response.materializations[0].hostname, target);
-        assert_eq!(response.materializations[0].port, 443);
-        assert!(commit_dns_response_authorizations(
-            &mut authorizations,
-            response,
-        ));
-        assert!(authorizations.runner_authorized_results_storage.is_empty());
-        assert!(authorizations.active.contains_key(target));
+            assert!(!response.requires_runner_provenance);
+            assert_eq!(response.materializations[0].hostname, target);
+            assert_eq!(response.materializations[0].port, 443);
+            assert!(commit_dns_response_authorizations(
+                &mut authorizations,
+                response,
+            ));
+            assert!(authorizations.runner_authorized_results_storage.is_empty());
+            assert!(authorizations.active.contains_key(target));
+        }
     }
 
     #[test]
     fn untrusted_and_unattributed_results_storage_queries_fail_closed() {
         let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
-        let request = query("productionresultssa17.blob.core.windows.net", 1);
+        let request = query("productionresultssa8.blob.core.windows.net", 1);
         let parsed = parse_dns_question(&request);
         let docker = DnsQueryClient {
             listener_kind: DnsListenerKind::Docker,
@@ -7960,12 +7989,17 @@ mod tests {
             query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap(),
             DnsQueryDispatch::RetryableFailure(Some("outside_policy"))
         );
-        let trusted_static = query("productionresultssa19.blob.core.windows.net", 28);
-        let parsed_static = parse_dns_question(&trusted_static);
-        assert_eq!(
-            query_for_upstream(&recorder, &trusted_static, parsed_static.as_ref(), None).unwrap(),
-            DnsQueryDispatch::Forward(trusted_static, None)
-        );
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            let trusted_static = query(hostname, 28);
+            let parsed_static = parse_dns_question(&trusted_static);
+            assert_eq!(
+                query_for_upstream(&recorder, &trusted_static, parsed_static.as_ref(), None)
+                    .unwrap(),
+                DnsQueryDispatch::Forward(trusted_static, None)
+            );
+        }
         let state = recorder.state.lock().unwrap();
         assert_eq!(state.results_storage_authorization_count, 0);
         assert_eq!(state.results_storage_attribution_failures, 1);
@@ -8037,7 +8071,7 @@ mod tests {
     #[test]
     fn audit_forwards_unattributed_results_storage_without_calling_it_allowed() {
         let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
-        let request = query("productionresultssa17.blob.core.windows.net", 1);
+        let request = query("productionresultssa8.blob.core.windows.net", 1);
         let parsed = parse_dns_question(&request);
         let dispatch = query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap();
         assert_eq!(
@@ -8045,20 +8079,20 @@ mod tests {
             DnsQueryDispatch::Forward(request, Some("outside_policy"))
         );
         recorder.record_query(
-            "productionresultssa17.blob.core.windows.net",
+            "productionresultssa8.blob.core.windows.net",
             1,
             true,
             Some("outside_policy"),
         );
         assert_eq!(
             recorder.record_response(
-                "productionresultssa17.blob.core.windows.net",
+                "productionresultssa8.blob.core.windows.net",
                 1,
                 &response_with_address(
-                    "productionresultssa17.blob.core.windows.net",
+                    "productionresultssa8.blob.core.windows.net",
                     1,
                     60,
-                    &[192, 0, 2, 17],
+                    &[192, 0, 2, 8],
                 ),
                 Some("outside_policy"),
             ),
@@ -8077,14 +8111,14 @@ mod tests {
             state
                 .retained
                 .get(&(
-                    "productionresultssa17.blob.core.windows.net".to_owned(),
+                    "productionresultssa8.blob.core.windows.net".to_owned(),
                     1,
                     "outside_policy",
                 ))
                 .is_some_and(|observation| {
                     observation
                         .resolved_addresses
-                        .contains(&"192.0.2.17".parse().unwrap())
+                        .contains(&"192.0.2.8".parse().unwrap())
                 })
         );
         drop(state);
@@ -8127,10 +8161,11 @@ mod tests {
             "hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
             1,
         ));
-        assert!(
-            DnsEvidenceScope::SelectedProfileRuntimeTest
-                .forward_query("productionresultssa19.blob.core.windows.net", 1)
-        );
+        for hostname in
+            crate::platform_profile::GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAMES
+        {
+            assert!(DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query(hostname, 1));
+        }
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
@@ -8148,7 +8183,7 @@ mod tests {
         );
         assert!(
             !DnsEvidenceScope::SelectedProfileRuntimeTest
-                .forward_query("productionresultssa17.blob.core.windows.net", 1)
+                .forward_query("productionresultssa8.blob.core.windows.net", 1)
         );
         assert!(
             !DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("uploads.github.com", 1)
@@ -8159,7 +8194,7 @@ mod tests {
         );
         assert!(
             DnsEvidenceScope::ProtectedHostAudit
-                .forward_query("productionresultssa17.blob.core.windows.net", 1)
+                .forward_query("productionresultssa8.blob.core.windows.net", 1)
         );
         assert!(DnsEvidenceScope::ProtectedHostAudit.forward_query("api.github.com", 16));
         let response = refused_response(&query("api.github.com", 1)).unwrap();
@@ -8500,7 +8535,7 @@ mod tests {
         )
         .unwrap();
         let results_policy = crate::hostname_policy::build_runtime_hostname_policy(&results_config);
-        let results_hostname = "productionresultssa17.blob.core.windows.net";
+        let results_hostname = "productionresultssa8.blob.core.windows.net";
         let mut results_authorizations = CnameAuthorizationState::default();
         assert!(!authorized_hostname(
             results_hostname,
@@ -10591,7 +10626,7 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_runner_authorized_results_storage_materialization() {
-        let hostname = "productionresultssa17.blob.core.windows.net";
+        let hostname = "productionresultssa8.blob.core.windows.net";
         let mut policy = test_hostname_policy(false);
         policy.exact.push(ExactHostnamePolicy {
             hostname: hostname.to_owned(),
@@ -10606,7 +10641,7 @@ mod tests {
         let error = pending_materializations_from_bootstrap_response(
             hostname,
             1,
-            &response_with_address(hostname, 1, 60, &[192, 0, 2, 17]),
+            &response_with_address(hostname, 1, 60, &[192, 0, 2, 8]),
             Instant::now(),
             &policy,
         )
@@ -10622,11 +10657,11 @@ mod tests {
     #[test]
     fn bootstrap_rejects_cname_delegation_to_runner_authorized_results_storage() {
         let hostname = "github.com";
-        let target = "productionresultssa17.blob.core.windows.net";
+        let target = "productionresultssa8.blob.core.windows.net";
         let error = pending_materializations_from_bootstrap_response(
             hostname,
             1,
-            &response_with_cname_and_address(hostname, target, 60, 60, &[192, 0, 2, 17]),
+            &response_with_cname_and_address(hostname, target, 60, 60, &[192, 0, 2, 8]),
             Instant::now(),
             &test_hostname_policy(false),
         )

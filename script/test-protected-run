@@ -245,6 +245,33 @@ import time
 scenario = sys.argv[1]
 report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:5])
 unit = sys.argv[5]
+trusted_results_storage_hostnames = [
+    "productionresultssa19.blob.core.windows.net",
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa9.blob.core.windows.net",
+    "productionresultssa15.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
+]
+default_bootstrap_hostnames = [
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+    "actions-results-receiver-production.githubapp.com",
+    *trusted_results_storage_hostnames,
+]
+opt_out_bootstrap_hostnames = [
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+    "actions-results-receiver-production.githubapp.com",
+    *trusted_results_storage_hostnames,
+]
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -254,18 +281,7 @@ expected_by_scenario = {
         "protection_available": True,
         "sudo_status": "disabled_verified",
         "container_status": "disabled_verified",
-        "bootstrap_hostnames": [
-            "github.com",
-            "api.github.com",
-            "release-assets.githubusercontent.com",
-            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-            "actions-results-receiver-production.githubapp.com",
-            "productionresultssa19.blob.core.windows.net",
-        ],
+        "bootstrap_hostnames": default_bootstrap_hostnames,
     },
     "standard-opt-out": {
         "mode": "block",
@@ -275,14 +291,7 @@ expected_by_scenario = {
         "protection_available": True,
         "sudo_status": "disabled_verified",
         "container_status": "disabled_verified",
-        "bootstrap_hostnames": [
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-            "actions-results-receiver-production.githubapp.com",
-            "productionresultssa19.blob.core.windows.net",
-        ],
+        "bootstrap_hostnames": opt_out_bootstrap_hostnames,
     },
     "unsafe-preserve": {
         "mode": "block",
@@ -292,18 +301,7 @@ expected_by_scenario = {
         "protection_available": False,
         "sudo_status": "disabled_verified",
         "container_status": "preserved_unsafe",
-        "bootstrap_hostnames": [
-            "github.com",
-            "api.github.com",
-            "release-assets.githubusercontent.com",
-            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-            "actions-results-receiver-production.githubapp.com",
-            "productionresultssa19.blob.core.windows.net",
-        ],
+        "bootstrap_hostnames": default_bootstrap_hostnames,
     },
     "wildcard-docker": {
         "mode": "block",
@@ -313,18 +311,7 @@ expected_by_scenario = {
         "protection_available": False,
         "sudo_status": "disabled_verified",
         "container_status": "preserved_unsafe",
-        "bootstrap_hostnames": [
-            "github.com",
-            "api.github.com",
-            "release-assets.githubusercontent.com",
-            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-            "actions-results-receiver-production.githubapp.com",
-            "productionresultssa19.blob.core.windows.net",
-        ],
+        "bootstrap_hostnames": default_bootstrap_hostnames,
     },
     "audit": {
         "mode": "audit",
@@ -334,18 +321,7 @@ expected_by_scenario = {
         "protection_available": False,
         "sudo_status": "preserved_verified",
         "container_status": "preserved_verified",
-        "bootstrap_hostnames": [
-            "github.com",
-            "api.github.com",
-            "release-assets.githubusercontent.com",
-            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-            "actions-results-receiver-production.githubapp.com",
-            "productionresultssa19.blob.core.windows.net",
-        ],
+        "bootstrap_hostnames": default_bootstrap_hostnames,
     },
 }
 expected_by_scenario["standard-finalization"] = expected_by_scenario["standard"]
@@ -551,7 +527,11 @@ case "$scenario" in
       https://api.github.com \
       https://release-assets.githubusercontent.com \
       https://hosted-compute-watchdog-prod-eus-01.githubapp.com \
-      https://productionresultssa19.blob.core.windows.net; do
+      https://productionresultssa19.blob.core.windows.net \
+      https://productionresultssa13.blob.core.windows.net \
+      https://productionresultssa9.blob.core.windows.net \
+      https://productionresultssa15.blob.core.windows.net \
+      https://productionresultssa17.blob.core.windows.net; do
       probe_https_once "$url"
     done
     ;;
@@ -565,7 +545,14 @@ case "$scenario" in
         die "protected broad-domain opt-out unexpectedly allowed $url"
       fi
     done
-    probe_https_once https://productionresultssa19.blob.core.windows.net
+    for url in \
+      https://productionresultssa19.blob.core.windows.net \
+      https://productionresultssa13.blob.core.windows.net \
+      https://productionresultssa9.blob.core.windows.net \
+      https://productionresultssa15.blob.core.windows.net \
+      https://productionresultssa17.blob.core.windows.net; do
+      probe_https_once "$url"
+    done
     ;;
   wildcard-docker)
     probe_https_once https://auth.docker.io

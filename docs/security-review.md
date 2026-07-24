@@ -9,23 +9,7 @@ attacker capabilities, abuse paths, and residual-risk priorities are defined in
 the frozen [`threat-model.md`](threat-model.md); normative behavior and schemas
 remain in [`v0.md`](v0.md).
 
-Fence intentionally supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
-Standard block mode reduces arbitrary outbound egress, disables measured
-passwordless sudo and container-control paths, and keeps resident controls
-active until ephemeral runner teardown. It does not claim sandboxing, kernel
-isolation, or elimination of every exfiltration channel. The selected GitHub
-workflow-bootstrap profile and its bounded DNS mediation remain disclosed
-channels that later workflow code may use. The exact `github.com`,
-`api.github.com`, `release-assets.githubusercontent.com`, the optional exact
-watchdog root, and up to eight single-label `*.githubapp.com` names are
-intentional compatibility exceptions by default. Workflows may set
-`disable_broad_github_domains: true` to remove those broad GitHub channels while
-keeping core Actions status and finalization endpoints available. GitHub
-results storage has one exact static compatibility root,
-`productionresultssa19.blob.core.windows.net`; Fence may additionally authorize
-at most four exact matching accounts requested by the pinned `Runner.Worker`
-process by default. Block-only `allow_github_artifacts: true` explicitly extends the same four-account budget to uniquely attributed, runner-UID-matching descendants of that pinned worker and records the reduced assurance. Every approved answer remains withheld until its TCP `443` rule is
-applied and verified.
+Fence intentionally supports only GitHub-hosted `ubuntu-24.04` x64 host jobs. Standard block mode reduces arbitrary outbound egress, disables measured passwordless sudo and container-control paths, and keeps resident controls active until ephemeral runner teardown. It does not claim sandboxing, kernel isolation, or elimination of every exfiltration channel. The selected GitHub workflow-bootstrap profile and its bounded DNS mediation remain disclosed channels that later workflow code may use. The exact `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the optional exact watchdog root, and up to eight single-label `*.githubapp.com` names are intentional compatibility exceptions by default. Workflows may set `disable_broad_github_domains: true` to remove those broad GitHub channels while keeping core Actions status and finalization endpoints available. GitHub results storage has five exact reviewed static compatibility roots: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. Fence may additionally authorize at most four exact matching accounts requested by the pinned `Runner.Worker` process by default. Block-only `allow_github_artifacts: true` explicitly extends the same four-account budget to uniquely attributed, runner-UID-matching descendants of that pinned worker and records the reduced assurance. Every approved answer remains withheld until its TCP `443` rule is applied and verified.
 
 ## Release Provenance
 
@@ -220,23 +204,13 @@ queue delay.
 
 ### Runner-Bound And Explicitly Opted-In Results-Storage Authorization
 
-GitHub's runner uploads job logs and summaries to signed Azure Blob URLs. A
-static numeric account list would be brittle, while a general
-`*.blob.core.windows.net` rule would authorize unrelated globally registered
-storage accounts. Fence instead routes host DNS directly to its local mediator,
-pins the unique reviewed `Runner.Worker` identity, and authorizes at most four
-exact `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts only when a matching host DNS socket belongs to that pinned process by default. PID reuse, executable replacement, ambiguous ownership, Docker-originated requests, and ordinary workflow-process requests fail closed. The DNS answer remains withheld until TCP `443` access is atomically applied and structurally verified.
+GitHub's runner uploads job logs and summaries to signed Azure Blob URLs. An unbounded static numeric account list would be brittle, while a general `*.blob.core.windows.net` rule would authorize unrelated globally registered storage accounts. Fence instead permits five exact reviewed static compatibility roots, routes host DNS directly to its local mediator, pins the unique reviewed `Runner.Worker` identity, and authorizes at most four additional exact `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts only when a matching host DNS socket belongs to that pinned process by default. PID reuse, executable replacement, ambiguous ownership, Docker-originated requests, and ordinary workflow-process requests fail closed. The DNS answer remains withheld until TCP `443` access is atomically applied and structurally verified.
 
 Block-only `allow_github_artifacts: true` is an explicit, default-off compatibility exception for GitHub artifact, Pages, and cache actions. It accepts a uniquely owned host DNS socket from a runner-UID-matching, bounded descendant of the pinned `Runner.Worker`, records origin `opt_in_github_artifact_dns`, and shares the existing maximum of four exact dynamic accounts with runner-authorized traffic. It revalidates the reviewed worker identity, descendant start time and ancestry, unique socket owner, strict account grammar, CNAME and TTL bounds, TCP-`443`-only materialization, and structural firewall verification. It rejects Docker, wrong-UID, unrelated or ambiguous sockets, general Azure Blob Storage, and enabled artifact compatibility in audit mode.
 
 The opt-in changes the trust boundary: neither the account-name grammar nor the requesting process proves GitHub owns the account, that the official artifact action made the request, or that uploaded files are safe. Later workflow code can use an authorized account to upload source, secrets, or other data. Runtime evidence and the post-job report must explicitly identify the enabled option, exact account provenance, and artifact-upload warning.
 
-The exact `productionresultssa19.blob.core.windows.net` account is a deliberate
-compatibility exception published in [GitHub's Actions domain
-inventory](https://api.github.com/meta). It is
-available without process attribution, while every other matching account
-continues to require the runner-bound authorization above. Fence does not allow
-the general Azure Blob suffix.
+The exact `productionresultssa19.blob.core.windows.net` compatibility account appears in [GitHub's Actions domain inventory](https://api.github.com/meta). Fence also permits the exact source-reviewed `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net` accounts. These five static roots are available without process attribution, while every other matching account continues to require the runner-bound authorization above. Fence does not allow the general Azure Blob suffix.
 
 Configuration rejects exact user entries for every non-static matching account before mutation, and bootstrap response processing independently refuses to materialize any hostname marked as requiring runner provenance. Response-local CNAME lineage also rejects non-static matching targets, so exact and wildcard user hostnames cannot turn a restricted account into an unattributed derived allowance. User wildcard policy remains lazy and cannot bypass the same attribution and four-account cap.
 
@@ -260,7 +234,7 @@ compile TypeScript at workflow runtime. See Node's
   `disable_broad_github_domains: true` removes those broad channels but retains
   core Actions status/finalization channels.
 - Explicit user wildcard patterns may contain one or two leading whole-label wildcards and authorize at most eight concrete names per invocation across all patterns. Each `*` matches exactly one DNS label, but the admitted query labels, matching HTTPS destinations, shared resolved addresses, and bounded external CNAME descendants remain exfiltration channels. Fence validates DNS structure rather than registrable-domain ownership and carries no public-suffix database.
-- The exact `productionresultssa19.blob.core.windows.net` account is always a reachable TCP `443` compatibility channel. Other exact matching results-storage accounts are restricted to the pinned runner by default; explicitly enabled artifact compatibility extends the same bounded budget to uniquely attributed, runner-UID-matching descendants of the pinned worker.
+- The five exact reviewed static results-storage accounts are always reachable TCP `443` compatibility channels. Other exact matching results-storage accounts are restricted to the pinned runner by default; explicitly enabled artifact compatibility extends the same bounded four-account dynamic budget to uniquely attributed, runner-UID-matching descendants of the pinned worker.
 - A runner-authorized or explicitly artifact-authorized results-storage account is also reachable by later workflow code at its resolved HTTPS addresses. Fence does not prove GitHub account ownership, authenticate an official action, inspect signed URLs, credentials, or encrypted request content, or prevent artifact-based data exfiltration.
 - The fixed upstream DNS resolver remains a trusted platform dependency. Fence
   bounds, canonicalizes, and filters requests and validates response source and
