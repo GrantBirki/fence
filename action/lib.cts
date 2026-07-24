@@ -1868,7 +1868,9 @@ function resultsStorageWarnings(dnsEvidence: any): string[] {
   }
   if (dnsEvidence?.runner_authorized_results_storage_truncated === true) {
     warnings.push(
-      `Fence denied additional GitHub results-storage requests after reaching the ${MAX_RESULTS_STORAGE_AUTHORIZATIONS}-account authorization limit`,
+      dnsEvidence.mode === "audit"
+        ? `Fence observed additional GitHub results-storage requests that would exceed the ${MAX_RESULTS_STORAGE_AUTHORIZATIONS}-account authorization limit in block mode`
+        : `Fence denied additional GitHub results-storage requests after reaching the ${MAX_RESULTS_STORAGE_AUTHORIZATIONS}-account authorization limit`,
     );
   }
   return warnings;
@@ -1915,7 +1917,11 @@ function resultsStorageWarningRows(dnsEvidence: any): string[] {
     rows.push(`| ⚠️ GitHub results-storage requests were rejected | ${markdownCode(requestRejections)} |`);
   }
   if (truncated) {
-    rows.push("| ⚠️ Additional results-storage accounts were denied after the authorization limit | `1+` |");
+    rows.push(
+      dnsEvidence.mode === "audit"
+        ? "| ⚠️ Additional results-storage accounts would exceed the authorization limit in block mode | `1+` |"
+        : "| ⚠️ Additional results-storage accounts were denied after the authorization limit | `1+` |",
+    );
   }
   return rows;
 }

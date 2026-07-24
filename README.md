@@ -153,6 +153,8 @@ flowchart LR
 
 At the end of each job, Fence adds a readable network activity table to the GitHub job summary and the Fence post-job log. The log also includes one bounded, machine-readable `FENCE_REPORT_JSON=` record containing sanitized network decisions, control results, warnings, and suggested audit-mode allowlist entries.
 
+Blocked requests in `block` mode are normal: Fence records them without marking a healthy job as a warning. Warnings highlight failed caller attribution, exhausted account limits, weakened controls, or missing evidence. In `audit` mode, Fence reports what `block` mode would deny; it does not block the request.
+
 Find the job and fetch its report through the GitHub API:
 
 ```bash
@@ -185,9 +187,10 @@ Fence adds a layer of protection to GitHub Actions jobs by limiting where later 
 
 - **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the most predictable runner image; `ubuntu-latest` is also regularly tested but can change over time. Fence refuses to start if the runner does not pass its security checks.
 - **Built-in GitHub connections:** Fence keeps a limited set of GitHub service and reporting connections open. Later workflow steps can still reach those destinations and anything in your `allowlist`.
+- **GitHub results storage:** Fence trusts five exact HTTPS destinations: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. The GitHub runner may separately authorize up to four additional exact accounts. General Azure Blob Storage is not allowed.
 - **Azure platform connections:** Root-owned host processes can reach Azure WireServer (`168.63.129.16`, TCP ports `80` and `32526`). Azure IMDS (`169.254.169.254`, TCP port `80`) remains reachable from host and forwarded traffic, including later workflow steps. These platform exceptions are separate from your `allowlist`.
 - **Tighter GitHub access:** Set `disable_broad_github_domains: true` when your workflow does not need optional GitHub destinations.
-- **GitHub artifacts:** Set `allow_github_artifacts: true` only when the job needs GitHub artifact uploads, GitHub Pages, or caches. The option is off by default and permits a small, bounded artifact-storage egress channel that later workflow steps can also use.
+- **GitHub artifacts:** Set `allow_github_artifacts: true` only when the job needs GitHub artifact uploads, GitHub Pages, or caches. The option is off by default, shares the same four-account limit, and permits an artifact-storage egress channel that later workflow steps can also use.
 - **Audit mode:** Reports network activity without blocking it.
 - **Docker access:** `container_policy: unsafe_preserve` keeps Docker available but provides weaker protection.
 - **Release pinning:** Use the full, immutable `action_commit` SHA from a published release.

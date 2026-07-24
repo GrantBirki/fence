@@ -2465,6 +2465,73 @@ test("warns when the results-storage authorization capacity is exhausted", () =>
   }
 });
 
+test("reports exhausted audit results-storage capacity without claiming a request was denied", () => {
+  const auditReport = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+  };
+  const authorizations = [8, 10, 11, 12].map((account) => ({
+    hostname: `productionresultssa${account}.blob.core.windows.net`,
+    authorization_origin: "pinned_runner_worker_dns",
+  }));
+  const hostname = "productionresultssa14.blob.core.windows.net";
+  const dnsEvidence = dnsEvidenceFor(auditReport, {
+    observations: [{
+      hostname,
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: ["198.51.100.14"],
+    }],
+    runner_authorized_results_storage: authorizations,
+    runner_authorized_results_storage_truncated: true,
+    results_storage_authorization_count: authorizations.length,
+    results_storage_request_rejections: 0,
+  });
+  const capacityWarning =
+    "Fence observed additional GitHub results-storage requests that would exceed the 4-account authorization limit in block mode";
+
+  validateReport(auditReport);
+  validateDnsEvidence(dnsEvidence, auditReport);
+  assert.deepEqual(resultsStorageWarnings(dnsEvidence), [capacityWarning]);
+
+  const document = parsedStructuredNetworkReport(auditReport, dnsEvidence);
+  assert.equal(document.schema_version, 1);
+  assert.equal(document.mode, "audit");
+  assert.equal(document.result, "warning");
+  assert.equal(document.warnings.results_storage_attribution_failures, 0);
+  assert.equal(document.warnings.results_storage_rejections, 0);
+  assert.equal(document.warnings.results_storage_authorizations_truncated, true);
+  assert.deepEqual(document.network, [{
+    destination_kind: "hostname",
+    destination: hostname,
+    decision: "would_block",
+    activities: [{ kind: "dns_query", query_type: "a", count: 1 }],
+    actors: [],
+    count: 1,
+  }]);
+
+  const summary = summaryLines(auditReport, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.match(summary, /Additional results-storage accounts would exceed the authorization limit in block mode/);
+  assert.doesNotMatch(summary, /results-storage accounts were denied|results-storage requests were rejected/i);
+
+  const humanReport = networkReportLines(auditReport, dnsEvidence).join("\n");
+  assert.match(humanReport, /Fence network report: warning/);
+  assert.match(humanReport, /would_block \| productionresultssa14\.blob\.core\.windows\.net/);
+
+  assert.equal(
+    captureResultsStorageWarnings(dnsEvidence),
+    `::warning::${capacityWarning}\n`,
+  );
+});
+
 test("reports independent results-storage attribution and capacity warnings", () => {
   const authorizations = [8, 10, 11, 12].map((account) => ({
     hostname: `productionresultssa${account}.blob.core.windows.net`,
