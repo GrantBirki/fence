@@ -24,6 +24,7 @@ const {
   networkReportLines,
   nativeInputsFromEnvironment,
   registeredActionPathGuardPaths,
+  resultsStorageWarnings,
   runtimePaths,
   structuredReportLine,
   summaryLines,
@@ -224,6 +225,14 @@ function parsedStructuredNetworkReport(currentReport: any, dnsEvidence: any = un
   assert.ok(Buffer.byteLength(line, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
   assert.equal(captureStdout(() => actionLog.structuredRecord(line)), `${line}\n`);
   return JSON.parse(line.slice("FENCE_REPORT_JSON=".length));
+}
+
+function captureResultsStorageWarnings(dnsEvidence: any): string {
+  return captureStdout(() => {
+    for (const warning of resultsStorageWarnings(dnsEvidence)) {
+      actionLog.warning(warning);
+    }
+  });
 }
 
 test("validates explicit and zero-input inline configurations", () => {
@@ -2323,6 +2332,173 @@ test("renders a canonical healthy structured network report from bounded evidenc
   assert.match(humanReport, /blocked \| blocked\.example\.com \| .* \| runner: curl \(PID 4242\)/);
   assert.match(humanReport, /2001:db8::44/);
   assert.doesNotMatch(humanReport, /intentional data-egress channel/);
+});
+
+test("keeps expected results-storage DNS refusals visible without warning", () => {
+  const hostname = "productionresultssa8.blob.core.windows.net";
+  const dnsEvidence = dnsEvidenceFor(report, {
+    observations: [{
+      hostname,
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 2,
+      resolved_addresses: [],
+    }],
+    blocked_non_profile_query_count: 2,
+    results_storage_request_rejections: 2,
+  });
+
+  validateDnsEvidence(dnsEvidence, report);
+  assert.deepEqual(resultsStorageWarnings(dnsEvidence), []);
+  const document = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(document.schema_version, 1);
+  assert.equal(document.result, "healthy");
+  assert.equal(document.warnings.results_storage_rejections, 2);
+  assert.equal(document.warnings.results_storage_attribution_failures, 0);
+  assert.equal(document.warnings.results_storage_authorizations_truncated, false);
+  assert.deepEqual(document.network, [{
+    destination_kind: "hostname",
+    destination: hostname,
+    decision: "blocked",
+    activities: [{ kind: "dns_query", query_type: "a", count: 2 }],
+    actors: [],
+    count: 2,
+  }]);
+
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\| `productionresultssa8\.blob\.core\.windows\.net` \| ⛔ Blocked \| 2 A queries \|/);
+  assert.doesNotMatch(summary, /### 🟡 Fence Summary|#### Warnings/);
+
+  const humanReport = networkReportLines(report, dnsEvidence).join("\n");
+  assert.match(humanReport, /^Fence network report: healthy/m);
+  assert.match(humanReport, /blocked \| productionresultssa8\.blob\.core\.windows\.net \| 2 A queries \| -/);
+
+  const line = structuredReportLine(report, dnsEvidence);
+  const output = captureStdout(() => {
+    for (const reportLine of networkReportLines(report, dnsEvidence)) {
+      actionLog.info(reportLine);
+    }
+    actionLog.structuredRecord(line);
+    for (const warning of resultsStorageWarnings(dnsEvidence)) {
+      actionLog.warning(warning);
+    }
+  });
+  assert.deepEqual(
+    output.split("\n").filter((outputLine) => outputLine.startsWith("FENCE_REPORT_JSON=")),
+    [line],
+  );
+  assert.doesNotMatch(output, /^::warning::/m);
+  assert.equal(captureResultsStorageWarnings(dnsEvidence), "");
+});
+
+test("warns when results-storage caller attribution fails", () => {
+  const dnsEvidence = dnsEvidenceFor(report, {
+    observations: [{
+      hostname: "productionresultssa8.blob.core.windows.net",
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: [],
+    }],
+    blocked_non_profile_query_count: 1,
+    results_storage_attribution_failures: 1,
+    results_storage_request_rejections: 1,
+  });
+
+  validateDnsEvidence(dnsEvidence, report);
+  assert.deepEqual(resultsStorageWarnings(dnsEvidence), [
+    "Fence could not attribute 1 GitHub results-storage DNS request(s)",
+  ]);
+  const document = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(document.result, "warning");
+  assert.equal(document.warnings.results_storage_attribution_failures, 1);
+  assert.equal(document.warnings.results_storage_rejections, 1);
+  assert.equal(document.network[0].decision, "blocked");
+
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.match(summary, /GitHub results-storage requests could not be attributed \| `1`/);
+  assert.match(summary, /GitHub results-storage requests were rejected \| `1`/);
+  assert.equal(
+    captureResultsStorageWarnings(dnsEvidence),
+    "::warning::Fence could not attribute 1 GitHub results-storage DNS request(s)\n",
+  );
+});
+
+test("warns when the results-storage authorization capacity is exhausted", () => {
+  const authorizations = [8, 10, 11, 12].map((account) => ({
+    hostname: `productionresultssa${account}.blob.core.windows.net`,
+    authorization_origin: "pinned_runner_worker_dns",
+  }));
+  const capacityWarning =
+    "Fence denied additional GitHub results-storage requests after reaching the 4-account authorization limit";
+
+  for (const requestRejections of [0, 1]) {
+    const dnsEvidence = dnsEvidenceFor(report, {
+      runner_authorized_results_storage: authorizations,
+      results_storage_authorization_count: authorizations.length,
+      runner_authorized_results_storage_truncated: true,
+      results_storage_request_rejections: requestRejections,
+    });
+
+    validateDnsEvidence(dnsEvidence, report);
+    assert.deepEqual(resultsStorageWarnings(dnsEvidence), [capacityWarning]);
+    const document = parsedStructuredNetworkReport(report, dnsEvidence);
+    assert.equal(document.result, "warning");
+    assert.equal(document.warnings.results_storage_attribution_failures, 0);
+    assert.equal(document.warnings.results_storage_rejections, requestRejections);
+    assert.equal(document.warnings.results_storage_authorizations_truncated, true);
+
+    const summary = summaryLines(report, dnsEvidence).join("\n");
+    assert.match(summary, /^### 🟡 Fence Summary/);
+    assert.match(summary, /Additional results-storage accounts were denied after the authorization limit/);
+    if (requestRejections > 0) {
+      assert.match(summary, /GitHub results-storage requests were rejected \| `1`/);
+    } else {
+      assert.doesNotMatch(summary, /GitHub results-storage requests were rejected/);
+    }
+    assert.equal(
+      captureResultsStorageWarnings(dnsEvidence),
+      `::warning::${capacityWarning}\n`,
+    );
+  }
+});
+
+test("reports independent results-storage attribution and capacity warnings", () => {
+  const authorizations = [8, 10, 11, 12].map((account) => ({
+    hostname: `productionresultssa${account}.blob.core.windows.net`,
+    authorization_origin: "pinned_runner_worker_dns",
+  }));
+  const dnsEvidence = dnsEvidenceFor(report, {
+    runner_authorized_results_storage: authorizations,
+    results_storage_authorization_count: authorizations.length,
+    runner_authorized_results_storage_truncated: true,
+    results_storage_attribution_failures: 2,
+    results_storage_request_rejections: 3,
+  });
+
+  validateDnsEvidence(dnsEvidence, report);
+  assert.deepEqual(resultsStorageWarnings(dnsEvidence), [
+    "Fence could not attribute 2 GitHub results-storage DNS request(s)",
+    "Fence denied additional GitHub results-storage requests after reaching the 4-account authorization limit",
+  ]);
+  const document = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(document.result, "warning");
+  assert.equal(document.warnings.results_storage_attribution_failures, 2);
+  assert.equal(document.warnings.results_storage_rejections, 3);
+  assert.equal(document.warnings.results_storage_authorizations_truncated, true);
+
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.match(summary, /GitHub results-storage requests could not be attributed \| `2`/);
+  assert.match(summary, /GitHub results-storage requests were rejected \| `3`/);
+  assert.match(summary, /Additional results-storage accounts were denied after the authorization limit/);
+  assert.equal(
+    captureResultsStorageWarnings(dnsEvidence),
+    "::warning::Fence could not attribute 2 GitHub results-storage DNS request(s)\n" +
+      "::warning::Fence denied additional GitHub results-storage requests after reaching the 4-account authorization limit\n",
+  );
 });
 
 test("reports GitHub artifact compatibility as intentionally reduced assurance", () => {

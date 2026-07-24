@@ -1826,9 +1826,7 @@ function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence
     materializationRequestRejections(dnsEvidence) > 0 ||
     materializationEvidenceCounter(dnsEvidence, "user_wildcard_request_rejections") > 0 ||
     Boolean(dnsEvidence && dnsEvidence.bounded_user_wildcard_authorizations_truncated === true) ||
-    resultsStorageEvidenceCounter(dnsEvidence, "results_storage_attribution_failures") > 0 ||
-    resultsStorageEvidenceCounter(dnsEvidence, "results_storage_request_rejections") > 0 ||
-    Boolean(dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true)
+    resultsStorageWarnings(dnsEvidence).length > 0
   );
 }
 
@@ -1855,6 +1853,25 @@ function materializationWarningRows(dnsEvidence: any): string[] {
 function resultsStorageEvidenceCounter(dnsEvidence: any, field: string): number {
   const value = dnsEvidence && dnsEvidence[field];
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function resultsStorageWarnings(dnsEvidence: any): string[] {
+  const attributionFailures = resultsStorageEvidenceCounter(
+    dnsEvidence,
+    "results_storage_attribution_failures",
+  );
+  const warnings = [];
+  if (attributionFailures > 0) {
+    warnings.push(
+      `Fence could not attribute ${attributionFailures} GitHub results-storage DNS request(s)`,
+    );
+  }
+  if (dnsEvidence?.runner_authorized_results_storage_truncated === true) {
+    warnings.push(
+      `Fence denied additional GitHub results-storage requests after reaching the ${MAX_RESULTS_STORAGE_AUTHORIZATIONS}-account authorization limit`,
+    );
+  }
+  return warnings;
 }
 
 function githubArtifactAuthorizationCount(dnsEvidence: any): number {
@@ -1894,7 +1911,7 @@ function resultsStorageWarningRows(dnsEvidence: any): string[] {
   if (attributionFailures > 0) {
     rows.push(`| ⚠️ GitHub results-storage requests could not be attributed | ${markdownCode(attributionFailures)} |`);
   }
-  if (requestRejections > 0) {
+  if (requestRejections > 0 && resultsStorageWarnings(dnsEvidence).length > 0) {
     rows.push(`| ⚠️ GitHub results-storage requests were rejected | ${markdownCode(requestRejections)} |`);
   }
   if (truncated) {
@@ -2651,6 +2668,7 @@ module.exports = {
   readLauncherIntegrity,
   launcherIntegrityDocument,
   registeredActionPathGuardPaths,
+  resultsStorageWarnings,
   runtimePaths,
   summaryHeading,
   summaryLines,
