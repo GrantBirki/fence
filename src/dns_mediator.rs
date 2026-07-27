@@ -137,6 +137,9 @@ const RESIDENT_EVENT_CHANNEL_CAPACITY: usize = 32;
 const RESIDENT_WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
+const MAX_DNS_TCP_CLIENTS: usize = 4;
+const MAX_DNS_TCP_FRAMES_PER_CLIENT: usize = 16;
+const DNS_TCP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
@@ -4491,6 +4494,121 @@ fn send_udp_retryable_failure(socket: &UdpSocket, query: &[u8], peer: std::net::
     }
 }
 
+struct DnsTcpClientCompletion {
+    slot: usize,
+    result: Result<(), DnsMediationError>,
+}
+
+struct DnsTcpClientPool {
+    shutdown: Arc<AtomicBool>,
+    sender: SyncSender<DnsTcpClientCompletion>,
+    receiver: Receiver<DnsTcpClientCompletion>,
+    slots: [Option<JoinHandle<()>>; MAX_DNS_TCP_CLIENTS],
+}
+
+impl DnsTcpClientPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(MAX_DNS_TCP_CLIENTS);
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            sender,
+            receiver,
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn free_slot(&self) -> Option<usize> {
+        self.slots.iter().position(Option::is_none)
+    }
+
+    fn complete(&mut self, completion: DnsTcpClientCompletion) -> Result<(), DnsMediationError> {
+        let worker = self
+            .slots
+            .get_mut(completion.slot)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                DnsMediationError::new(
+                    "dns_tcp_listener_failed",
+                    "resident TCP DNS client reported an invalid worker slot",
+                )
+            })?;
+        worker.join().map_err(|_| {
+            DnsMediationError::new(
+                "dns_tcp_client_panicked",
+                "resident TCP DNS client worker panicked",
+            )
+        })?;
+        completion.result
+    }
+
+    fn drain(&mut self) -> Result<(), DnsMediationError> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(completion) => self.complete(completion)?,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(DnsMediationError::new(
+                        "dns_tcp_listener_failed",
+                        "resident TCP DNS client supervision disconnected",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn wait(&mut self) -> Result<(), DnsMediationError> {
+        match self.receiver.recv_timeout(DNS_TCP_POLL_INTERVAL) {
+            Ok(completion) => self.complete(completion),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(DnsMediationError::new(
+                "dns_tcp_listener_failed",
+                "resident TCP DNS client supervision disconnected",
+            )),
+        }
+    }
+
+    fn spawn<F>(&mut self, slot: usize, work: F) -> Result<(), DnsMediationError>
+    where
+        F: FnOnce(Arc<AtomicBool>) -> Result<(), DnsMediationError> + Send + 'static,
+    {
+        let sender = self.sender.clone();
+        let shutdown = Arc::clone(&self.shutdown);
+        let worker = thread::Builder::new()
+            .name(format!("fence-dns-tcp-client-{slot}"))
+            .spawn(move || {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(shutdown)));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err(DnsMediationError::new(
+                        "dns_tcp_client_panicked",
+                        "resident TCP DNS client worker panicked",
+                    )),
+                };
+                let _ = sender.send(DnsTcpClientCompletion { slot, result });
+            })
+            .map_err(|_| {
+                DnsMediationError::new(
+                    "dns_tcp_client_spawn_failed",
+                    "failed to start a bounded resident TCP DNS client worker",
+                )
+            })?;
+        self.slots[slot] = Some(worker);
+        Ok(())
+    }
+}
+
+impl Drop for DnsTcpClientPool {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for slot in &mut self.slots {
+            if let Some(worker) = slot.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
 fn serve_tcp(
     listener: TcpListener,
     listener_kind: DnsListenerKind,
@@ -4498,11 +4616,18 @@ fn serve_tcp(
     stop: &AtomicBool,
     upstream_address: &str,
 ) -> Result<(), DnsMediationError> {
+    let mut pool = DnsTcpClientPool::new();
     while !stop.load(Ordering::Relaxed) {
-        let (mut client, peer) = match listener.accept() {
+        pool.drain()?;
+        let Some(slot) = pool.free_slot() else {
+            pool.wait()?;
+            continue;
+        };
+
+        let (client, peer) = match listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(DNS_TCP_POLL_INTERVAL);
                 continue;
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -4513,23 +4638,54 @@ fn serve_tcp(
                 ));
             }
         };
-        if set_dns_tcp_deadlines(&client).is_err() {
-            continue;
+        let client_recorder = recorder.clone();
+        let client_upstream_address = upstream_address.to_owned();
+        pool.spawn(slot, move |shutdown| {
+            serve_tcp_client(
+                client,
+                peer,
+                listener_kind,
+                client_recorder,
+                &client_upstream_address,
+                shutdown.as_ref(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn serve_tcp_client(
+    mut client: TcpStream,
+    peer: std::net::SocketAddr,
+    listener_kind: DnsListenerKind,
+    recorder: ObservationRecorder,
+    upstream_address: &str,
+    shutdown: &AtomicBool,
+) -> Result<(), DnsMediationError> {
+    if set_dns_tcp_deadlines(&client).is_err() {
+        return Ok(());
+    }
+    let Ok(local) = client.local_addr() else {
+        return Ok(());
+    };
+
+    for _ in 0..MAX_DNS_TCP_FRAMES_PER_CLIENT {
+        if shutdown.load(Ordering::Acquire) || recorder.shutdown.load(Ordering::Acquire) {
+            return Ok(());
         }
-        let Ok(local) = client.local_addr() else {
-            continue;
-        };
+
+        let frame_deadline = Instant::now() + DNS_FORWARD_TIMEOUT;
         let mut length = [0_u8; 2];
-        if client.read_exact(&mut length).is_err() {
-            continue;
+        if read_tcp_exact_until(&mut client, &mut length, frame_deadline, shutdown).is_err() {
+            return Ok(());
         }
         let query_length = usize::from(u16::from_be_bytes(length));
         if query_length == 0 || query_length > MAX_DNS_PACKET_BYTES {
-            continue;
+            return Ok(());
         }
         let mut query = vec![0_u8; query_length];
-        if client.read_exact(&mut query).is_err() {
-            continue;
+        if read_tcp_exact_until(&mut client, &mut query, frame_deadline, shutdown).is_err() {
+            return Ok(());
         }
         let parsed_question = parse_dns_question(&query);
         let query_client = DnsQueryClient {
@@ -4554,26 +4710,33 @@ fn serve_tcp(
             }
             DnsQueryDispatch::Refused(classification_override) => {
                 record_rejected_query(&recorder, parsed_question.as_ref(), classification_override);
-                if let Some(response) = refused_response(&query) {
-                    let _ = client.write_all(&(response.len() as u16).to_be_bytes());
-                    let _ = client.write_all(&response);
+                if let Some(response) = refused_response(&query)
+                    && !write_tcp_dns_response(&mut client, &response, shutdown)
+                {
+                    return Ok(());
                 }
                 continue;
             }
             DnsQueryDispatch::RetryableFailure(classification_override) => {
                 record_rejected_query(&recorder, parsed_question.as_ref(), classification_override);
-                write_tcp_retryable_failure(&mut client, &query);
+                if !write_tcp_retryable_failure(&mut client, &query, shutdown) {
+                    return Ok(());
+                }
                 continue;
             }
         };
         let Ok(mut response) = forward_upstream_udp(upstream_address, &upstream_query) else {
             recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
+            if !write_tcp_retryable_failure(&mut client, &query, shutdown) {
+                return Ok(());
+            }
             continue;
         };
         if !response_matches_upstream_query(&response, &upstream_query) {
             recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
+            if !write_tcp_retryable_failure(&mut client, &query, shutdown) {
+                return Ok(());
+            }
             continue;
         }
         restore_client_query_id(&mut response, &query);
@@ -4586,24 +4749,111 @@ fn serve_tcp(
         let Some(output) = dns_response_for_disposition(&query, &response, disposition) else {
             continue;
         };
-        let Ok(output_length) = u16::try_from(output.len()) else {
-            continue;
-        };
-        let _ = client.write_all(&output_length.to_be_bytes());
-        let _ = client.write_all(&output);
+        if !write_tcp_dns_response(&mut client, &output, shutdown) {
+            return Ok(());
+        }
     }
     Ok(())
 }
 
-fn write_tcp_retryable_failure(client: &mut TcpStream, query: &[u8]) {
-    let Some(response) = server_failure_response(query) else {
-        return;
-    };
+fn read_tcp_exact_until(
+    client: &mut TcpStream,
+    mut remaining: &mut [u8],
+    deadline: Instant,
+    shutdown: &AtomicBool,
+) -> std::io::Result<()> {
+    while !remaining.is_empty() {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "resident TCP DNS client was stopped",
+            ));
+        }
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "resident TCP DNS frame exceeded its deadline",
+            ));
+        }
+        client.set_read_timeout(Some(remaining_time.min(DNS_TCP_POLL_INTERVAL)))?;
+        match client.read(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "resident TCP DNS frame ended before completion",
+                ));
+            }
+            Ok(length) => remaining = &mut remaining[length..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_tcp_all_until(
+    client: &mut TcpStream,
+    mut remaining: &[u8],
+    deadline: Instant,
+    shutdown: &AtomicBool,
+) -> std::io::Result<()> {
+    while !remaining.is_empty() {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "resident TCP DNS client was stopped",
+            ));
+        }
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "resident TCP DNS response exceeded its deadline",
+            ));
+        }
+        client.set_write_timeout(Some(remaining_time.min(DNS_TCP_POLL_INTERVAL)))?;
+        match client.write(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "resident TCP DNS response could not be written",
+                ));
+            }
+            Ok(length) => remaining = &remaining[length..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_tcp_dns_response(client: &mut TcpStream, response: &[u8], shutdown: &AtomicBool) -> bool {
     let Ok(length) = u16::try_from(response.len()) else {
-        return;
+        return false;
     };
-    let _ = client.write_all(&length.to_be_bytes());
-    let _ = client.write_all(&response);
+    let deadline = Instant::now() + DNS_FORWARD_TIMEOUT;
+    write_tcp_all_until(client, &length.to_be_bytes(), deadline, shutdown).is_ok()
+        && write_tcp_all_until(client, response, deadline, shutdown).is_ok()
+}
+
+fn write_tcp_retryable_failure(
+    client: &mut TcpStream,
+    query: &[u8],
+    shutdown: &AtomicBool,
+) -> bool {
+    let Some(response) = server_failure_response(query) else {
+        return false;
+    };
+    write_tcp_dns_response(client, &response, shutdown)
 }
 
 fn forward_upstream_udp(upstream_address: &str, query: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -6654,6 +6904,169 @@ mod tests {
         let upstream_address = resolver.local_addr().unwrap().to_string();
         let resolver_thread = thread::spawn(move || {
             let mut request = [0_u8; MAX_DNS_PACKET_BYTES];
+            for index in 0..MAX_DNS_TCP_FRAMES_PER_CLIENT {
+                let (hostname, final_octet) = if index % 2 == 0 {
+                    ("github.com", 10)
+                } else {
+                    ("api.github.com", 11)
+                };
+                let (length, peer) = resolver.recv_from(&mut request).unwrap();
+                assert_eq!(
+                    parse_dns_question(&request[..length]),
+                    Some((hostname.to_owned(), 1)),
+                );
+                let mut response =
+                    response_with_address(hostname, 1, 60, &[192, 0, 2, final_octet]);
+                response[..2].copy_from_slice(&request[..2]);
+                resolver.send_to(&response, peer).unwrap();
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener_address = listener.local_addr().unwrap();
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            serve_tcp(
+                listener,
+                DnsListenerKind::Host,
+                recorder,
+                &server_stop,
+                &upstream_address,
+            )
+        });
+
+        let mut client = TcpStream::connect(listener_address).unwrap();
+        set_dns_tcp_deadlines(&client).unwrap();
+        for index in 0..MAX_DNS_TCP_FRAMES_PER_CLIENT {
+            let (hostname, final_octet) = if index % 2 == 0 {
+                ("github.com", 10)
+            } else {
+                ("api.github.com", 11)
+            };
+            let identifier = 0x1234_u16 + u16::try_from(index).unwrap();
+            let mut request = query(hostname, 1);
+            request[..2].copy_from_slice(&identifier.to_be_bytes());
+            client
+                .write_all(&(request.len() as u16).to_be_bytes())
+                .unwrap();
+            client.write_all(&request).unwrap();
+            let mut response_length = [0_u8; 2];
+            client.read_exact(&mut response_length).unwrap();
+            let mut response = vec![0_u8; usize::from(u16::from_be_bytes(response_length))];
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(&response[..2], &identifier.to_be_bytes());
+            assert_eq!(
+                parse_dns_question(&response),
+                Some((hostname.to_owned(), 1))
+            );
+            assert_eq!(&response[response.len() - 4..], &[192, 0, 2, final_octet]);
+        }
+
+        let mut next_response = [0_u8; 2];
+        let error = client.read_exact(&mut next_response).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+        ));
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+        resolver_thread.join().unwrap();
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn limits_tcp_dns_to_a_fixed_number_of_concurrent_clients() {
+        let mut pool = DnsTcpClientPool::new();
+        let release = Arc::new(AtomicBool::new(false));
+
+        for slot in 0..MAX_DNS_TCP_CLIENTS {
+            let client_release = Arc::clone(&release);
+            pool.spawn(slot, move |shutdown| {
+                while !client_release.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire) {
+                    thread::sleep(DNS_TCP_POLL_INTERVAL);
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert!(pool.free_slot().is_none());
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.free_slot().is_none() && Instant::now() < deadline {
+            pool.wait().unwrap();
+        }
+        assert!(pool.free_slot().is_some());
+    }
+
+    #[test]
+    fn tcp_dns_client_failures_preserve_the_original_security_error() {
+        let mut pool = DnsTcpClientPool::new();
+        let slot = pool.free_slot().unwrap();
+        pool.spawn(slot, |_| {
+            Err(DnsMediationError::new(
+                "runner_worker_identity_drift",
+                "trusted runner identity changed",
+            ))
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            match pool.wait() {
+                Err(error) => break error,
+                Ok(()) if Instant::now() < deadline => {}
+                Ok(()) => panic!("TCP DNS client did not report its security failure"),
+            }
+        };
+
+        assert_eq!(error.code, "runner_worker_identity_drift");
+    }
+
+    #[test]
+    fn tcp_dns_frame_reads_keep_one_deadline_for_slow_partial_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let sender = thread::spawn(move || {
+            for _ in 0..16 {
+                if client.write_all(&[0]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let shutdown = AtomicBool::new(false);
+        let mut frame = [0_u8; 16];
+        let started = Instant::now();
+
+        let error = read_tcp_exact_until(
+            &mut server,
+            &mut frame,
+            started + Duration::from_millis(60),
+            &shutdown,
+        )
+        .unwrap_err();
+        drop(server);
+        sender.join().unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn slow_tcp_dns_clients_do_not_block_other_queries() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        resolver
+            .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+            .unwrap();
+        let upstream_address = resolver.local_addr().unwrap().to_string();
+        let resolver_thread = thread::spawn(move || {
+            let mut request = [0_u8; MAX_DNS_PACKET_BYTES];
             let (length, peer) = resolver.recv_from(&mut request).unwrap();
             assert_eq!(
                 parse_dns_question(&request[..length]),
@@ -6680,10 +7093,13 @@ mod tests {
             )
         });
 
+        let mut stalled = TcpStream::connect(listener_address).unwrap();
+        stalled.write_all(&[0, 32, 0]).unwrap();
+
         let mut client = TcpStream::connect(listener_address).unwrap();
         set_dns_tcp_deadlines(&client).unwrap();
         let mut request = query("github.com", 1);
-        request[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+        request[..2].copy_from_slice(&0x4321_u16.to_be_bytes());
         client
             .write_all(&(request.len() as u16).to_be_bytes())
             .unwrap();
@@ -6692,14 +7108,14 @@ mod tests {
         client.read_exact(&mut response_length).unwrap();
         let mut response = vec![0_u8; usize::from(u16::from_be_bytes(response_length))];
         client.read_exact(&mut response).unwrap();
-        assert_eq!(&response[..2], &[0x12, 0x34]);
+
+        assert_eq!(&response[..2], &0x4321_u16.to_be_bytes());
         assert_eq!(
             parse_dns_question(&response),
             Some(("github.com".to_owned(), 1))
         );
-        assert_eq!(&response[response.len() - 4..], &[192, 0, 2, 10]);
 
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::Release);
         server.join().unwrap().unwrap();
         resolver_thread.join().unwrap();
         let _ = fs::remove_file(report_path);
