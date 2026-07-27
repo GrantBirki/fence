@@ -226,6 +226,85 @@ assert_invalid_artifact_input \
   "true" \
   "allow_github_artifacts input can only be used with block mode"
 
+assert_invalid_configuration_input() {
+  local label="$1"
+  local invocation="$2"
+  local configuration="$3"
+  local allowlist="$4"
+  local expected_error="$5"
+  local unit="fence-$invocation.service"
+  local -a action_environment=(
+    "INPUT_CONFIG=$configuration"
+    "INPUT_ALLOWLIST=$allowlist"
+    "GITHUB_STATE=$state"
+    "GITHUB_STEP_SUMMARY=$summary"
+  )
+
+  if [[ -z "$configuration" ]]; then
+    action_environment+=("INPUT_INVOCATION_ID=$invocation")
+  fi
+  if [[ -e "/run/fence/$invocation" || -e "/run/fence-launcher/$invocation" ]]; then
+    die "Action $label setup-failure evidence requires no preexisting runtime state"
+  fi
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" != "not-found" ]]; then
+    die "Action $label setup-failure evidence requires an unused transient service name"
+  fi
+
+  : >"$state"
+  : >"$summary"
+  : >"$stdout"
+  : >"$stderr"
+  if env "${action_environment[@]}" node action/main.cts >"$stdout" 2>"$stderr"; then
+    die "Action setup unexpectedly accepted $label"
+  fi
+  if ! grep -Fq "$expected_error" "$stderr"; then
+    die "Action $label setup-failure evidence did not report the expected configuration error"
+  fi
+  if [[ -s "$stdout" || -s "$state" || -s "$summary" ]]; then
+    die "Action $label setup-failure evidence unexpectedly emitted success state"
+  fi
+  if [[ -e "/run/fence/$invocation" || -e "/run/fence-launcher/$invocation" ]]; then
+    die "Action $label setup-failure evidence unexpectedly created runtime state"
+  fi
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" != "not-found" ]]; then
+    die "Action $label setup-failure evidence unexpectedly created a transient service"
+  fi
+  if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+    die "Action $label setup-failure evidence unexpectedly created inet fence_v0"
+  fi
+  if ! sudo --non-interactive /usr/bin/true; then
+    die "Action $label setup-failure evidence unexpectedly disabled passwordless sudo"
+  fi
+}
+
+assert_invalid_configuration_input \
+  "unsupported raw platform profile" \
+  "action-invalid-platform-profile" \
+  '{"schema_version":1,"mode":"block","invocation_id":"action-invalid-platform-profile","platform_profile":"unsupported","allowlist":[]}' \
+  '' \
+  'config platform_profile must be github_hosted_workflow_bootstrap_v5'
+
+assert_invalid_configuration_input \
+  "duplicate raw JSON field" \
+  "action-invalid-duplicate-field" \
+  '{"schema_version":1,"mode":"block","m\u006fde":"audit","invocation_id":"action-invalid-duplicate-field","allowlist":[]}' \
+  '' \
+  'config JSON objects must not contain duplicate fields'
+
+assert_invalid_configuration_input \
+  "scoped IPv6 destination" \
+  "action-invalid-scoped-ipv6" \
+  '' \
+  'ip fe80::1%eth0 tcp 443' \
+  'allowlist line 1: allowlist ip entries must be valid literal IP addresses'
+
+assert_invalid_configuration_input \
+  "runner-authorized results-storage destination" \
+  "action-invalid-results-storage" \
+  '' \
+  'productionresultssa8.blob.core.windows.net' \
+  'allowlist line 1: allowlist hostname entries must not target runner-authorized GitHub results storage'
+
 runtime_failure_invocation="action-runtime-failure"
 runtime_failure_unit="fence-$runtime_failure_invocation.service"
 if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" != "not-found" ]]; then
@@ -235,15 +314,15 @@ fi
 : >"$summary"
 : >"$stdout"
 : >"$stderr"
-if INPUT_CONFIG='{"schema_version":1,"mode":"block","invocation_id":"action-runtime-failure","platform_profile":"unsupported","allowlist":[]}' \
+if INPUT_CONFIG='{"schema_version":1,"mode":"block","invocation_id":"action-runtime-failure","allowlist":[{"destination_type":"hostname","destination":"fence-startup-failure.invalid","protocol":"tcp","port":443}]}' \
   GITHUB_STATE="$state" \
   GITHUB_STEP_SUMMARY="$summary" \
   node action/main.cts >"$stdout" 2>"$stderr"; then
-  die "Action setup unexpectedly accepted an unsupported source profile"
+  die "Action setup unexpectedly accepted an unresolvable required hostname"
 fi
 
 grep -q "Fence resident service exited before readiness" "$stderr"
-grep -q "Fence resident error code: invalid_platform_profile" "$stdout"
+grep -q "Fence resident error code: dns_block_prehydration_failed" "$stdout"
 if grep -q "readiness was not emitted before the timeout" "$stderr"; then
   die "Action runtime failure waited for the full readiness timeout"
 fi
@@ -266,4 +345,4 @@ grep -qx "ActiveState=failed" <<<"$runtime_failure_status"
 grep -qx "Result=exit-code" <<<"$runtime_failure_status"
 grep -qx "ExecMainStatus=1" <<<"$runtime_failure_status"
 
-echo -e "${GREEN}Action setup-failure evidence verified:${OFF} invalid wrapper inputs and source profile fail before mutation"
+echo -e "${GREEN}Action setup-failure evidence verified:${OFF} invalid inputs fail before mutation and source startup failures remain observable"

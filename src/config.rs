@@ -430,6 +430,9 @@ fn is_numeric_ipv4_component(component: &str) -> bool {
 
 fn normalize_cidr(value: &str) -> Option<String> {
     let (address, prefix) = value.split_once('/')?;
+    if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     let address = address.parse::<IpAddr>().ok()?;
     let prefix = prefix.parse::<u8>().ok()?;
     match address {
@@ -902,6 +905,22 @@ mod tests {
                 "invalid_destination",
             ),
             (
+                one_allowance("cidr", "192.0.2.0/256", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("cidr", "0.0.0.0/+0", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("cidr", "192.0.2.0/+24", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("cidr", "192.0.2.0/+024", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
                 one_allowance("cidr", "192.0.2.0/24/1", "tcp", 443),
                 "invalid_destination",
             ),
@@ -919,6 +938,10 @@ mod tests {
             ),
             (
                 one_allowance("cidr", "2001:db8::/129", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("cidr", "2001:db8::/+64", "tcp", 443),
                 "invalid_destination",
             ),
             (
