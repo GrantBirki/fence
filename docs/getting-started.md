@@ -1,6 +1,6 @@
 # Getting Started
 
-Fence is a GitHub Action for supported GitHub-hosted `ubuntu-24.04` x64 host jobs. It must run before checkout and any other steps you want it to constrain.
+Fence is a GitHub Action for GitHub-hosted x64 host jobs using `ubuntu-24.04` or `ubuntu-latest`. `ubuntu-24.04` is the fixed, release-validated security target; `ubuntu-latest` is regularly tested and must pass the same runner security checks. Run Fence before checkout and any other steps you want it to constrain.
 
 ## Add Fence To A Job
 
