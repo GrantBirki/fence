@@ -146,6 +146,7 @@ const DOCKER_DAEMON_PATH: &str = "/etc/docker/daemon.json";
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_PREHYDRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_PREHYDRATION_MAX_ATTEMPTS: usize = 3;
+const MAX_STARTUP_PREHYDRATION_WORKERS: usize = 32;
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
@@ -3322,27 +3323,140 @@ impl PrehydrationError {
 fn prehydrate_exact_hostnames(
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
-    let deadline = Instant::now() + STARTUP_PREHYDRATION_TIMEOUT;
+    prehydrate_exact_hostnames_with_query(
+        hostname_policy,
+        Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+        &query_fixed_upstream_for_prehydration_with_timeout,
+    )
+}
+
+fn prehydrate_exact_hostnames_with_query<F>(
+    hostname_policy: &RuntimeHostnamePolicy,
+    deadline: Instant,
+    query: &F,
+) -> Result<Vec<PendingMaterialization>, PrehydrationError>
+where
+    F: Fn(&str, u16, Duration) -> Result<Vec<u8>, PrehydrationQueryError> + Sync,
+{
+    let entries = startup_prehydration_entries(hostname_policy).collect::<Vec<_>>();
+    let optional_start = entries
+        .iter()
+        .position(|entry| is_optional_platform_hostname_entry(entry))
+        .unwrap_or(entries.len());
+    let (required, optional) = entries.split_at(optional_start);
     let mut materializations = Vec::new();
-    for entry in startup_prehydration_entries(hostname_policy) {
-        let result = if is_optional_platform_hostname_entry(entry) {
-            prehydrate_exact_hostname(entry, hostname_policy)
-        } else {
-            prehydrate_exact_hostname_for_startup(entry, hostname_policy, deadline)
-        };
+
+    for batch in required.chunks(MAX_STARTUP_PREHYDRATION_WORKERS) {
+        if Instant::now() >= deadline {
+            return Err(startup_deadline_exceeded());
+        }
+
+        let mut batch_materializations = Vec::new();
+        let mut batch_failure = None;
+        thread::scope(|scope| {
+            let workers = batch
+                .iter()
+                .map(|entry| {
+                    scope.spawn(move || {
+                        prehydrate_exact_hostname_for_startup_with_query(
+                            entry,
+                            hostname_policy,
+                            deadline,
+                            |hostname, query_type, timeout| query(hostname, query_type, timeout),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(hostname_materializations)) => {
+                        batch_materializations.extend(hostname_materializations);
+                    }
+                    Ok(Err(error)) => retain_startup_failure(&mut batch_failure, error),
+                    Err(_) => retain_startup_failure(
+                        &mut batch_failure,
+                        PrehydrationError::Fatal(DnsMediationError::new(
+                            "dns_block_prehydration_failed",
+                            "a fixed DNS-mediated bootstrap worker failed",
+                        )),
+                    ),
+                }
+            }
+        });
+
+        if let Some(error) = batch_failure {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Err(startup_deadline_exceeded());
+        }
+        extend_startup_materializations(&mut materializations, batch_materializations)?;
+    }
+
+    for entry in optional {
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        let result =
+            prehydrate_exact_hostname_with_query(entry, hostname_policy, |hostname, query_type| {
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(DNS_FORWARD_TIMEOUT);
+                if timeout.is_zero() {
+                    Err(PrehydrationQueryError::Transient)
+                } else {
+                    query(hostname, query_type, timeout)
+                }
+            });
         match result {
-            Ok(hostname_materializations) => materializations.extend(hostname_materializations),
-            Err(PrehydrationError::Transient(_)) if is_optional_platform_hostname_entry(entry) => {}
+            Ok(hostname_materializations) => {
+                extend_startup_materializations(&mut materializations, hostname_materializations)?;
+            }
+            Err(PrehydrationError::Transient(_)) => {}
             Err(error) => return Err(error),
         }
-        if materializations.len() > MAX_ACTIVE_MATERIALIZATIONS {
-            return Err(PrehydrationError::Fatal(DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "exact DNS-mediated hostnames exceeded the active materialization bound",
-            )));
-        }
     }
+
     Ok(materializations)
+}
+
+fn startup_deadline_exceeded() -> PrehydrationError {
+    PrehydrationError::Transient(DnsMediationError::new(
+        "dns_block_prehydration_failed",
+        "fixed DNS-mediated bootstrap prehydration exceeded its startup deadline",
+    ))
+}
+
+fn retain_startup_failure(
+    first_failure: &mut Option<PrehydrationError>,
+    candidate: PrehydrationError,
+) {
+    if matches!(
+        (&*first_failure, &candidate),
+        (None, _)
+            | (
+                Some(PrehydrationError::Transient(_)),
+                PrehydrationError::Fatal(_)
+            )
+    ) {
+        *first_failure = Some(candidate);
+    }
+}
+
+fn extend_startup_materializations(
+    materializations: &mut Vec<PendingMaterialization>,
+    additions: Vec<PendingMaterialization>,
+) -> Result<(), PrehydrationError> {
+    if materializations.len().saturating_add(additions.len()) > MAX_ACTIVE_MATERIALIZATIONS {
+        return Err(PrehydrationError::Fatal(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "exact DNS-mediated hostnames exceeded the active materialization bound",
+        )));
+    }
+    materializations.extend(additions);
+    Ok(())
 }
 
 fn is_optional_platform_hostname_entry(entry: &ExactHostnamePolicy) -> bool {
@@ -3362,19 +3476,6 @@ fn startup_prehydration_entries(
         .iter()
         .filter(|entry| is_optional_platform_hostname_entry(entry));
     required.chain(optional)
-}
-
-fn prehydrate_exact_hostname_for_startup(
-    entry: &ExactHostnamePolicy,
-    hostname_policy: &RuntimeHostnamePolicy,
-    deadline: Instant,
-) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
-    prehydrate_exact_hostname_for_startup_with_query(
-        entry,
-        hostname_policy,
-        deadline,
-        query_fixed_upstream_for_prehydration_with_timeout,
-    )
 }
 
 fn prehydrate_exact_hostname_for_startup_with_query<F>(
@@ -3410,14 +3511,10 @@ where
             Err(PrehydrationError::Transient(error)) => last_transient = Some(error),
         }
     }
-    Err(PrehydrationError::Transient(last_transient.unwrap_or_else(
-        || {
-            DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "fixed DNS-mediated bootstrap prehydration exceeded its startup deadline",
-            )
-        },
-    )))
+    match last_transient {
+        Some(error) => Err(PrehydrationError::Transient(error)),
+        None => Err(startup_deadline_exceeded()),
+    }
 }
 
 fn prehydrate_exact_hostname(
@@ -3597,6 +3694,7 @@ fn query_fixed_upstream_for_prehydration_with_timeout(
     if timeout.is_zero() {
         return Err(PrehydrationQueryError::Transient);
     }
+    let deadline = Instant::now() + timeout;
     let query = canonical_dns_query(hostname, query_type, 0x0100).ok_or_else(|| {
         PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
@@ -3605,23 +3703,41 @@ fn query_fixed_upstream_for_prehydration_with_timeout(
     })?;
     let upstream = UdpSocket::bind("0.0.0.0:0").map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
-        .set_read_timeout(Some(timeout))
-        .map_err(|_| PrehydrationQueryError::Transient)?;
-    upstream
-        .set_write_timeout(Some(timeout))
-        .map_err(|_| PrehydrationQueryError::Transient)?;
-    upstream
         .connect(UPSTREAM_DNS)
         .map_err(|_| PrehydrationQueryError::Transient)?;
+
+    query_connected_upstream_for_prehydration(&upstream, &query, deadline)
+}
+
+fn query_connected_upstream_for_prehydration(
+    upstream: &UdpSocket,
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, PrehydrationQueryError> {
+    let write_timeout = deadline.saturating_duration_since(Instant::now());
+    if write_timeout.is_zero() {
+        return Err(PrehydrationQueryError::Transient);
+    }
     upstream
-        .send(&query)
+        .set_write_timeout(Some(write_timeout))
+        .map_err(|_| PrehydrationQueryError::Transient)?;
+    upstream
+        .send(query)
+        .map_err(|_| PrehydrationQueryError::Transient)?;
+
+    let read_timeout = deadline.saturating_duration_since(Instant::now());
+    if read_timeout.is_zero() {
+        return Err(PrehydrationQueryError::Transient);
+    }
+    upstream
+        .set_read_timeout(Some(read_timeout))
         .map_err(|_| PrehydrationQueryError::Transient)?;
     let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
     let response_length = upstream
         .recv(&mut response)
         .map_err(|_| PrehydrationQueryError::Transient)?;
     let response = response[..response_length].to_vec();
-    if !response_matches_upstream_query(&response, &query) {
+    if !response_matches_upstream_query(&response, query) {
         return Err(PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "fixed upstream DNS response did not match the bootstrap query",
@@ -5964,7 +6080,7 @@ fn fixed_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     static TEST_REPORT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -10476,6 +10592,352 @@ mod tests {
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
         );
+    }
+
+    #[test]
+    fn startup_prehydrates_required_hostnames_with_bounded_parallelism() {
+        let mut policy = test_hostname_policy(false);
+        for index in 0..(MAX_STARTUP_PREHYDRATION_WORKERS + 9) {
+            policy.exact.push(ExactHostnamePolicy {
+                hostname: format!("prehydration-{index:02}.example.test"),
+                origins: vec![HostnamePolicyOrigin::User],
+                transports: vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                }],
+            });
+        }
+        policy.exact.sort();
+
+        let active = AtomicUsize::new(0);
+        let maximum_active = AtomicUsize::new(0);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_active.fetch_max(current, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(5));
+            let result = if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            };
+            active.fetch_sub(1, Ordering::SeqCst);
+            result
+        };
+
+        let materializations = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap();
+
+        assert!(maximum_active.load(Ordering::SeqCst) > 1);
+        assert!(maximum_active.load(Ordering::SeqCst) <= MAX_STARTUP_PREHYDRATION_WORKERS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            materializations
+                .iter()
+                .map(|materialization| materialization.source_hostname.as_str())
+                .collect::<Vec<_>>(),
+            startup_prehydration_entries(&policy)
+                .map(|entry| entry.hostname.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn startup_prehydration_rejects_expired_required_deadlines_before_queries() {
+        let policy = test_hostname_policy(false);
+        let calls = AtomicUsize::new(0);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = prehydrate_exact_hostnames_with_query(&policy, expired, &|_, _, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(PrehydrationQueryError::Transient)
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn startup_prehydration_skips_expired_optional_watchdog_queries() {
+        let mut policy = test_hostname_policy(false);
+        policy.exact.retain(is_optional_platform_hostname_entry);
+        assert_eq!(policy.exact.len(), 1);
+
+        let calls = AtomicUsize::new(0);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let materializations =
+            prehydrate_exact_hostnames_with_query(&policy, expired, &|_, _, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(PrehydrationQueryError::Transient)
+            })
+            .unwrap();
+
+        assert!(materializations.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn startup_prehydration_attempts_optional_watchdog_only_once() {
+        let policy = test_hostname_policy(false);
+        let optional_calls = AtomicUsize::new(0);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            if is_optional_github_hosted_workflow_bootstrap_hostname(hostname) {
+                optional_calls.fetch_add(1, Ordering::Relaxed);
+                return Err(PrehydrationQueryError::Transient);
+            }
+            if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            }
+        };
+
+        let materializations = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap();
+
+        assert_eq!(optional_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(materializations.len(), policy.exact.len() - 1);
+        assert!(materializations.iter().all(|materialization| {
+            !is_optional_github_hosted_workflow_bootstrap_hostname(&materialization.source_hostname)
+        }));
+    }
+
+    #[test]
+    fn startup_prehydration_rejects_invalid_optional_watchdog_responses() {
+        let policy = test_hostname_policy(false);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            if is_optional_github_hosted_workflow_bootstrap_hostname(hostname) {
+                return Ok(response_with_unrelated_address(
+                    hostname,
+                    query_type,
+                    "unrelated.example.net",
+                    &[192, 0, 2, 10],
+                ));
+            }
+            if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            }
+        };
+
+        let error = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
+    }
+
+    #[test]
+    fn startup_prehydration_keeps_a_user_requested_watchdog_required() {
+        let mut policy = test_hostname_policy(false);
+        policy
+            .exact
+            .iter_mut()
+            .find(|entry| is_optional_platform_hostname_entry(entry))
+            .unwrap()
+            .origins
+            .push(HostnamePolicyOrigin::User);
+
+        let watchdog_calls = AtomicUsize::new(0);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            if is_optional_github_hosted_workflow_bootstrap_hostname(hostname) {
+                watchdog_calls.fetch_add(1, Ordering::Relaxed);
+                return Err(PrehydrationQueryError::Transient);
+            }
+            if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            }
+        };
+
+        let error = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert_eq!(
+            watchdog_calls.load(Ordering::Relaxed),
+            STARTUP_PREHYDRATION_MAX_ATTEMPTS * 2
+        );
+    }
+
+    #[test]
+    fn startup_prehydration_prioritizes_fatal_responses_over_transient_failures() {
+        let policy = test_hostname_policy(false);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            if hostname == "api.github.com" {
+                return Err(PrehydrationQueryError::Transient);
+            }
+            if hostname == "github.com" && query_type == 28 {
+                return Ok(response_with_unrelated_address(
+                    hostname,
+                    query_type,
+                    "unrelated.example.net",
+                    &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                ));
+            }
+            if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            }
+        };
+
+        let error = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
+        assert_eq!(
+            prehydration_error_code(&error),
+            "dns_block_prehydration_failed"
+        );
+    }
+
+    #[test]
+    fn startup_prehydration_treats_worker_panics_as_fatal() {
+        let policy = test_hostname_policy(false);
+        let completed_queries = AtomicUsize::new(0);
+        let query = |hostname: &str, query_type: u16, _: Duration| {
+            assert_ne!(hostname, "api.github.com", "test bootstrap worker panic");
+            completed_queries.fetch_add(1, Ordering::Relaxed);
+            if query_type == 1 {
+                Ok(response_with_address(
+                    hostname,
+                    query_type,
+                    60,
+                    &[192, 0, 2, 10],
+                ))
+            } else {
+                Err(PrehydrationQueryError::Transient)
+            }
+        };
+
+        let error = prehydrate_exact_hostnames_with_query(
+            &policy,
+            Instant::now() + STARTUP_PREHYDRATION_TIMEOUT,
+            &query,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
+        assert!(completed_queries.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn bootstrap_upstream_socket_enforces_one_shared_deadline() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream.connect(server.local_addr().unwrap()).unwrap();
+        let packet = canonical_dns_query("github.com", 1, 0x0100).unwrap();
+        let started = Instant::now();
+
+        let error = query_connected_upstream_for_prehydration(
+            &upstream,
+            &packet,
+            started + Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrehydrationQueryError::Transient));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bootstrap_upstream_socket_rejects_responses_for_another_query() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream.connect(server.local_addr().unwrap()).unwrap();
+        let packet = canonical_dns_query("github.com", 1, 0x0100).unwrap();
+        let worker = thread::spawn(move || {
+            let mut incoming = [0_u8; MAX_DNS_PACKET_BYTES];
+            let (_, peer) = server.recv_from(&mut incoming).unwrap();
+            let mut response = response_with_address("github.com", 1, 60, &[192, 0, 2, 10]);
+            response[0] ^= 0xff;
+            server.send_to(&response, peer).unwrap();
+        });
+
+        let error = query_connected_upstream_for_prehydration(
+            &upstream,
+            &packet,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        worker.join().unwrap();
+
+        assert!(matches!(error, PrehydrationQueryError::Fatal(_)));
+    }
+
+    #[test]
+    fn bootstrap_upstream_socket_accepts_matching_responses() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream.connect(server.local_addr().unwrap()).unwrap();
+        let packet = canonical_dns_query("github.com", 1, 0x0100).unwrap();
+        let worker = thread::spawn(move || {
+            let mut incoming = [0_u8; MAX_DNS_PACKET_BYTES];
+            let (_, peer) = server.recv_from(&mut incoming).unwrap();
+            let mut response = response_with_address("github.com", 1, 60, &[192, 0, 2, 10]);
+            response[0..2].copy_from_slice(&incoming[0..2]);
+            server.send_to(&response, peer).unwrap();
+        });
+
+        let response = query_connected_upstream_for_prehydration(
+            &upstream,
+            &packet,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        worker.join().unwrap();
+
+        assert!(response_matches_upstream_query(&response, &packet));
     }
 
     #[test]

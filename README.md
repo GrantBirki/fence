@@ -136,7 +136,7 @@ Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for 
 
 ## How It Works 🔧
 
-Fence validates that it is running through the supported Action path, turns your inputs into a local policy, and applies the controls for the selected mode. Local UDP and TCP DNS requests share the same tightly scoped root-only UDP resolver path. A resident agent keeps checking those controls throughout the job, and the protected post-job hook reports what happened and fails the job if it finds critical drift. Required DNS destinations are refreshed in due order; if one loses valid coverage, Fence treats it as critical drift rather than reporting the runner as healthy.
+Fence validates that it is running through the supported Action path, turns your inputs into a local policy, and applies the controls for the selected mode. Required DNS destinations are prepared in bounded parallel batches under one shared ten-second startup deadline. Local UDP and TCP DNS requests share the same tightly scoped root-only UDP resolver path. A resident agent keeps checking those controls throughout the job, and the protected post-job hook reports what happened and fails the job if it finds critical drift. Required DNS destinations are refreshed in due order; if one loses valid coverage, Fence treats it as critical drift rather than reporting the runner as healthy.
 
 ```mermaid
 flowchart LR
