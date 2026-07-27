@@ -2561,6 +2561,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         elapsed: Duration,
         finding_timeout: Duration,
     ) -> Result<bool, DnsMediationError> {
+        let poll_started = Instant::now();
         let mut changed = false;
         for failure in self._mediation.drain_worker_failures() {
             let _worker = failure.worker;
@@ -2607,10 +2608,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 
         let mut root_refresh_error = None;
         let mut refresh_materializations = BTreeSet::new();
-        let due_hostname = self
-            .next_hostname_refresh
-            .iter()
-            .find_map(|(hostname, due)| (*due <= elapsed).then(|| hostname.clone()));
+        let due_hostname = next_due_hostname_refresh(&self.next_hostname_refresh, elapsed);
         if let Some(hostname) = due_hostname {
             let entry = self
                 ._mediation
@@ -2622,9 +2620,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             match prehydrate_exact_hostname(&entry, &self._mediation.recorder.hostname_policy) {
                 Ok(materializations) => {
                     let refresh_interval = hostname_refresh_interval(&entry, &materializations);
+                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
                     refresh_materializations.extend(materializations);
                     self.next_hostname_refresh
-                        .insert(hostname, elapsed + refresh_interval);
+                        .insert(hostname, completed_elapsed.saturating_add(refresh_interval));
                 }
                 Err(error) => {
                     if matches!(error, PrehydrationError::Transient(_)) {
@@ -2632,8 +2631,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                             self.evidence.hostname_refresh_warnings.saturating_add(1);
                         self._mediation.recorder.record_hostname_refresh_warning();
                     }
-                    self.next_hostname_refresh
-                        .insert(hostname, elapsed + DNS_PROFILE_REFRESH_INTERVAL);
+                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
+                    self.next_hostname_refresh.insert(
+                        hostname,
+                        completed_elapsed.saturating_add(DNS_PROFILE_REFRESH_INTERVAL),
+                    );
                     root_refresh_error = Some(error);
                 }
             };
@@ -3472,6 +3474,17 @@ fn hostname_refresh_schedule(
         .collect()
 }
 
+fn next_due_hostname_refresh(
+    schedule: &BTreeMap<String, Duration>,
+    elapsed: Duration,
+) -> Option<String> {
+    schedule
+        .iter()
+        .filter(|(_, due)| **due <= elapsed)
+        .min_by_key(|(_, due)| **due)
+        .map(|(hostname, _)| hostname.clone())
+}
+
 fn hostname_refresh_interval(
     entry: &ExactHostnamePolicy,
     materializations: &[PendingMaterialization],
@@ -3560,14 +3573,10 @@ fn root_refresh_critical_finding(
             "dns_block_root_refresh_integrity_failed",
             "DNS-mediated exact-root refresh received invalid bootstrap DNS evidence after readiness",
         )),
-        Some(PrehydrationError::Transient(_))
-            if !active_covers_exact_hostname_policy(active, hostname_policy) =>
-        {
-            Some((
-                "dns_block_root_refresh_failed",
-                "DNS-mediated exact-root refresh lost required bootstrap coverage after readiness",
-            ))
-        }
+        _ if !active_covers_exact_hostname_policy(active, hostname_policy) => Some((
+            "dns_block_root_refresh_failed",
+            "DNS-mediated exact-root refresh lost required bootstrap coverage after readiness",
+        )),
         _ => None,
     }
 }
@@ -7343,6 +7352,43 @@ mod tests {
     }
 
     #[test]
+    fn due_hostname_refreshes_prioritize_deadlines_without_starving_platform_roots() {
+        let mut schedule = BTreeMap::from([
+            ("a.example.com".to_owned(), Duration::from_secs(5)),
+            ("github.com".to_owned(), Duration::from_secs(1)),
+            ("z.example.com".to_owned(), Duration::from_secs(1)),
+        ]);
+
+        assert_eq!(next_due_hostname_refresh(&schedule, Duration::ZERO), None);
+        assert_eq!(
+            next_due_hostname_refresh(&schedule, Duration::from_secs(1)),
+            Some("github.com".to_owned())
+        );
+        assert_eq!(
+            next_due_hostname_refresh(&schedule, Duration::from_secs(5)),
+            Some("github.com".to_owned())
+        );
+
+        schedule.insert("a.example.com".to_owned(), Duration::from_secs(1));
+        schedule.insert("github.com".to_owned(), Duration::from_secs(5));
+        schedule.insert("z.example.com".to_owned(), Duration::from_secs(5));
+        assert_eq!(
+            next_due_hostname_refresh(&schedule, Duration::from_secs(5)),
+            Some("a.example.com".to_owned())
+        );
+
+        let completed_elapsed = Duration::from_secs(7);
+        schedule.insert(
+            "a.example.com".to_owned(),
+            completed_elapsed.saturating_add(user_hostname_refresh_interval(1)),
+        );
+        assert_eq!(
+            next_due_hostname_refresh(&schedule, completed_elapsed),
+            Some("github.com".to_owned())
+        );
+    }
+
+    #[test]
     fn block_missing_materialization_owner_fails_closed_but_empty_and_audit_answers_forward() {
         let (block, block_report) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
         assert_eq!(
@@ -10682,6 +10728,11 @@ mod tests {
         let mut required_only = active.clone();
         required_only
             .retain(|key, _| !is_optional_github_hosted_workflow_bootstrap_hostname(&key.0));
+        assert_eq!(root_refresh_critical_finding(None, &active, &policy), None);
+        assert_eq!(
+            root_refresh_critical_finding(None, &required_only, &policy),
+            None
+        );
         assert_eq!(
             root_refresh_critical_finding(
                 Some(&PrehydrationError::Transient(DnsMediationError::new(
@@ -10701,6 +10752,11 @@ mod tests {
             .unwrap()
             .origins
             .push(HostnamePolicyOrigin::User);
+        assert_eq!(
+            root_refresh_critical_finding(None, &required_only, &user_required_policy)
+                .map(|(code, _)| code),
+            Some("dns_block_root_refresh_failed")
+        );
         assert_eq!(
             root_refresh_critical_finding(
                 Some(&PrehydrationError::Transient(DnsMediationError::new(
@@ -10746,6 +10802,37 @@ mod tests {
                 &policy,
             )
             .map(|(code, _)| code),
+            Some("dns_block_root_refresh_failed")
+        );
+        assert_eq!(
+            root_refresh_critical_finding(None, &BTreeMap::new(), &policy).map(|(code, _)| code),
+            Some("dns_block_root_refresh_failed")
+        );
+    }
+
+    #[test]
+    fn expired_required_root_is_critical_without_a_failed_refresh() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut active = active_with_all_bootstrap_roots(now);
+        active
+            .iter_mut()
+            .find(|(key, _)| key.0 == "github.com")
+            .expect("the reviewed profile contains the github.com root")
+            .1
+            .expires_at = now;
+
+        let merge = merge_materializations(
+            &mut active,
+            std::iter::empty::<PendingMaterialization>(),
+            now,
+        );
+
+        assert_eq!(merge.expired, 1);
+        assert!(merge.metadata_changed);
+        assert!(!active_covers_exact_hostname_policy(&active, &policy));
+        assert_eq!(
+            root_refresh_critical_finding(None, &active, &policy).map(|(code, _)| code),
             Some("dns_block_root_refresh_failed")
         );
     }
