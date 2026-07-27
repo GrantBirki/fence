@@ -316,6 +316,8 @@ import random
 import socket
 import struct
 import sys
+import threading
+import time
 
 if sys.flags.optimize != 0:
     raise SystemExit("Python optimization must be disabled")
@@ -332,22 +334,83 @@ def read_exact(connection, size):
         output.extend(chunk)
     return bytes(output)
 
-identifier = random.randrange(0, 65536)
-hostname = b"github.com"
-question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
-packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
-with socket.create_connection(("127.0.0.1", 53), timeout=5) as connection:
-    connection.settimeout(5)
+def dns_packet(hostname, identifier):
+    question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
+    return struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+
+
+def resolve_tcp(connection, hostname=b"github.com"):
+    identifier = random.randrange(0, 65536)
+    packet = dns_packet(hostname, identifier)
     connection.sendall(struct.pack("!H", len(packet)) + packet)
     response_length = struct.unpack("!H", read_exact(connection, 2))[0]
     response = read_exact(connection, response_length)
+    response_identifier, flags, question_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
+    require(response_identifier == identifier)
+    require(flags & 0x8000 != 0)
+    require(flags & 0x000F == 0)
+    require(question_count == 1)
+    require(answer_count > 0)
 
-response_identifier, flags, question_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
-require(response_identifier == identifier)
-require(flags & 0x8000 != 0)
-require(flags & 0x000F == 0)
-require(question_count == 1)
-require(answer_count > 0)
+
+with socket.create_connection(("127.0.0.1", 53), timeout=5) as connection:
+    connection.settimeout(5)
+    resolve_tcp(connection, b"github.com")
+    resolve_tcp(connection, b"api.github.com")
+
+barrier = threading.Barrier(4)
+failures = []
+
+
+def resolve_concurrently():
+    try:
+        with socket.create_connection(("127.0.0.1", 53), timeout=5) as connection:
+            connection.settimeout(5)
+            barrier.wait(timeout=5)
+            resolve_tcp(connection)
+    except (Exception, SystemExit) as error:
+        failures.append(str(error))
+
+
+workers = [threading.Thread(target=resolve_concurrently) for _ in range(4)]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join(timeout=8)
+require(all(not worker.is_alive() for worker in workers), "concurrent TCP DNS clients did not complete")
+require(not failures, "concurrent TCP DNS clients did not all resolve")
+
+with socket.create_connection(("127.0.0.1", 53), timeout=5) as stalled:
+    stalled.settimeout(2)
+    packet = dns_packet(b"github.com", random.randrange(0, 65536))
+    stalled.sendall(struct.pack("!H", len(packet)) + packet[:1])
+
+    with socket.create_connection(("127.0.0.1", 53), timeout=5) as connection:
+        connection.settimeout(5)
+        resolve_tcp(connection)
+
+    closed = False
+    started = time.monotonic()
+    for byte in packet[1:15]:
+        if time.monotonic() - started >= 3:
+            break
+        try:
+            stalled.sendall(bytes([byte]))
+        except OSError:
+            closed = True
+            break
+        time.sleep(0.2)
+
+    if not closed:
+        stalled.settimeout(1)
+        try:
+            closed = stalled.recv(1) == b""
+        except (ConnectionResetError, BrokenPipeError):
+            closed = True
+        except TimeoutError:
+            closed = False
+
+    require(closed, "a slow TCP DNS frame exceeded its fixed deadline")
 PY
 fi
 
