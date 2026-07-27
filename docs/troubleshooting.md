@@ -8,7 +8,7 @@ If setup fails and you need more detail, set the standard GitHub Actions reposit
 
 ## Check The Supported Runner
 
-Fence's protected target is a GitHub-hosted `ubuntu-24.04` x64 host job. A job using `ubuntu-latest`, another architecture, a container job, or a self-hosted runner may fail the support check or may not establish the protected lifecycle.
+Fence supports GitHub-hosted x64 host jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the stable, release-validated image. `ubuntu-latest` is regularly tested, but GitHub can change its image; Fence fails closed if the current runner does not pass its security checks. Other architectures, container jobs, and self-hosted runners are unsupported.
 
 Fence must be the first meaningful step in the job. Move checkout, setup actions, and workflow commands after Fence so the Action can validate the expected runner state before other code changes it.
 
