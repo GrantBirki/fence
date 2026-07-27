@@ -47,6 +47,12 @@ type AllowlistEntry = {
   protocol: "tcp" | "udp";
   port: number;
 };
+type StrictJsonFrame = {
+  kind: "object";
+  keys: Set<string>;
+} | {
+  kind: "array";
+};
 type AuditFindingRow = {
   destination: string;
   destinationKind: "hostname" | "ip";
@@ -99,6 +105,8 @@ type StructuredNetworkRow = {
 };
 
 const MAX_CONFIG_BYTES = 256 * 1024;
+const MAX_CONFIG_JSON_DEPTH = 127;
+const MAX_CONFIG_UNSIGNED_INTEGER = "18446744073709551615";
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const MAX_NATIVE_ALLOWLIST_ENTRIES = 64;
 const MAX_CRITICAL_FINDINGS = 64;
@@ -360,14 +368,51 @@ function validateHostname(value: string): string {
   if (destination === undefined) {
     fail("allowlist hostname entries must be valid exact names or bounded wildcard patterns");
   }
+  if (
+    RESULTS_STORAGE_HOSTNAME.test(destination) &&
+    !STATIC_RESULTS_STORAGE_HOSTNAMES.has(destination)
+  ) {
+    fail("allowlist hostname entries must not target runner-authorized GitHub results storage");
+  }
   return destination;
 }
 
+function normalizeLiteralIp(value: string): string | undefined {
+  if (value.includes("%")) {
+    return undefined;
+  }
+  const family = net.isIP(value);
+  if (family === 0) {
+    return undefined;
+  }
+  const canonical = new net.SocketAddress({
+    address: value,
+    family: family === 4 ? "ipv4" : "ipv6",
+  }).address;
+  if (
+    family !== 6 ||
+    !canonical.includes(".") ||
+    canonical.startsWith("::ffff:")
+  ) {
+    return canonical;
+  }
+
+  const separator = canonical.lastIndexOf(":");
+  const [first, second, third, fourth] = canonical
+    .slice(separator + 1)
+    .split(".")
+    .map(Number);
+  const firstGroup = ((first << 8) | second).toString(16);
+  const secondGroup = ((third << 8) | fourth).toString(16);
+  return `${canonical.slice(0, separator)}:${firstGroup}:${secondGroup}`;
+}
+
 function validateIp(value: string): string {
-  if (net.isIP(value) === 0) {
+  const canonical = normalizeLiteralIp(value);
+  if (canonical === undefined) {
     fail("allowlist ip entries must be valid literal IP addresses");
   }
-  return value;
+  return canonical;
 }
 
 function validateCidr(value: string): string {
@@ -386,14 +431,10 @@ function validateCidr(value: string): string {
   if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > maximum) {
     fail(`allowlist cidr prefix length must be between 0 and ${maximum}`);
   }
-  if (address.includes("%")) {
+  const canonicalAddress = normalizeLiteralIp(address);
+  if (canonicalAddress === undefined) {
     fail("allowlist cidr entries must identify a canonical IP network");
   }
-
-  const canonicalAddress = new net.SocketAddress({
-    address,
-    family: family === 4 ? "ipv4" : "ipv6",
-  }).address;
   let addressParts: string[];
   if (family === 4) {
     addressParts = canonicalAddress.split(".");
@@ -621,6 +662,195 @@ function readJsonBounded(file: string, maximumBytes: number, description: string
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function validateStrictJsonTokens(raw: string): void {
+  const frames: StrictJsonFrame[] = [];
+
+  for (let index = 0; index < raw.length;) {
+    const character = raw[index];
+    if (character === '"') {
+      const start = index++;
+      while (index < raw.length) {
+        if (raw[index] === "\\") {
+          index += 2;
+        } else if (raw[index++] === '"') {
+          break;
+        }
+      }
+
+      let next = index;
+      while (next < raw.length && /\s/.test(raw[next])) {
+        next += 1;
+      }
+      const frame = frames[frames.length - 1];
+      if (raw[next] === ":" && frame?.kind === "object") {
+        const key = JSON.parse(raw.slice(start, index)) as string;
+        if (frame.keys.has(key)) {
+          fail("config JSON objects must not contain duplicate fields");
+        }
+        frame.keys.add(key);
+      }
+      continue;
+    }
+
+    if (character === "{" || character === "[") {
+      if (frames.length >= MAX_CONFIG_JSON_DEPTH) {
+        fail("config JSON exceeds the supported nesting limit");
+      }
+      frames.push(character === "{"
+        ? { kind: "object", keys: new Set<string>() }
+        : { kind: "array" });
+      index += 1;
+      continue;
+    }
+
+    if (character === "}" || character === "]") {
+      frames.pop();
+      index += 1;
+      continue;
+    }
+
+    if (character === "-" || (character >= "0" && character <= "9")) {
+      const start = index++;
+      while (index < raw.length && /[0-9eE+.\-]/.test(raw[index])) {
+        index += 1;
+      }
+      const value = raw.slice(start, index);
+      if (
+        !/^(?:0|[1-9][0-9]*)$/.test(value) ||
+        value.length > MAX_CONFIG_UNSIGNED_INTEGER.length ||
+        (
+          value.length === MAX_CONFIG_UNSIGNED_INTEGER.length &&
+          value > MAX_CONFIG_UNSIGNED_INTEGER
+        )
+      ) {
+        fail("config numeric values must be unsigned 64-bit JSON integers");
+      }
+      continue;
+    }
+
+    index += 1;
+  }
+}
+
+function validateParsedInlineConfig(parsed: Record<string, unknown>): string {
+  const fields = new Set([
+    "schema_version",
+    "mode",
+    "invocation_id",
+    "platform_profile",
+    "container_policy",
+    "disable_broad_github_domains",
+    "allow_github_artifacts",
+    "allowlist",
+  ]);
+  if (Object.keys(parsed).some((field) => !fields.has(field))) {
+    fail("config input must contain only recognized fields");
+  }
+  for (const field of ["schema_version", "mode", "invocation_id", "allowlist"]) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, field)) {
+      fail(`config input is missing required field: ${field}`);
+    }
+  }
+  if (parsed.schema_version !== 1) {
+    fail("config schema_version must be the unsigned integer 1");
+  }
+  if (parsed.mode !== "block" && parsed.mode !== "audit") {
+    fail("config mode must be block or audit");
+  }
+
+  const invocationId = parsed.invocation_id;
+  if (
+    typeof invocationId !== "string" ||
+    invocationId.length < 1 ||
+    invocationId.length > 64 ||
+    !INVOCATION_ID.test(invocationId)
+  ) {
+    fail("config invocation_id must use the Fence lowercase slug grammar");
+  }
+
+  if (
+    parsed.platform_profile !== undefined &&
+    parsed.platform_profile !== null &&
+    parsed.platform_profile !== REVIEWED_PLATFORM_PROFILE
+  ) {
+    fail(`config platform_profile must be ${REVIEWED_PLATFORM_PROFILE}`);
+  }
+  if (parsed.container_policy !== undefined && parsed.container_policy !== null) {
+    if (parsed.mode === "audit") {
+      fail("config container_policy cannot be used with audit mode");
+    }
+    if (parsed.container_policy !== "disable" && parsed.container_policy !== "unsafe_preserve") {
+      fail("config container_policy must be either disable or unsafe_preserve");
+    }
+  }
+
+  for (const field of ["disable_broad_github_domains", "allow_github_artifacts"]) {
+    if (
+      Object.prototype.hasOwnProperty.call(parsed, field) &&
+      typeof parsed[field] !== "boolean"
+    ) {
+      fail(`config ${field} must be a boolean`);
+    }
+  }
+  if (parsed.allow_github_artifacts === true && parsed.mode !== "block") {
+    fail("allow_github_artifacts can only be used with block mode");
+  }
+
+  if (!Array.isArray(parsed.allowlist)) {
+    fail("config allowlist must be an array");
+  }
+  if (parsed.allowlist.length > MAX_NATIVE_ALLOWLIST_ENTRIES) {
+    fail(`config allowlist must contain no more than ${MAX_NATIVE_ALLOWLIST_ENTRIES} entries`);
+  }
+
+  const allowanceFields = new Set([
+    "destination_type",
+    "destination",
+    "protocol",
+    "port",
+  ]);
+  for (const [index, entry] of parsed.allowlist.entries()) {
+    if (entry === null || Array.isArray(entry) || typeof entry !== "object") {
+      fail(`config allowlist entry ${index + 1} must be an object`);
+    }
+    const allowance = entry as Record<string, unknown>;
+    if (Object.keys(allowance).some((field) => !allowanceFields.has(field))) {
+      fail(`config allowlist entry ${index + 1} contains an unrecognized field`);
+    }
+    for (const field of allowanceFields) {
+      if (!Object.prototype.hasOwnProperty.call(allowance, field)) {
+        fail(`config allowlist entry ${index + 1} is missing required field: ${field}`);
+      }
+    }
+
+    const destinationType = allowance.destination_type;
+    if (
+      destinationType !== "hostname" &&
+      destinationType !== "ip" &&
+      destinationType !== "cidr"
+    ) {
+      fail(`config allowlist entry ${index + 1} must declare hostname, ip, or cidr`);
+    }
+    if (typeof allowance.destination !== "string") {
+      fail(`config allowlist entry ${index + 1} destination must be a string`);
+    }
+    validateDestination(destinationType, allowance.destination);
+    if (allowance.protocol !== "tcp" && allowance.protocol !== "udp") {
+      fail(`config allowlist entry ${index + 1} protocol must be tcp or udp`);
+    }
+    if (
+      typeof allowance.port !== "number" ||
+      !Number.isSafeInteger(allowance.port) ||
+      allowance.port < 1 ||
+      allowance.port > 65535
+    ) {
+      fail(`config allowlist entry ${index + 1} port must be between 1 and 65535`);
+    }
+  }
+
+  return invocationId;
+}
+
 function validateInlineConfig(raw: unknown, environment: Environment = process.env, nativeInput: unknown = undefined): InlineConfig {
   const inputs = normalizeNativeInputs(nativeInput);
   const usingDefault = typeof raw !== "string" || raw.length === 0;
@@ -647,24 +877,8 @@ function validateInlineConfig(raw: unknown, environment: Environment = process.e
   if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
     fail("config input must be a JSON object");
   }
-  if (
-    Object.prototype.hasOwnProperty.call(parsed, "allow_github_artifacts") &&
-    typeof parsed.allow_github_artifacts !== "boolean"
-  ) {
-    fail("config allow_github_artifacts must be a boolean");
-  }
-  if (parsed.allow_github_artifacts === true && parsed.mode !== "block") {
-    fail("allow_github_artifacts can only be used with block mode");
-  }
-  const invocationId = parsed.invocation_id;
-  if (
-    typeof invocationId !== "string" ||
-    invocationId.length < 1 ||
-    invocationId.length > 64 ||
-    !INVOCATION_ID.test(invocationId)
-  ) {
-    fail("config invocation_id must use the Fence lowercase slug grammar");
-  }
+  validateStrictJsonTokens(normalizedRaw);
+  const invocationId = validateParsedInlineConfig(parsed as Record<string, unknown>);
   return { invocationId, raw: normalizedRaw, usingDefault };
 }
 

@@ -1,6 +1,8 @@
 # Allowlist Syntax And DNS Behavior
 
-The native Action `allowlist` input accepts one entry per line and supports up to 64 unique, normalized destinations. Blank lines and lines beginning with `#` are ignored. Equivalent entries are deduplicated using the destination type, normalized destination, protocol, and port before the limit is applied; a 65th unique entry fails before privileged setup.
+The native Action `allowlist` input accepts one entry per line and supports up to 64 unique, normalized destinations. Blank lines and lines beginning with `#` are ignored. Equivalent hostnames, IPv4 addresses, IPv6 addresses, and CIDR networks are deduplicated using the destination type, normalized destination, protocol, and port before the limit is applied; a 65th unique entry fails before privileged setup.
+
+The advanced raw JSON `config` input follows the Rust agent's separate limit of 64 declared allowlist entries. Duplicate JSON object fields, malformed integer values, unknown configuration fields, and invalid destination policies are rejected before privileged setup; the original JSON is passed to the agent unchanged.
 
 ## Accepted Forms
 
@@ -22,7 +24,7 @@ cidr 2001:db8::/64 tcp 443
 - `example.com:8443`, `tcp://...`, and `udp://...` select a specific transport and port.
 - `hostname ...`, `ip ...`, and `cidr ...` are the explicit forms.
 - Literal IPv6 addresses and address ranges should use `ip` or `cidr` so the port remains unambiguous.
-- CIDR entries must identify a canonical network without host bits; for example, `192.0.2.0/24` is valid but `192.0.2.1/24` is rejected before privileged setup.
+- CIDR entries must identify a canonical network with an unsigned prefix and no host bits; for example, `192.0.2.0/24` is valid but `192.0.2.1/24` and `192.0.2.0/+24` are rejected before privileged setup.
 
 ## Exact Hostnames
 

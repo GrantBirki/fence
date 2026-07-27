@@ -418,8 +418,17 @@ test("validates explicit and zero-input inline configurations", () => {
     () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { invocationId: "Action_Test" }),
     /invocation_id input/,
   );
-  assert.throws(() => validateInlineConfig('{"invocation_id":"Action_Test"}'), /slug grammar/);
-  assert.throws(() => validateInlineConfig('{"invocation_id":"action--test"}'), /slug grammar/);
+  for (const invocationId of ["Action_Test", "action--test"]) {
+    assert.throws(
+      () => validateInlineConfig(JSON.stringify({
+        schema_version: 1,
+        mode: "block",
+        invocation_id: invocationId,
+        allowlist: [],
+      })),
+      /slug grammar/,
+    );
+  }
   assert.throws(() => validateInlineConfig("[]"), /JSON object/);
   assert.throws(
     () => validateInlineConfig(JSON.stringify({ invocation_id: "x", padding: "x".repeat(256 * 1024) })),
@@ -515,13 +524,41 @@ test("normalizes canonical IPv4 and IPv6 allowlist networks", () => {
     ["::/0", "::/0"],
     ["2001:0DB8:0000::/064", "2001:db8::/64"],
     ["2001:db8::1/128", "2001:db8::1/128"],
+    ["::192.0.2.0/120", "::c000:200/120"],
+    ["::c000:200/120", "::c000:200/120"],
     ["::ffff:192.0.2.0/120", "::ffff:192.0.2.0/120"],
+    ["::ffff:c000:200/120", "::ffff:192.0.2.0/120"],
   ]) {
     const config = JSON.parse(defaultInlineConfig(
       { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" },
       { allowlist: `cidr ${input} tcp 443` },
     ));
     assert.equal(config.allowlist[0].destination, expected);
+  }
+});
+
+test("canonicalizes literal IP addresses using the Rust agent's policy identity", () => {
+  const environment = { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" };
+  for (const [input, expected] of [
+    ["192.0.2.10", "192.0.2.10"],
+    ["2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1"],
+    ["2001:db8::1", "2001:db8::1"],
+    ["::192.0.2.1", "::c000:201"],
+    ["::c000:201", "::c000:201"],
+    ["::ffff:192.0.2.1", "::ffff:192.0.2.1"],
+    ["::FFFF:C000:0201", "::ffff:192.0.2.1"],
+  ]) {
+    const config = JSON.parse(defaultInlineConfig(environment, {
+      allowlist: `ip ${input} tcp 443`,
+    }));
+    assert.equal(config.allowlist[0].destination, expected);
+  }
+
+  for (const scoped of ["fe80::1%eth0", "fe80::1%3"]) {
+    assert.throws(
+      () => defaultInlineConfig(environment, { allowlist: `ip ${scoped} tcp 443` }),
+      /allowlist line 1: allowlist ip entries must be valid literal IP addresses/,
+    );
   }
 });
 
@@ -549,6 +586,21 @@ test("limits native allowlists to 64 unique canonical destinations", () => {
     "cidr 192.0.2.0/24 tcp 443",
   ]), 64);
   assert.equal(allowlistLength([
+    ...hostnames.slice(0, 63),
+    "ip 2001:0DB8:0000:0000:0000:0000:0000:0001 tcp 443",
+    "ip 2001:db8::1 tcp 443",
+  ]), 64);
+  assert.equal(allowlistLength([
+    ...hostnames.slice(0, 63),
+    "ip ::192.0.2.1 tcp 443",
+    "ip ::c000:201 tcp 443",
+  ]), 64);
+  assert.equal(allowlistLength([
+    ...hostnames.slice(0, 63),
+    "ip ::ffff:c000:201 tcp 443",
+    "ip ::ffff:192.0.2.1 tcp 443",
+  ]), 64);
+  assert.equal(allowlistLength([
     ...hostnames.slice(0, 64),
     "# comments do not consume allowlist entries",
     "",
@@ -569,6 +621,202 @@ test("limits native allowlists to 64 unique canonical destinations", () => {
       "hostname ports.example.com tcp 8443",
     ]),
     /allowlist line 65: allowlist input must contain no more than 64 unique entries/,
+  );
+});
+
+test("rejects runner-authorized results storage before privileged setup", () => {
+  const environment = { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" };
+  for (const allowlist of [
+    "productionresultssa8.blob.core.windows.net",
+    "hostname ProductionResultsSA8.Blob.Core.Windows.Net tcp 443",
+    "tcp://productionresultssa8.blob.core.windows.net:443",
+  ]) {
+    assert.throws(
+      () => defaultInlineConfig(environment, { allowlist }),
+      /allowlist line 1: allowlist hostname entries must not target runner-authorized GitHub results storage/,
+    );
+  }
+
+  assert.throws(
+    () => validateInlineConfig(JSON.stringify({
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "restricted-storage",
+      allowlist: [{
+        destination_type: "hostname",
+        destination: "ProductionResultsSA8.Blob.Core.Windows.Net",
+        protocol: "tcp",
+        port: 443,
+      }],
+    })),
+    /runner-authorized GitHub results storage/,
+  );
+
+  for (const hostname of [
+    "productionresultssa19.blob.core.windows.net",
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa9.blob.core.windows.net",
+    "productionresultssa15.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
+    "productionresultssa100000.blob.core.windows.net",
+    "*.blob.core.windows.net",
+  ]) {
+    const config = JSON.parse(defaultInlineConfig(environment, { allowlist: hostname }));
+    assert.equal(config.allowlist[0].destination, hostname);
+  }
+});
+
+test("validates advanced JSON against the complete Rust configuration contract", () => {
+  const base: Record<string, unknown> = {
+    schema_version: 1,
+    mode: "block",
+    invocation_id: "strict-config",
+    allowlist: [],
+  };
+
+  for (const field of ["schema_version", "mode", "invocation_id", "allowlist"]) {
+    const incomplete = { ...base };
+    delete incomplete[field];
+    assert.throws(
+      () => validateInlineConfig(JSON.stringify(incomplete)),
+      new RegExp(`missing required field: ${field}`),
+    );
+  }
+
+  for (const [configuration, expected] of [
+    [{ ...base, unexpected: true }, /only recognized fields/],
+    [{ ...base, schema_version: 0 }, /schema_version/],
+    [{ ...base, schema_version: "1" }, /schema_version/],
+    [{ ...base, mode: "observe" }, /mode must be block or audit/],
+    [{ ...base, mode: null }, /mode must be block or audit/],
+    [{ ...base, platform_profile: "unsupported" }, /platform_profile/],
+    [{ ...base, platform_profile: false }, /platform_profile/],
+    [{ ...base, container_policy: "preserve" }, /container_policy/],
+    [{ ...base, container_policy: false }, /container_policy/],
+    [{ ...base, mode: "audit", container_policy: "disable" }, /container_policy cannot be used with audit mode/],
+    [{ ...base, disable_broad_github_domains: null }, /disable_broad_github_domains must be a boolean/],
+    [{ ...base, disable_broad_github_domains: "false" }, /disable_broad_github_domains must be a boolean/],
+    [{ ...base, allow_github_artifacts: null }, /allow_github_artifacts must be a boolean/],
+    [{ ...base, allow_github_artifacts: "false" }, /allow_github_artifacts must be a boolean/],
+    [{ ...base, mode: "audit", allow_github_artifacts: true }, /allow_github_artifacts can only be used with block mode/],
+    [{ ...base, allowlist: null }, /allowlist must be an array/],
+    [{ ...base, allowlist: {} }, /allowlist must be an array/],
+  ] as [Record<string, unknown>, RegExp][]) {
+    assert.throws(() => validateInlineConfig(JSON.stringify(configuration)), expected);
+  }
+
+  for (const optional of [
+    { platform_profile: null },
+    { platform_profile: "github_hosted_workflow_bootstrap_v5" },
+    { container_policy: null },
+    { container_policy: "disable" },
+    { container_policy: "unsafe_preserve" },
+    { disable_broad_github_domains: false },
+    { allow_github_artifacts: false },
+  ]) {
+    const raw = JSON.stringify({ ...base, ...optional });
+    assert.equal(validateInlineConfig(raw).raw, raw);
+  }
+
+  const rawAudit = JSON.stringify({
+    ...base,
+    mode: "audit",
+    platform_profile: null,
+    container_policy: null,
+  });
+  assert.equal(validateInlineConfig(rawAudit).raw, rawAudit);
+
+  const original = ' { "schema_version" : 1, "mode" : "block", "invocation_id" : "strict-config", "allowlist" : [] } ';
+  assert.equal(validateInlineConfig(original).raw, original);
+});
+
+test("rejects duplicate JSON fields and noncanonical integer tokens", () => {
+  for (const raw of [
+    '{"schema_version":1,"mode":"block","mode":"audit","invocation_id":"strict-config","allowlist":[]}',
+    '{"schema_version":1,"mode":"block","m\\u006fde":"audit","invocation_id":"strict-config","allowlist":[]}',
+    '{"schema_version":1,"mode":"block","invocation_id":"strict-config","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443,"port":8443}]}',
+    '{"schema_version":1,"mode":"block","invocation_id":"strict-config","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443,"p\\u006frt":8443}]}',
+  ]) {
+    assert.throws(() => validateInlineConfig(raw), /must not contain duplicate fields/);
+  }
+
+  for (const value of ["1.0", "1e0", "1E+0", "-0", "18446744073709551616"]) {
+    const raw = `{"schema_version":${value},"mode":"block","invocation_id":"strict-config","allowlist":[]}`;
+    assert.throws(() => validateInlineConfig(raw), /unsigned 64-bit JSON integers/);
+  }
+
+  for (const value of ["443.0", "443e0", "-0", "18446744073709551616"]) {
+    const raw = `{"schema_version":1,"mode":"block","invocation_id":"strict-config","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":${value}}]}`;
+    assert.throws(() => validateInlineConfig(raw), /unsigned 64-bit JSON integers/);
+  }
+
+  const nested = `${"[".repeat(127)}0${"]".repeat(127)}`;
+  const tooDeep = `{"schema_version":1,"mode":"block","invocation_id":"strict-config","allowlist":[],"unexpected":${nested}}`;
+  assert.throws(() => validateInlineConfig(tooDeep), /supported nesting limit/);
+});
+
+test("validates every advanced allowlist field before privileged setup", () => {
+  const base = {
+    schema_version: 1,
+    mode: "block",
+    invocation_id: "strict-config",
+  };
+  const allowance: Record<string, unknown> = {
+    destination_type: "hostname",
+    destination: "example.com",
+    protocol: "tcp",
+    port: 443,
+  };
+
+  for (const field of ["destination_type", "destination", "protocol", "port"]) {
+    const incomplete = { ...allowance };
+    delete incomplete[field];
+    assert.throws(
+      () => validateInlineConfig(JSON.stringify({ ...base, allowlist: [incomplete] })),
+      new RegExp(`missing required field: ${field}`),
+    );
+  }
+
+  for (const [entry, expected] of [
+    [null, /entry 1 must be an object/],
+    [[], /entry 1 must be an object/],
+    [{ ...allowance, unexpected: true }, /entry 1 contains an unrecognized field/],
+    [{ ...allowance, destination_type: "domain" }, /declare hostname, ip, or cidr/],
+    [{ ...allowance, destination: 123 }, /destination must be a string/],
+    [{ ...allowance, destination: "*.com" }, /bounded wildcard patterns/],
+    [{ ...allowance, destination_type: "ip", destination: "example.com" }, /valid literal IP addresses/],
+    [{ ...allowance, destination_type: "ip", destination: "fe80::1%eth0" }, /valid literal IP addresses/],
+    [{ ...allowance, destination_type: "cidr", destination: "192.0.2.1/24" }, /canonical IP network without host bits/],
+    [{ ...allowance, destination_type: "cidr", destination: "192.0.2.0/+24" }, /literal IP network and prefix length/],
+    [{ ...allowance, protocol: "icmp" }, /protocol must be tcp or udp/],
+    [{ ...allowance, port: 0 }, /port must be between 1 and 65535/],
+    [{ ...allowance, port: 65536 }, /port must be between 1 and 65535/],
+    [{ ...allowance, port: "443" }, /port must be between 1 and 65535/],
+  ] as [unknown, RegExp][]) {
+    const raw = JSON.stringify({ ...base, allowlist: [entry] });
+    assert.throws(() => validateInlineConfig(raw), expected);
+  }
+});
+
+test("limits advanced JSON to 64 physically declared allowlist entries", () => {
+  const allowance = {
+    destination_type: "hostname",
+    destination: "example.com",
+    protocol: "tcp",
+    port: 443,
+  };
+  const configuration = (count: number): string => JSON.stringify({
+    schema_version: 1,
+    mode: "block",
+    invocation_id: "raw-allowlist-limit",
+    allowlist: Array.from({ length: count }, () => allowance),
+  });
+
+  const exactly64 = configuration(64);
+  assert.equal(validateInlineConfig(exactly64).raw, exactly64);
+  assert.throws(
+    () => validateInlineConfig(configuration(65)),
+    /config allowlist must contain no more than 64 entries/,
   );
 });
 

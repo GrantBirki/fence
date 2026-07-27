@@ -130,7 +130,7 @@ cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
 
-Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. CIDR entries must identify a network address without host bits. Fence accepts up to 64 unique, normalized allowlist entries; duplicate entries, blank lines, and comments beginning with `#` do not count more than once. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
+Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. CIDR entries must identify a network address without host bits. Fence accepts up to 64 unique, normalized allowlist entries; duplicate entries, equivalent IP addresses, blank lines, and comments beginning with `#` do not count more than once. Invalid input is rejected before privileged setup. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
 
 **Read more:** [Allowlist syntax and DNS behavior](docs/allowlist.md)
 
