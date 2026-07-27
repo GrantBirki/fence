@@ -40,7 +40,7 @@ The supported hosted VM also depends on Azure platform services. The selected pr
 
 ## Startup And Readiness
 
-Before reporting readiness, Fence checks the supported runner fingerprint, prepares the selected network policy, applies and verifies the required controls, and resolves required exact hostnames in bounded parallel batches. Transient or addressless DNS results receive at most three attempts within one shared ten-second startup deadline; malformed or integrity-invalid responses fail immediately.
+Before reporting readiness, Fence checks the supported runner fingerprint, prepares the selected network policy, applies and verifies the required controls, and resolves required exact hostnames in bounded parallel batches. Transient or addressless DNS results receive at most three attempts within one shared ten-second startup deadline; a malformed or integrity-invalid response immediately stops the remaining bootstrap work.
 
 After readiness, Fence remains resident and verifies the controls every five seconds. It never restores access at the end of the job; the disposable GitHub-hosted VM teardown removes the state.
 
