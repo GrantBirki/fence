@@ -1,54 +1,88 @@
-# Getting Started
+# Getting Started 🚀
 
-Fence is a GitHub Action for GitHub-hosted x64 host jobs using `ubuntu-24.04` or `ubuntu-latest`. `ubuntu-24.04` is the fixed, release-validated security target; `ubuntu-latest` is regularly tested and must pass the same runner security checks. Run Fence before checkout and any other steps you want it to constrain.
+Fence limits where a GitHub Actions job can send network traffic. Add it as the first step so the rest of the job runs with those limits in place.
 
-## Add Fence To A Job
-
-Use the full 40-character `action_commit` value from the release's `action-release.json` asset:
+## Add Fence To Your Workflow
 
 ```yaml
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: openai/fence@<fence-commit-sha>
+      - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+
       - uses: actions/checkout@<checkout-commit-sha>
-      - run: script/test
+
+      - name: Run tests
+        run: script/test
 ```
 
-The root `main` branch is source-only and intentionally omits the generated agent bundle. A release-specific `vX.Y.Z` tag identifies a signed distribution commit, but consumers should pin the immutable distribution commit from `action-release.json` rather than the tag.
+Copy the full commit SHA and version from a [published release](https://github.com/openai/fence/releases). Each release includes a ready-to-use pin. The `main` branch does not contain the bundled Action, so it cannot be used directly.
 
-## Default Behavior
+Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is also tested, but GitHub can change the image behind that label.
 
-With no inputs, the Action starts Fence in `block` mode with an empty user `allowlist`. Fence permits the bounded platform traffic required for the GitHub-hosted runner, blocks other outbound traffic, disables passwordless sudo, and disables Docker and containerd control paths.
+## What Happens By Default?
 
-Fence allows the core GitHub Actions status and finalization endpoints. The default compatibility profile also includes `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the exact optional hosted-runner watchdog endpoint, and a bounded class of GitHub application hostnames. Set `disable_broad_github_domains: true` to remove those broader platform-origin destinations while retaining the core Actions path.
+Without additional configuration, Fence:
 
-GitHub uploads job logs and summaries to per-run Azure storage accounts. Fence always permits five exact reviewed static compatibility accounts: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. It can authorize at most four additional exact results-storage hostnames when the DNS request is attributable to the pinned GitHub runner process; it never permits the general `*.blob.core.windows.net` suffix.
+- Keeps required GitHub Actions and runner connections available.
+- Blocks other outbound connections.
+- Turns off passwordless `sudo`.
+- Disables Docker and container access.
+- Reports network activity in the job summary and post-job log.
 
-GitHub artifact uploads, Pages, and caches use a separate action process rather than the pinned runner process. If a job needs those operations, explicitly enable the bounded compatibility option:
+Required GitHub and runner platform connections are built in. You do not need to add GitHub's job-reporting domains yourself.
+
+## Allow A Domain
+
+Allow only the destinations your workflow needs:
 
 ```yaml
-- uses: openai/fence@<fence-commit-sha>
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    allowlist: |
+      api.example.com
+      registry.example.com:8443
+```
+
+A hostname without a port uses TCP port `443`. The [allowlist guide](allowlist.md) covers other ports, IP addresses, network ranges, and wildcards.
+
+## Start With Audit Mode
+
+Not sure which connections your job needs? Start in audit mode:
+
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    mode: audit
+```
+
+Audit mode records what Fence would block without blocking traffic or disabling `sudo` and Docker. Check the job summary, add the destinations you need, and remove `mode: audit` when you are ready to enforce the allowlist.
+
+## Upload Artifacts Or Deploy Pages
+
+Artifact uploads, GitHub Pages, and caches can need access to GitHub Actions storage:
+
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
   with:
     allow_github_artifacts: true
 ```
 
-This option is off by default. When enabled, uniquely attributed runner-owned descendants of the pinned GitHub runner can authorize exact GitHub-shaped results-storage accounts over TCP port `443`, sharing the existing four-account lifetime limit. Other workflow steps can also use an authorized account, and a matching account name does not prove GitHub owns it. Enable this option only when the job needs artifact access; it does not authorize the general Azure Blob Storage suffix.
+> [!IMPORTANT]
+> Later workflow steps can also use this storage access to send data out of the runner. Enable it only when your job needs artifacts, Pages, or caches.
 
-The supported hosted VM also depends on Azure platform services. The selected profile permits root-only host access to WireServer at `168.63.129.16` on TCP ports `80` and `32526`, plus host and forwarded access to Azure IMDS at `169.254.169.254` on TCP port `80`. These are separate platform rules, not user allowlist entries.
+## Use Docker
 
-## Startup And Readiness
+If your job needs Docker or containerd, keep container access available:
 
-Before reporting readiness, Fence checks the supported runner fingerprint, prepares the selected network policy, applies and verifies the required controls, and resolves required exact hostnames in bounded parallel batches. Transient or addressless DNS results receive at most three attempts within one shared ten-second startup deadline; a malformed or integrity-invalid response immediately stops the remaining bootstrap work.
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    container_policy: unsafe_preserve
+```
 
-After readiness, Fence remains resident and verifies the controls every five seconds. It never restores access at the end of the job; the disposable GitHub-hosted VM teardown removes the state.
+> [!WARNING]
+> Container access weakens Fence's runner isolation. Enable it only when the job requires containers.
 
-## Choose A Mode
-
-- Use the default `block` mode for the strongest supported containment claim.
-- Add `allow_github_artifacts: true` only when a block-mode job needs GitHub artifacts, Pages, or caches and you accept the additional bounded data-egress channel.
-- Use `audit` to observe the policy before enabling blocking.
-- Use `container_policy: unsafe_preserve` only when the workflow requires Docker or containerd access and you accept the weaker containment boundary.
-
-See [configuration examples](examples.md), [allowlist syntax](allowlist.md), and the normative [Fence v0 specification](v0.md) for the complete contract.
+See [configuration examples](examples.md), [allowlist syntax](allowlist.md), and [troubleshooting](troubleshooting.md) for more help.

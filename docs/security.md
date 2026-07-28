@@ -1,55 +1,75 @@
-# Security Boundaries And Operational Guidance
+# Security Guide 🔒
 
-Fence reduces where later workflow steps can send data and removes common ways for those steps to undo the restriction. It is a narrow security control for one supported runner class, not a general sandbox or a claim that the job is fully hermetic.
+Fence limits where a GitHub Actions job can send network traffic and removes common ways to undo those limits. It is not a sandbox.
 
-## Supported Boundary
+## Supported Runners
 
-Fence supports GitHub-hosted x64 host jobs using `ubuntu-24.04` or `ubuntu-latest`. `ubuntu-24.04` remains the fixed, release-validated v0 security target. `ubuntu-latest` is supported when its current image passes the same reviewed runner fingerprint; it is regularly tested, but future image changes are not trusted automatically. Container jobs, other architectures, self-hosted runners, and direct CLI launches do not establish the protected production lifecycle.
+Fence supports GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`.
 
-Two non-required workflows provide operational compatibility evidence without expanding that boundary. `nightly` builds an ephemeral production-shaped candidate from the exact current `main` source SHA and runs the complete unique-case Action-acceptance suite on `ubuntu-latest`. Scheduled and input-free manual `action drift canary` runs resolve the newest non-prerelease immutable release, validate its `action-release.json`, and run the mapped release's zero-input standard lifecycle on both `ubuntu-24.04` and `ubuntu-latest`; explicit-SHA diagnostics and reusable release-candidate validation remain fixed to `ubuntu-24.04`. The scheduled compatibility signals are not branch-protection or release gates; the fixed-label reusable canary remains part of release validation. A green floating-label result means only that the image currently selected by `ubuntu-latest` matched Fence's reviewed fingerprint and passed its applicable suite; a future image is not automatically trusted.
+- Releases are validated on `ubuntu-24.04`.
+- `ubuntu-latest` is tested regularly, but GitHub can change the image behind that label.
+- Self-hosted runners, container jobs, other architectures, Windows, and macOS are not supported.
 
-Fence should run before checkout and all other steps that need restriction. It checks a reviewed hosted-runner fingerprint before mutation, but it does not authenticate a privileged command or platform component that was already compromised before Fence started.
+Fence checks the runner before changing it. If the runner does not match a supported configuration, setup fails.
 
-## Mode Boundaries
+Run Fence before checkout and the other steps you want it to protect.
 
-- Standard `block` applies the bounded network policy, disables measured passwordless sudo, disables accepted Docker/containerd control paths, and verifies the post-mutation baseline before readiness.
-- `block` with `container_policy: unsafe_preserve` keeps container access available. It still applies the network policy and disables passwordless sudo, but the retained container control plane invalidates the ordinary containment claim.
-- `audit` observes policy activity without blocking traffic and preserves passwordless sudo and container access. Its readiness is explicitly observation-only.
+## Protection Modes
 
-Fence never silently downgrades from standard block mode to a weaker mode.
+- **Block:** Allows required runner connections and your allowlist, blocks other outbound traffic, and disables passwordless `sudo` and Docker. This is the default.
+- **Audit:** Shows what block mode would deny without blocking traffic or disabling `sudo` and Docker.
+- **Preserved containers:** `container_policy: unsafe_preserve` keeps Docker and containerd available. Network filtering stays active, but the runner is less isolated.
 
-## Allowed Destinations Remain Reachable
+Fence never switches to audit mode or preserved containers automatically.
 
-The built-in GitHub policy is a compatibility tradeoff. Core Actions status and finalization endpoints must remain reachable, and the default profile also permits broader GitHub web, API, release-asset, watchdog, and bounded GitHub application destinations. Later workflow code can send data to any destination that remains allowed.
+## Built-In Network Access
 
-Set `disable_broad_github_domains: true` to remove `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the exact optional hosted-runner watchdog, and new platform-origin broad GitHub application authorizations. This does not remove the core reporting path, exact results-storage compatibility, or an explicit user wildcard.
+GitHub-hosted jobs need some network access to run, report their status, and finish. Fence keeps the GitHub and Azure connections needed for those tasks available.
 
-GitHub's authorized results-storage accounts are also reachable over TCP port `443` for the rest of the job after authorization. Fence always permits exactly five reviewed static compatibility accounts: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. By default, Fence limits additional dynamic authorization to at most four exact accounts requested by the pinned runner process and records the bounded authorization locally; it does not permit the general Azure Blob Storage suffix.
+The default policy allows GitHub's website, API, release downloads, and job reporting. Set `disable_broad_github_domains: true` to remove optional GitHub destinations when your job does not need them. Job reporting still works.
 
-Separate hosted-runner platform rules permit root-only access to Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526`, plus host and forwarded access to Azure IMDS at `169.254.169.254` on TCP port `80`. These are built-in platform channels rather than user allowlist entries: later workflow code can use the shared IMDS rule, while any root-owned host process can use the WireServer rules.
+Fence also allows the storage endpoints needed for job reporting without allowing all Azure Blob Storage. GitHub artifacts, Pages, and caches may need `allow_github_artifacts: true` for additional storage access.
 
-### Optional GitHub Artifact Compatibility
+> [!IMPORTANT]
+> Any destination a job can reach can also receive its data. Keep your allowlist narrow and enable artifact access only when needed.
 
-`allow_github_artifacts: true` explicitly permits uniquely attributed runner-owned descendants of the pinned `Runner.Worker`, including GitHub artifact, Pages, and cache actions, to request exact `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` results-storage accounts. It remains limited to TCP port `443`, the shared maximum of four dynamically authorized accounts, bounded process ancestry, verified DNS answers, existing bounded TTLs, and structurally verified firewall materialization. It does not permit `*.blob.core.windows.net`, arbitrary Azure storage, Docker-originated requests, or unverified or ambiguously attributed DNS requests.
+## Azure Platform Services
 
-This option is disabled by default and deliberately weakens the default results-storage provenance boundary. A matching storage hostname is not cryptographic proof that GitHub owns the account or issued it for the current job. Fence cannot authenticate the official upload action, inspect HTTPS contents, distinguish intended Pages or artifacts from uploaded secrets or source code, or prevent later workflow code from reusing an authorized account. The resulting artifact-upload channel is intentional and must be treated as data egress. Keep the option disabled for jobs that do not need GitHub artifacts, Pages, or caches.
+GitHub-hosted runners depend on Azure platform services:
 
-## Integrity And Drift
+- **Azure Instance Metadata Service (IMDS):** `169.254.169.254:80` remains reachable from host and forwarded traffic, including later workflow steps.
+- **Azure WireServer:** `168.63.129.16` on TCP ports `80` and `32526` is available only to root-owned host processes.
 
-The Action validates its checked-in manifest, copies the bundled agent into a protected root-owned launcher directory, and starts only that protected copy. The agent validates trusted executable identities, reviewed path ancestors, sudo-policy sources, runner identity, and the bounded root TCP, Unix, and container inventory before protection is claimed.
+These platform connections are built in; you do not need to add them to `allowlist`. Fence does not block IMDS.
 
-After readiness, Fence rechecks its firewall, lockdown or observation state, local-control inventory, required worker health, and evidence every five seconds. A critical resident failure is permanent and causes the protected post-job hook to fail the job. Fence intentionally does not restore network, sudo, or container access before the disposable VM is torn down.
+## GitHub Artifacts
 
-## Local Evidence And Privacy
+`allow_github_artifacts: true` lets approved runner-owned processes reach a limited number of storage endpoints used by GitHub Actions over HTTPS. It is off by default.
 
-Fence does not upload telemetry. Local reports contain bounded control results, network decisions, and findings. Best-effort process attribution may include attribution status, actor class, PID, executable basename, and up to four parent executable basenames; it excludes command arguments, full executable paths, environments, working directories, and packet payloads.
+Once Fence allows a storage endpoint, later workflow steps can reach it too. Fence cannot inspect encrypted uploads or prove that the account belongs to GitHub. Artifact uploads are an intentional way to send data out of the runner.
 
-The protected post hook also writes a bounded network activity table and exactly one schema-`1` `FENCE_REPORT_JSON=` record to ordinary job logs after verifying its resident service and evidence. These public-facing reports contain at most 20 grouped destinations and never exceed 16 KiB for the structured record. They may expose observed hostnames, literal IP addresses, and the same approved actor class, executable basename, and PID already shown in the job summary to anyone with access to the workflow run. They do not expose parent-process details, raw reports, credentials, environment variables, packet contents, full paths, or process arguments. Critical results are recorded before the hook fails the job; malformed or unverified evidence is never reported as healthy.
+## Runtime Integrity
 
-Uniquely owned unconnected host UDP sockets with wildcard local or remote endpoints can be correlated. Forwarded or container UDP traffic is not matched against the host socket table, so it cannot be linked to an unrelated host program. Process races and shared sockets can still produce `not_found` or `ambiguous` attribution. Attribution enriches local evidence but does not decide whether a destination is allowed.
+Fence verifies its bundled agent, runs it from a protected root-owned location, and keeps checking the runner's network and privilege settings.
 
-## Pinning And Provenance
+If a required protection changes, Fence records the problem and fails the job. It does not restore network, `sudo`, or Docker access. GitHub discards the hosted runner when the job ends.
 
-Consumers should pin the full immutable `action_commit` SHA from the release's `action-release.json` asset. Do not consume Fence from `main` or rely on a version tag as the workflow reference. See [Release Provenance](release-provenance.md) for the source, distribution commit, artifact, and attestation model.
+## Reports And Privacy
 
-For the formal claims and residual risks, read the [Fence v0 specification](v0.md), [threat model](threat-model.md), and [security review](security-review.md). Report vulnerabilities according to the repository [security policy](../SECURITY.md).
+Fence does not upload telemetry. Job summaries and logs can include destination hostnames, IP addresses, process names, process IDs, protection status, and warnings.
+
+Reports never include credentials, environment variables, full executable paths, command arguments, or packet contents. Anyone who can read the workflow job log can read its Fence report.
+
+See [network reports](how-it-works.md#network-reports) for the report format and GitHub API example.
+
+## Release Pinning
+
+Pin the full `action_commit` SHA from a [published release](https://github.com/openai/fence/releases):
+
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+```
+
+Do not reference `main`; it contains source code rather than the production Action bundle. See [release provenance](release-provenance.md) for the signed source, bundled artifact, and verification model.
+
+For the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security review](security-review.md). Report vulnerabilities using the [security policy](../SECURITY.md).

@@ -1,124 +1,60 @@
 # Fence Implementation History
 
-This page records the major implementation milestones that led to the current
-v0 contract. It is historical context, not a support or security-claim source.
-See [`v0.md`](v0.md) for normative behavior and
-[`threat-model.md`](threat-model.md) for the current security model.
+This page tracks the major changes that shaped Fence. For current behavior and security guarantees, see the [v0 specification](v0.md) and [threat model](threat-model.md).
 
 ## Bootstrap and policy model
 
-- The repository began from a hermetic Rust template with pinned toolchains,
-  vendored dependencies, offline routine scripts, and Linux x64 packaging.
-- The initial agent model replaced the scaffold commands with the four-command
-  JSON CLI, strict schema-`1` configuration, typed allowlist entries, bounded
-  hostname resolution, deterministic policy hashing, and `render-plan`.
-- Public `run` remained fail-closed until the privileged lifecycle had hosted
-  evidence.
+- Fence started as a Rust project with pinned toolchains, vendored dependencies, offline development scripts, and Linux x64 packaging.
+- The first agent added a strict JSON configuration, typed allowlist entries, bounded hostname resolution, stable policy hashes, and the `render-plan` CLI command.
+- The public `run` command remained disabled until hosted tests could verify the privileged runner lifecycle.
 
 ## Native network evidence
 
-- Fence adopted a fixed singleton native `nftables` table, deterministic
-  ruleset rendering, structured active-state verification, and separate
-  logical-policy and backend-ruleset hashes.
-- Privileged namespace tests proved atomic apply, exact verification,
-  Fence-owned rollback, IPv4/IPv6 behavior, forward-path behavior, and audit
-  versus block verdicts before public activation.
-- NFLOG collection added bounded metadata-only findings. Raw packet prefixes
-  are discarded after parsing and are never serialized.
+- Fence uses a dedicated `nftables` table, predictable firewall rules, and separate hashes for the intended policy and active rules.
+- Privileged tests verified atomic firewall updates, rollback, IPv4 and IPv6 traffic, forwarded traffic, and the difference between audit and block modes.
+- NFLOG added bounded network findings. Fence discards raw packet data after parsing and never includes it in reports.
 
 ## Resident protection lifecycle
 
-- Hosted-runner observation established one accepted GitHub-hosted
-  `ubuntu-24.04` x64 fingerprint.
-- Root-owned runtime storage, transient `systemd` supervision, five-second
-  resident verification, readiness ordering, and pre-ready rollback were
-  proved before public activation.
-- Later hosted evidence added additional exact accepted digests for the fixed cloud-init sudo-policy source without broadening any other fingerprint fact.
-- A bounded Action-acceptance classifier removed the source-before-bundle
-  release deadlock while continuing to reject every unreviewed host drift.
-- The subsequent attested Action bundle refresh adopted profile v4, policy-hash
-  schema `7`, runtime-evidence schema `4`, and the root-only WireServer rules.
-- Standard block added measured passwordless-sudo and Docker/containerd
-  lockdown. `unsafe_preserve` retained container access with degraded
-  assurance, while audit preserved sudo and containers and made no containment
-  claim.
-- The evidence-only hosted observer advanced to schema `4` and added stable,
-  bounded, privacy-reduced Unix/TCP listener and root container-process
-  inventory for review before any closed-host enforcement change.
-- Private local-control stabilization began excluding inaccessible Unix listener churn while retaining fail-closed acquisition checks and every security-relevant container, listener, and owner identity.
-- The attested Action bundle later published fingerprint schema `2`, enforced
-  the reviewed trusted-path, effective-access, and local-control facts during
-  host classification, and added a fatal scheduled fixed-runner drift canary.
-- Fingerprint schema `3` replaced recurring whole-file alternates for the cloud-init sudo source with one strict generated-header digest profile while keeping all body bytes exact and retaining a raw runtime mutation pin.
+- Hosted tests established a trusted GitHub-hosted `ubuntu-24.04` x64 runner fingerprint.
+- Fence added root-owned runtime files, `systemd` supervision, checks every five seconds, ordered readiness, and rollback before protection starts.
+- Runner fingerprinting later accepted specific generated cloud-init headers while continuing to verify the rest of the sudo policy and detect later changes.
+- Standard block mode disables passwordless sudo and Docker. `unsafe_preserve` keeps Docker available with weaker isolation, while audit mode leaves sudo and Docker available without claiming containment.
+- Hosted observation added bounded inventories of Unix sockets, TCP listeners, and root-owned container processes while excluding inaccessible, irrelevant Unix-socket churn.
+- Later fingerprint updates tightened trusted executable checks, local-control verification, and scheduled runner-drift detection.
 
 ## Hosted workflow compatibility
 
-- Fixed endpoint guesses could not reliably complete hosted jobs. Controlled
-  evidence selected a bounded DNS-mediated workflow-bootstrap profile instead
-  of broad arbitrary DNS or HTTPS access.
-- The selected profile uses explicit roots, bounded Actions-suffix discovery,
-  canonical `A`/`AAAA` forwarding, bounded CNAME descendants, TTL-derived
-  address rules, and completion-driven firewall materialization.
-- Broad `github.com`, `api.github.com`, and release-asset roots are enabled for
-  first-step compatibility and can be removed with
-  `disable_broad_github_domains: true` while core job-reporting endpoints remain.
+- A fixed list of guessed endpoints could not reliably support GitHub-hosted jobs, so Fence adopted a bounded DNS-mediated GitHub Actions policy.
+- The policy uses explicit platform destinations, limited GitHub hostname discovery, canonical `A` and `AAAA` queries, bounded CNAME handling, and short-lived firewall rules.
+- Broad GitHub destinations are available by default for compatibility. `disable_broad_github_domains: true` removes those broad destinations while keeping required job-reporting endpoints.
 
 ## Public agent and Action
 
-- The trusted launcher activated standard block, degraded block, and audit only
-  for a matching root transient service with pinned root-owned input.
-- Stable publication added checksum- and attestation-verified Linux x64 release
-  artifacts and a same-repository Action carrying the reviewed binary.
-- The Action moved from raw JSON as its primary interface to native inputs while
-  retaining strict JSON as an advanced escape hatch. It also added compact
-  progress logs, result-oriented job summaries, and audit allowlist guidance.
+- The trusted launcher starts standard block, degraded block, or audit mode only from the expected root-owned service and configuration.
+- Releases added checksummed and attested Linux x64 binaries, bundled directly into the GitHub Action.
+- Native Action inputs replaced raw JSON for common configuration. Raw JSON remains available for advanced use, alongside job summaries and audit-mode allowlist suggestions.
 
 ## One-PR Action publication
 
-- Releases through `v0.6.3` used the earlier two-stage model: a version/source release was published first, then a later reviewed commit refreshed the checked-in Action binary and manifest. Those historical tags and full-SHA consumer pins remain unchanged.
-- The next release model made protected `main` source-only. A single reviewed change plus version bump authorizes automation to build from source merge `M`, create signed child distribution commit `D` containing only the generated binary and schema-`4` manifest, run full Action acceptance and the fixed-runner canary on `D`, and publish the immutable version tag at `D`.
-- `action-release.json` became the public mapping from version and source `M` to the exact full distribution SHA `D`; consumers continue pinning full commit SHAs, and the Action continues to avoid runtime agent or policy downloads.
+- Releases through `v0.6.3` used two stages: first a source release, then a reviewed update to the Action binary and manifest. Their original tags and commit pins remain unchanged.
+- The current release process keeps `main` source-only. One reviewed version bump authorizes automation to build source commit `M`, create signed distribution commit `D`, test it, and publish an immutable release.
+- `action-release.json` maps each release to its exact distribution commit. Users pin that full commit SHA; the Action never downloads an agent or policy at runtime.
 
 ## v0 hardening
 
-- The agent replaced an unmaintained general netlink packet dependency with a
-  narrow safe-Rust NFLOG configuration serializer.
-- DNS, privileged file handling, subprocess deadlines, response binding,
-  first-connection ordering, and evidence propagation received focused
-  hardening.
-- Derived DNS authorization moved from process-wide answer-owner matching to a
-  response-local chain rooted at the echoed question, with atomic validation
-  and queried-root policy retention. Address-family NODATA responses retain no
-  derived authorization, and duplicate terminal endpoints use the minimum TTL.
-- The single firewall owner now rechecks, applies, verifies, and publishes DNS
-  authorization and materialization candidates as one ordered transaction;
-  queued work cannot restart validation-time expiry.
-- The logical policy now merges platform and user hostname transports,
-  prehydrates exact roots, refreshes them during the resident lifecycle, and
-  keeps transient addresses out of the logical hash.
-- Exact user policy can no longer prehydrate non-static results-storage accounts: configuration rejects those entries before mutation, and bootstrap processing independently refuses runner-gated materialization.
-- Response-local CNAME lineage now rejects non-static results-storage targets so user hostnames cannot bypass pinned-runner attribution or the four-account authorization cap.
-- Local TCP DNS queries now use the same bounded root-only UDP upstream resolver as local UDP queries, preserving the existing firewall exception without granting upstream TCP access.
-- Source-built policy added exact-depth one- and two-label user wildcard
-  hostnames with one shared eight-name lifetime budget, lazy DNS-mediated
-  materialization, deterministic transport union, and explicit local evidence.
-  The subsequent atomic Action refresh adopted the attested v0.5.0 agent,
-  native wildcard parsing, policy-hash schema `8`, runtime-evidence schema `5`,
-  bounded wildcard warnings, and hosted Docker-registry endpoint evidence.
-- Resident workers now report through one health channel; fresh evidence and a
-  live matching service are required at post-job time.
-- The Action runtime and bundled agent are copied to root-owned storage and
-  mounted read-only after launch so later runner-user code cannot replace the
-  registered post hook.
-- Bounded local `/proc` correlation may add best-effort process attribution to
-  actual findings without telemetry, command arguments, full paths,
-  environments, or payload data.
-- Best-effort finding attribution now recognizes uniquely owned unconnected host UDP sockets without matching forwarded or container traffic to an unrelated host program, and denied DNS questions return structurally valid minimal `REFUSED` responses instead of retaining stale EDNS/additional bytes.
-- Hosted evidence pinned the root-owned `walinuxagent.service` identity and
-  observed the same service process naturally connecting to both Azure
-  WireServer ports. The next profile version added exact UID `0` TCP `80` and
-  `32526` rules for `168.63.129.16` as a dedicated platform-service class while
-  leaving workflow traffic and Azure IMDS blocked.
-- A later profile revision added an exact shared TCP `80` rule for Azure IMDS at `169.254.169.254`, with structural active-state verification and an updated logical policy-hash schema. No other IMDS port is part of the platform contract.
+- An unmaintained netlink dependency was replaced with a small safe-Rust NFLOG configuration writer.
+- DNS handling, root-owned files, subprocess timeouts, first connections, and evidence reporting received additional checks.
+- DNS authorization now follows a response-local CNAME chain rooted at the original question. Responses without matching addresses grant no access, and duplicate addresses use the shortest TTL.
+- One firewall owner validates, applies, verifies, and publishes each DNS authorization in order. Waiting in the queue cannot extend an expired authorization.
+- Fence preloads required exact hostnames, refreshes them while running, and keeps temporary IP addresses out of the logical policy hash.
+- Fence trusts a small fixed set of storage accounts used for GitHub Actions. Additional accounts require the pinned GitHub runner identity or an eligible runner descendant when artifact support is enabled; direct allowlist entries, CNAMEs, and wildcards cannot bypass the four-account limit.
+- Local TCP and UDP DNS requests both use the same root-only UDP upstream resolver; no upstream TCP firewall exception is needed.
+- User allowlists support one- and two-label wildcard hostnames with a shared limit of eight discovered names.
+- All resident workers report through one health channel. Post-job checks require fresh evidence and the expected live service.
+- Fence copies its runtime and bundled agent into root-owned storage and mounts them read-only, so later workflow steps cannot replace the post hook.
+- Process attribution can identify a likely program without logging command arguments, full paths, environment variables, packet contents, or unrelated container traffic.
+- Azure WireServer access is limited to root-owned host processes at `168.63.129.16` on TCP ports `80` and `32526`.
+- Azure Instance Metadata Service remains available at `169.254.169.254` on TCP port `80` only.
 
 Future release details belong in GitHub Releases rather than this document.

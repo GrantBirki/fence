@@ -2,22 +2,21 @@
 
 ## Scope
 
-This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-15.
+This review covers Fence's Linux agent, DNS policy, firewall, root-owned runtime files, runner lockdown, GitHub Action, release process, and offline validation scripts.
 
-This document records focused review findings. The current trust assumptions,
-attacker capabilities, abuse paths, and residual-risk priorities are defined in
-the frozen [`threat-model.md`](threat-model.md); normative behavior and schemas
-remain in [`v0.md`](v0.md).
+The [threat model](threat-model.md) describes attacker capabilities, trust assumptions, and remaining risks. The [v0 specification](v0.md) defines the full technical contract.
 
-Fence intentionally supports only GitHub-hosted `ubuntu-24.04` x64 host jobs. Standard block mode reduces arbitrary outbound egress, disables measured passwordless sudo and container-control paths, and keeps resident controls active until ephemeral runner teardown. It does not claim sandboxing, kernel isolation, or elimination of every exfiltration channel. The selected GitHub workflow-bootstrap profile and its bounded DNS mediation remain disclosed channels that later workflow code may use. The exact `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the optional exact watchdog root, and up to eight single-label `*.githubapp.com` names are intentional compatibility exceptions by default. Workflows may set `disable_broad_github_domains: true` to remove those broad GitHub channels while keeping core Actions status and finalization endpoints available. GitHub results storage has five exact reviewed static compatibility roots: `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`. Fence may additionally authorize at most four exact matching accounts requested by the pinned `Runner.Worker` process by default. Block-only `allow_github_artifacts: true` explicitly extends the same four-account budget to uniquely attributed, runner-UID-matching descendants of that pinned worker and records the reduced assurance. Every approved answer remains withheld until its TCP `443` rule is applied and verified.
+Fence supports GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is tested regularly, but GitHub can change its underlying image. Standard block mode limits outbound connections, disables passwordless sudo and container access, and keeps those protections active until the job ends. Fence is not a sandbox and does not prevent data from being sent to allowed destinations.
+
+The default network policy allows the GitHub and runner services needed for compatibility. `disable_broad_github_domains: true` removes optional GitHub destinations while preserving required job-reporting connections. Fence also permits five reviewed storage endpoints and up to four additional accounts requested by the verified `Runner.Worker`. Enabling `allow_github_artifacts` lets verified descendants of that worker use the same four-account limit; it does not prove GitHub owns an account or that an upload is safe. Fence releases an approved DNS response only after applying and verifying its TCP `443` firewall rule.
 
 ## Release Provenance
 
-Protected `main` is source-only and intentionally omits the production Action binary and manifest. A reviewed change plus matching version bump is the sole human release authorization. The release workflow builds the Linux x64 artifact once from signed source merge `M`, generates attestations bound to `M` and `refs/heads/main` in a dedicated least-privilege job, and uses the offline `script/assemble-action-bundle` path to create a production-shaped candidate without downloading an agent, policy, or attestation.
+The protected `main` branch contains source code, not the published Action binary or manifest. A reviewed version bump authorizes a release. The workflow builds the Linux x64 agent from signed source commit `M`, creates attestations for `M` and `refs/heads/main`, and assembles the candidate offline with `script/assemble-action-bundle`.
 
-GitHub's commit API creates signed distribution commit `D` as a one-parent child of `M`; its exact diff is the mode-`0644` binary and schema-`4` provenance manifest. The workflow verifies the signature, parent, diff, manifest identity, and byte equality, then runs complete fixed-runner Action acceptance and the strict drift canary against exact `D`. Only after those gates and final-asset attestation verification pass does the immutable `vX.Y.Z` tag target `D`. The `action-release.json` release asset binds the public version, `M`, `D`, artifact digest, manifest schema, and signer identity, and consumers pin the full `action_commit` SHA.
+GitHub creates signed distribution commit `D` as the direct child of `M`. Its only changes are the mode-`0644` binary and schema-`4` manifest. The workflow verifies the commit, manifest, and binary, then runs full Action acceptance and the fixed-runner drift canary against `D`. After those checks and artifact verification pass, the immutable release tag points to `D`. The `action-release.json` asset records the version, source and distribution commits, binary checksum, manifest schema, and signer. Users pin its full `action_commit` SHA.
 
-Post-publication verification re-downloads the assets, verifies checksums and source-bound attestations, and rechecks `vX.Y.Z -> D`, signed `D -> M`, the exact generated diff, mapping, and bundled bytes before reporting the consumer SHA. The protected release environment is main-only and has no separate required reviewer, so a second publication approval cannot bypass or replace the reviewed version merge. The Action still performs no runtime agent or policy download. Releases through `v0.6.3` retain their historical tag semantics. See GitHub's [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
+After publication, the workflow downloads the assets again and verifies their checksums, attestations, release mapping, tag, commit relationship, and bundled bytes. The release environment accepts only protected `main`; merging the reviewed version change remains the only release approval. The Action never downloads an agent or policy at runtime. Releases through `v0.6.3` retain their original tag behavior. See GitHub's [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
 
 ## Findings Addressed
 
@@ -31,49 +30,27 @@ The UDP mediator previously accepted the first datagram received on its ephemera
 
 ### Docker DNS configuration file safety
 
-The provisional Docker DNS rewrite previously read the existing daemon
-configuration through an unbounded path-following file read. Existing input is
-now opened with no-follow, close-on-exec, and non-blocking flags; non-regular,
-symlink, and oversized files fail closed. Replacement refuses non-regular or
-symlink destinations and validates the opened output file before writing.
+Docker DNS configuration previously followed file paths without bounding the read. Fence now opens existing files without following symlinks, refuses oversized or non-regular files, and verifies replacement files before writing them.
 
 ### Bounded fixed-command execution
 
-DNS routing setup previously waited indefinitely for fixed `systemctl` and
-`resolvectl` subprocesses. The trusted-launcher `systemctl show MainPID`
-identity query also used an unbounded wait. Those commands now have fixed
-execution deadlines and are killed on timeout.
+DNS setup and the launcher's `systemctl show MainPID` check previously waited indefinitely for subprocesses. Those commands now have fixed deadlines and are stopped if they time out.
 
 ### Bounded nftables subprocess input
 
-The native `nftables` executor previously wrote its generated program to child
-stdin before beginning deadline enforcement. A child that stopped reading
-could block that write indefinitely. Stdin writing now occurs in a joined
-worker while the parent enforces the command deadline and kills a stalled
-child.
+The `nftables` executor previously wrote to a child process before starting its timeout, so a child that stopped reading could block forever. Fence now writes in a separate worker while enforcing the command deadline.
 
 ### NFLOG attribute ambiguity
 
-The NFLOG parser previously accepted duplicate payload or prefix attributes and
-could ignore trailing bytes outside aligned attributes. It now rejects those
-ambiguous event shapes before approved metadata extraction.
+The NFLOG parser now rejects duplicate payload or prefix attributes and unexpected trailing bytes before extracting approved metadata.
 
 ### Bounded local incident attribution
 
-Retained NFLOG findings can now be correlated with a unique local Linux socket
-owner through bounded `/proc` snapshots. Fence records only attribution status,
-actor class, PID, executable basename, and at most four parent executable
-basenames. The worker has fixed queue, socket, process, and file-descriptor
-limits and is supervised with the other resident workers. Local socket tuples
-remain internal, and Fence does not record command arguments, full paths,
-environments, working directories, payloads, or telemetry.
+Fence can match a network finding to a uniquely owned local socket using bounded `/proc` snapshots. Reports contain only the attribution status, actor class, PID, executable name, and up to four parent executable names. The worker has fixed limits and is supervised like the other resident workers. Socket details, command arguments, full paths, environment variables, working directories, packet contents, and telemetry are never reported.
 
 ### Sudo policy source file type
 
-The hosted-runner fingerprint path previously bounded sudo policy bytes and
-rejected symlinks but did not require a regular file after opening. Policy
-sources now use a non-blocking open and fail closed unless the opened object is
-a bounded regular file.
+Fence now checks that every opened sudo policy source is a bounded regular file, not a symlink, pipe, device, or another special file.
 
 ### Exact hosted sudo-policy variants
 
@@ -85,73 +62,23 @@ Cloud-init constructs the first `90-cloud-init-users` line from its package vers
 
 ### Effective sudo and trusted-path access
 
-The production fingerprint previously relied on ownership and ordinary mode
-metadata without proving the runner's effective access after ACL processing.
-Fingerprint schema `2` introduced records for every trusted executable, its reviewed
-ancestor directories, and every accepted sudo source. Before mutation, Fence
-uses descriptor-pinned `sudo` and descriptor-pinned `/usr/bin/test` to require
-that the runner cannot write any of those paths, can execute the fixed commands
-and searchable ancestors, and cannot search `/etc/sudoers.d`. Each probe is
-bound to exact path or policy identity immediately before and after execution,
-followed by a full trusted-executable and sudo-inventory recheck. Disposable
-hosted evidence adds an ACL that grants runner search without changing the
-root-owned directory's accepted `0750` mode and proves the effective-access
-check rejects it before readiness or mutation.
+File ownership and mode alone do not prove what the runner can access when ACLs are present. Fence checks every trusted executable, its parent directories, and accepted sudo sources using pinned `sudo` and `/usr/bin/test` descriptors. The runner must not be able to write those paths or search `/etc/sudoers.d`. Each check verifies the same file identity before and after execution. Hosted tests confirm that an unexpected ACL fails before Fence changes the runner.
 
 ### Descriptor-pinned privileged commands
 
-Security-critical host commands previously executed reviewed absolute paths
-after a metadata check, leaving a path replacement window between validation
-and execution. Fence now captures the twelve accepted root-owned command files
-with no-follow, close-on-exec descriptors and revalidates canonical path,
-device, inode, owner, group, and mode before every use. Root commands execute
-the captured inode through `/proc/self/fd`; effective runner probes use pinned
-outer sudo to execute the pinned target without a raw-path fallback. Standard
-descriptors are reserved throughout capture and retained executable descriptors
-must be at least `3`. The sudo transport requires the transient service to have
-no controlling terminal, and hosted audit evidence exercises that path.
+Security-critical commands previously had a small replacement window between checking a path and executing it. Fence now opens all twelve reviewed root-owned executables first, verifies their path and file identity before every use, and executes the captured inode through `/proc/self/fd`. Runner-access checks use pinned `sudo` and the pinned target without falling back to an unchecked path.
 
-This provides forward identity under the first-step and trusted hosted-image
-assumptions. It does not hash or authenticate pre-capture bytes, same-inode
-modification by an already privileged process, the dynamic loader or shared
-libraries, or a malicious root/platform component.
+These checks protect executable identity after capture. They do not authenticate earlier file contents, prevent same-inode changes by an already privileged process, or protect against a compromised loader, shared library, root process, or hosted image.
 
 ### Closed local root-control inventory
 
-Standard lockdown previously verified only named Docker/containerd units and
-sockets, so an additive rootful control endpoint outside that fixed list could
-escape the support gate. Three corrected same-image observations supplied one
-stable, within-bounds, reachability-complete, and ownership-complete reference.
-Fingerprint schema `2` introduced acceptance of the exact two root container identities,
-wildcard IPv4/IPv6 TCP port `22` listeners, and ten domain-separated Unix
-listener identities with reviewed owner sets and multiplicities.
+Checking known Docker and containerd services is not enough: an unexpected root-owned listener can provide another way around runner lockdown. Fence therefore records the accepted root container processes, SSH listeners, and Unix sockets before changing the host.
 
-Production re-observes that inventory before mutation. Standard block may only
-remove accepted container processes or owners, plus the exact
-fingerprint-tagged Docker Unix listener after its reviewed `dockerd` owner has
-exited and the accepted socket unit is stopped. If that listener remains, its
-non-container owners and multiplicity remain exact. Fence then pins the
-verified reduction as its resident baseline; audit and degraded block require
-the full exact reference. The baseline is checked again before readiness and
-every five seconds afterward. Relative filesystem socket names, incomplete
-ownership, unavailable or unreviewed root identity, collection bounds,
-unreviewed reductions, additive endpoints, and post-ready drift fail closed.
-Filesystem reachability probes are limited to possible root-control candidates,
-capped at forty, and share a five-second deadline so nonroot socket volume
-cannot create unbounded privileged probes. Hosted rejection evidence covers an
-unexpected pre-ready root listener and a separate post-ready listener that
-makes resident health permanently critical.
+Standard block mode can remove approved container processes and one specifically identified Docker socket after its owner exits. Audit mode and `unsafe_preserve` must preserve the complete original inventory. Fence checks the resulting inventory before startup and every five seconds afterward. Unexpected listeners, missing ownership information, unreviewed changes, incomplete scans, and later drift fail closed. Filesystem checks are capped at 40 candidates and share a five-second deadline.
 
 ### In-memory pre-ready rollback and no-restore commit
 
-The accepted runner sudo source is now captured only in bounded memory and
-compared exactly again before removal. Pre-ready rollback recreates it with
-exclusive no-follow creation and verifies bytes, mode, ownership, digest,
-complete policy inventory, `visudo`, and uncached runner capability. Sudo and
-container rollback are attempted independently and dual failures are
-aggregated. Once readiness is created, the control enters an explicit
-no-restore state before any later fallible report update, and every rollback
-attempt is rejected.
+Fence keeps the runner's sudo policy only in bounded memory and checks it again before removal. If startup fails, it restores and verifies the exact policy, permissions, digest, configuration validity, and runner capability. Sudo and container rollback are attempted independently. Once Fence reports readiness, restoration is permanently disabled for that job.
 
 ### Source-before-bundle host compatibility
 
@@ -159,17 +86,11 @@ The ephemeral source-built candidate and published distribution bundle expose fi
 
 ### Invocation slug consistency
 
-The Action wrapper rejected consecutive hyphens in invocation identifiers,
-while several Rust validators accepted them. The Rust configuration, runtime,
-and service validators now enforce the same lowercase internal-hyphen grammar
-as the wrapper.
+The Action wrapper and Rust agent now apply the same lowercase, internal-hyphen rules to invocation identifiers.
 
 ### DNS evidence write propagation
 
-Late DNS observation report write failures were previously ignored by the
-proxy threads. The recorder now retains a failure flag that resident audit or
-block verification converts into a bounded critical finding in the primary
-report.
+DNS report-write failures are now recorded and surfaced as critical findings instead of being silently ignored.
 
 ### DNS answer and firewall activation ordering
 
@@ -177,30 +98,9 @@ The DNS mediator previously waited for an approved HTTPS address to enter the ow
 
 ### Response-local DNS alias authorization
 
-CNAME retention previously evaluated every answer edge against process-wide
-hostname authorization. An unrelated answer owner that was independently
-allowed could therefore seed a derived authorization unrelated to the echoed
-question. Fence now parses each complete DNS response once and accepts only one
-linear, acyclic alias chain rooted at that question. Every CNAME must belong to
-the chain, every address must belong to its terminal name, and the chain keeps
-the queried root's origins and transports even if an intermediate name is also
-directly allowed. Address records must match the echoed question family, and
-duplicate terminal endpoints use the minimum TTL. Conflicts, cycles, unrelated
-records, self-referential aliases, invalid depth, and capacity failures reject the whole
-block-mode response without committing partial state. In block mode, valid
-derived authorization is committed only
-after the address rules are applied and verified. Audit may forward invalid
-upstream data but does not retain authorization from it. A fully rooted CNAME
-response with no address records is forwarded as address-family NODATA and
-retains no derived authorization in either mode.
+Fence accepts only one acyclic CNAME chain rooted at the requested hostname. Every alias must belong to that chain, every returned address must belong to its final hostname, and the original hostname's policy remains in effect. Address records must match the requested address family; duplicate addresses use the shortest TTL. Conflicts, cycles, unrelated records, invalid depth, and capacity failures reject the entire response. A CNAME response without addresses grants no derived access.
 
-The resident firewall owner rechecks queued block responses in order against a
-cloned authorization state before rendering any replacement. Stale, expired,
-or over-capacity transactions contribute no candidate address rules. After
-successful structural verification, the owner publishes the candidate
-authorization and active-materialization states before reporting success to
-the DNS worker. Validation-time expiry is absolute and is not restarted by
-queue delay.
+The firewall owner processes approved responses in order, rejects stale or expired requests, and applies and verifies all matching address rules before publishing an authorization. Waiting in the queue never extends an authorization's original expiry.
 
 ### Runner-Bound And Explicitly Opted-In Results-Storage Authorization
 
@@ -216,49 +116,19 @@ Configuration rejects exact user entries for every non-static matching account b
 
 ### Action child-process deadlines and dependency surface
 
-The Action launcher previously had no timeout for fixed privileged subprocess
-calls. It now enforces a bounded deadline. The wrapper source is also
-dependency-free TypeScript executed directly through Node 24 built-in type
-stripping. Its unit suite uses Node's built-in `node:test` and `node:assert`
-modules. Fence does not carry an npm dependency tree, install Node packages, or
-compile TypeScript at workflow runtime. See Node's
-[built-in TypeScript documentation](https://nodejs.org/docs/latest-v24.x/api/typescript.html#type-stripping).
+The Action launcher now enforces deadlines for privileged subprocesses. Its dependency-free TypeScript runs directly through Node 24's built-in type stripping, and its tests use Node's built-in `node:test` and `node:assert` modules. Fence does not install npm packages or compile TypeScript while a workflow runs. See Node's [built-in TypeScript documentation](https://nodejs.org/docs/latest-v24.x/api/typescript.html#type-stripping).
 
 ## Residual Risks And Boundaries
 
-- Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to
-  later workflow code and therefore remain possible exfiltration channels. By
-  default this includes `github.com`, `api.github.com`,
-  `release-assets.githubusercontent.com`, the optional exact watchdog root, and
-  up to eight single-label `*.githubapp.com` names;
-  `disable_broad_github_domains: true` removes those broad channels but retains
-  core Actions status/finalization channels.
+- Approved GitHub DNS and HTTPS destinations remain available to later workflow steps and can carry data off the runner. By default, these include `github.com`, `api.github.com`, release assets, an optional watchdog endpoint, and up to eight `*.githubapp.com` names. `disable_broad_github_domains: true` removes those broad destinations but keeps required job reporting.
 - Explicit user wildcard patterns may contain one or two leading whole-label wildcards and authorize at most eight concrete names per invocation across all patterns. Each `*` matches exactly one DNS label, but the admitted query labels, matching HTTPS destinations, shared resolved addresses, and bounded external CNAME descendants remain exfiltration channels. Fence validates DNS structure rather than registrable-domain ownership and carries no public-suffix database.
 - The five exact reviewed static results-storage accounts are always reachable TCP `443` compatibility channels. Other exact matching results-storage accounts are restricted to the pinned runner by default; explicitly enabled artifact compatibility extends the same bounded four-account dynamic budget to uniquely attributed, runner-UID-matching descendants of the pinned worker.
 - A runner-authorized or explicitly artifact-authorized results-storage account is also reachable by later workflow code at its resolved HTTPS addresses. Fence does not prove GitHub account ownership, authenticate an official action, inspect signed URLs, credentials, or encrypted request content, or prevent artifact-based data exfiltration.
-- The fixed upstream DNS resolver remains a trusted platform dependency. Fence
-  bounds, canonicalizes, and filters requests and validates response source and
-  transaction identity, but does not add DNSSEC validation.
-- [Azure documents `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
-  as its fixed platform virtual address for DNS, VM-agent, and health
-  communication. Fence permits its root-resident DNS mediator to reach UDP `53`
-  and UID `0` host traffic to reach WireServer TCP `80` and `32526`. The latter is a dedicated platform-service rule class, not a workflow or user allowance. Unprivileged and forwarded traffic does not match it. A separate shared platform rule permits host and forwarded traffic to Azure IMDS at `169.254.169.254` on TCP `80` only.
-- Any root-owned host process can use the two WireServer ports. Standard block
-  relies on verified sudo and container lockdown to prevent later workflow code
-  from obtaining UID `0`; degraded block and audit already disclaim ordinary
-  containment.
-- Untrusted workflow code can intentionally deny service to its own job. Fence
-  bounds individual mediator and subprocess waits but does not claim local
-  availability against malicious later steps.
-- Process attribution is best effort. Short-lived processes, shared sockets,
-  namespace boundaries, and bounded scan limits can produce missing or
-  ambiguous ownership instead of a guessed actor.
-- Trusted executable capture prevents path replacement after capture but is not
-  a content-authentication boundary for an already compromised image or root
-  process. Pre-capture byte modification with restored metadata, same-inode
-  privileged writes, the dynamic loader, and shared libraries remain inside
-  the trusted hosted-image/platform assumption.
-- GitHub-hosted runner image drift intentionally fails closed until the pinned
-  fingerprint is reviewed and updated.
-- macOS, Windows, ARM, self-hosted runners, and job-container protection remain
-  unsupported.
+- The upstream DNS resolver is trusted. Fence limits and validates DNS requests and responses but does not perform DNSSEC validation.
+- [Azure's platform address `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16) remains available to Fence's root-owned DNS mediator over UDP `53` and to root-owned host processes over TCP `80` and `32526`. Unprivileged and forwarded traffic cannot use those WireServer ports. Azure IMDS at `169.254.169.254:80` remains available to host and forwarded traffic.
+- Any root-owned host process can use the WireServer ports. Standard block mode depends on verified sudo and container lockdown; audit mode and `unsafe_preserve` do not provide the same isolation.
+- A malicious workflow step can still intentionally slow down or fail its own job.
+- Process attribution is best effort. Short-lived processes, shared sockets, namespaces, and scan limits can leave ownership unknown or ambiguous.
+- Verified executable capture does not protect against an already compromised runner image, root process, dynamic loader, or shared library.
+- Unexpected GitHub-hosted runner changes fail closed until the runner fingerprint is reviewed and updated.
+- macOS, Windows, ARM, self-hosted runners, and jobs running inside containers are unsupported.

@@ -1,155 +1,75 @@
 # Fence v0 Threat Model
 
-Status: security-claim source for the v0 protected target
-Audience: workflow authors, maintainers, adopters, and security reviewers
-Last reviewed: 2026-07-15
+This document explains what Fence protects, what it trusts, and what remains outside its security guarantees. It is intended for workflow authors, maintainers, and security reviewers.
 
-This model must be reviewed before changing the supported runner class,
-platform profile, trusted launcher, privilege controls, evidence trust model,
-or public protection claims. Normative behavior and schemas remain in
-[`v0.md`](v0.md); implementation chronology remains in
-[`history.md`](history.md).
+Review this threat model before changing the supported runners, platform profile, launcher, privilege controls, evidence format, or public security claims. The [v0 specification](v0.md) defines the full contract; the [implementation history](history.md) explains how Fence reached its current design.
 
-The source tree and released Action define the schema-`9` policy and schema-`5` runtime-evidence contract. Protected `main` is source-only; each published Action is a signed generated distribution commit containing the reviewed wrapper source plus the exact binary and schema-`4` `action/bundle-manifest.json`. The wrapper rejects older evidence, stale verification state, malformed wildcard evidence, an incomplete worker set, or a resident PID that does not match the active systemd service. Future contract changes must update the agent, wrapper validators, tests, and source version atomically in one reviewed pull request.
+Fence uses a schema-`9` policy and schema-`5` runtime evidence. The `main` branch contains source code only. Each published Action includes the reviewed wrapper, the exact agent binary, and a schema-`4` manifest in a signed distribution commit. The wrapper rejects outdated evidence, stale verification, malformed wildcard records, missing workers, and agent processes that do not match the running `systemd` service. Changes to this contract must update the agent, wrapper, tests, and version together in one reviewed pull request.
 
 ## Executive summary
 
-Fence protects one narrow environment: a GitHub-hosted `ubuntu-24.04` x64 host
-job in which Fence is the first workflow step. Its highest-risk boundaries are
-the transition from runner-user code to the root resident agent, the exact
-network policy realized from DNS, the privileged host controls that prevent
-later bypass, and the local evidence consumed by the protected post hook. Fence
-reduces arbitrary outbound access; it does not eliminate exfiltration because
-approved GitHub destinations, DNS behavior, exact and wildcard user allowlist
-entries, and shared destination IP addresses remain usable channels.
+Fence protects GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest` when it runs as the first workflow step. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is tested regularly, but GitHub can change the image behind that label.
 
-The versioned platform contract separately permits UID `0` host traffic to Azure WireServer at exact destination `168.63.129.16` on TCP `80` and `32526`. Unprivileged and forwarded traffic does not match those rules. The contract also permits host and forwarded traffic to Azure IMDS at exact destination `169.254.169.254` on TCP `80`; later workflow code can use that endpoint as an egress channel. Any root-owned host process can use the two WireServer ports, so standard block depends on its verified sudo/container lockdown; degraded block and audit do not claim that containment boundary.
+The main risks are how Fence starts its root-owned agent, translates DNS responses into firewall rules, removes sudo and container access, and verifies its post-job evidence. Fence limits outbound network access, but it cannot stop data from being sent to allowed GitHub services, user-approved destinations, or services sharing an allowed IP address.
+
+Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526` is limited to root-owned host processes. Azure Instance Metadata Service at `169.254.169.254:80` remains available to host and forwarded traffic, including later workflow steps. Standard block mode depends on removing sudo and container access so untrusted steps cannot reach root-only services; audit mode and `unsafe_preserve` do not make the same containment claim.
 
 ## Scope and assumptions
 
-In scope:
+Fence covers:
 
-- the root GitHub Action wrapper and bundled Linux agent under `action/`;
-- strict configuration, planning, DNS mediation, native `nftables`, NFLOG,
-  lockdown, runtime storage, resident supervision, and local attribution under
-  `src/`;
-- protected-host validation in `.github/workflows/integration.yml` and
-  `.github/workflows/action-acceptance.yml`;
-- agent and Action-bundle provenance in `.github/workflows/release.yml`, `script/assemble-action-bundle`, and `script/validate-action-bundle`.
+- The GitHub Action wrapper and bundled Linux agent in `action/`.
+- Configuration, DNS mediation, `nftables`, NFLOG, privilege lockdown, runtime storage, service supervision, and local attribution in `src/`.
+- Hosted-runner checks in `.github/workflows/integration.yml` and `.github/workflows/action-acceptance.yml`.
+- Release and bundle verification in `.github/workflows/release.yml`, `script/assemble-action-bundle`, and `script/validate-action-bundle`.
 
-Assumptions that materially define the model:
+This threat model assumes:
 
 - Fence runs before checkout, setup, or other untrusted workflow steps.
-- The runner is an ephemeral GitHub-hosted `ubuntu-24.04` x64 host job that
-  matches the reviewed fingerprint.
-- The reviewed hosted image and privileged platform processes have not
-  modified a trusted executable and restored its accepted metadata before
-  Fence captures it. Fence provides forward executable identity from capture;
-  it does not authenticate pre-capture file contents.
-- Later workflow code may execute arbitrary commands as the unprivileged
-  `runner` user and may possess workflow credentials or sensitive source.
-- The Linux kernel, GitHub runner control plane, GitHub-hosted image supply
-  chain, and GitHub Actions service are trusted.
-- Standard block mode uses `container_policy: disable`; `unsafe_preserve` and
-  `audit` have explicitly weaker claims.
-- Fence has no remote control plane, telemetry upload, or runtime agent/policy
-  download.
+- The runner is an ephemeral GitHub-hosted x64 job using `ubuntu-24.04` or `ubuntu-latest` and matches the reviewed runner fingerprint.
+- The hosted image and privileged platform processes have not replaced a trusted executable before Fence captures it. Fence verifies executable identity after capture; it does not authenticate earlier file contents.
+- Later workflow steps can run arbitrary commands as the unprivileged `runner` user and may have access to credentials or sensitive source code.
+- The Linux kernel, GitHub runner control plane, hosted image supply chain, and GitHub Actions service are trusted.
+- Standard block mode uses `container_policy: disable`; `unsafe_preserve` and `audit` provide weaker isolation.
+- Fence has no remote control plane, telemetry upload, or runtime agent or policy download.
 
-Out of scope:
+Fence does not protect against:
 
-- kernel, hypervisor, or GitHub platform compromise;
-- self-hosted, long-lived, ARM, Windows, macOS, and job-container protection;
-- semantic restrictions inside TLS or HTTP requests to approved endpoints;
-- confidentiality from an endpoint intentionally placed in the user
-  `allowlist`;
-- preventing data encoding in the bounded concrete names queried beneath an
-  explicitly allowed wildcard suffix;
-- preventing a malicious workflow from denying service to its own job; and
-- guaranteed process ownership attribution or process isolation.
+- A compromised kernel, hypervisor, or GitHub platform.
+- Self-hosted or long-lived runners, ARM, Windows, macOS, or jobs running inside containers.
+- Sensitive data sent through approved HTTPS or HTTP destinations.
+- Data encoded in allowed wildcard DNS names.
+- A malicious step intentionally causing its own job to fail.
+- Missing process attribution or a lack of full process isolation.
 
-There are no unresolved context questions for the v0 risk ranking. Expanding
-the supported runner class, allowing job containers, or changing the default
-GitHub profile requires a new threat-model review.
+Adding runner types, supporting job containers, or changing the default GitHub policy requires another threat-model review.
 
 ## System model
 
 ### Primary components
 
-- **Action launcher:** dependency-free TypeScript validates native inputs,
-  creates root-owned launcher state, protects its registered runtime with a
-  read-only bind mount, launches the service, and waits for readiness
-  (`action/main.cts`, `action/lib.cts`).
-- **Resident Rust agent:** validates the trusted service context and strict
-  configuration, applies controls, emits readiness, supervises workers, and
-  verifies state every five seconds (`src/cli.rs`, `src/lifecycle.rs`,
-  `src/dns_mediator.rs`).
-- **Network boundary:** a generated native `inet` ruleset, local DNS mediator,
-  pinned `Runner.Worker` identity, and NFLOG reader implement and verify host egress policy
-  (`src/nft.rs`, `src/nft_backend.rs`, `src/nflog.rs`).
-- **Privilege boundary:** schema-`3` hosted-runner fingerprint checks,
-  descriptor-pinned privileged commands, ACL-aware effective-access probes,
-  in-memory passwordless-sudo rollback state, Docker/containerd stop and
-  runtime masking, and the bounded local root-control inventory remove ordinary
-  root-equivalent bypass paths (`src/hosted_runner.rs`,
-  `src/trusted_executable.rs`, `src/local_control.rs`, `src/lockdown.rs`).
-- **Evidence boundary:** root-owned readiness and reports, resident health,
-  bounded findings, and the protected post hook provide local evidence without
-  restoring controls (`src/runtime.rs`, `src/findings.rs`, `action/post.cts`).
-- **Publication boundary:** pinned offline inputs, an offline bundle assembler, GitHub-signed one-parent distribution commits, complete candidate acceptance, release checksums, artifact attestations bound to source commit `M`, and the verified `action-release.json` mapping connect reviewed source `M` to published Action commit `D` (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
+- **Action launcher:** Validates native inputs, creates root-owned launcher files, protects its runtime with a read-only mount, starts the service, and waits until the agent is ready (`action/main.cts`, `action/lib.cts`).
+- **Resident Rust agent:** Checks the service and configuration, applies protections, supervises its workers, and verifies their state every five seconds (`src/cli.rs`, `src/lifecycle.rs`, `src/dns_mediator.rs`).
+- **Network controls:** The `nftables` rules, DNS mediator, pinned `Runner.Worker`, and NFLOG reader enforce and record the runner's network policy (`src/nft.rs`, `src/nft_backend.rs`, `src/nflog.rs`).
+- **Privilege controls:** Runner fingerprinting, verified privileged executables, effective-access checks, sudo rollback, container shutdown, and root-process inventories prevent common privilege bypasses (`src/hosted_runner.rs`, `src/trusted_executable.rs`, `src/local_control.rs`, `src/lockdown.rs`).
+- **Local evidence:** Root-owned readiness files, reports, worker health, and the protected post hook show whether protections remained active (`src/runtime.rs`, `src/findings.rs`, `action/post.cts`).
+- **Release verification:** Pinned build inputs, signed distribution commits, acceptance tests, artifact attestations, checksums, and `action-release.json` connect reviewed source commit `M` to published Action commit `D` (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
 
 ### Data flows and trust boundaries
 
-- **Workflow author -> Action launcher:** native inputs or bounded raw JSON
-  cross through Action environment variables. The wrapper rejects conflicting
-  input modes and constructs schema-`1` JSON; the agent performs strict
-  unknown-field and semantic validation (`action/lib.cts`,
-  `src/config.rs::parse_and_normalize`).
-- **Runner user -> root launcher:** fixed `sudo` and `systemd-run` arguments
-  launch one root service. Configuration and launcher files are copied to fixed
-  root-owned paths; arbitrary executable paths and shell evaluation are not
-  accepted (`action/main.cts`, `src/lifecycle.rs`).
-- **Root agent -> Linux host controls:** captured executable descriptors and
-  typed generated rules mutate only reviewed sudo, container, resolver, and
-  owned `nftables` state. The runner cannot write the captured paths, their
-  reviewed ancestors, or accepted sudo sources; subprocess output and
-  execution time are bounded (`src/trusted_executable.rs`, `src/lockdown.rs`,
-  `src/nft_backend.rs`, `src/dns_mediator.rs`).
-- **Workflow process -> DNS mediator:** a reviewed read-only resolver mount
-  sends host UDP/TCP DNS directly to Fence so caller sockets remain visible;
-  Docker uses its separate local route. Block mode canonicalizes and forwards
-  only authorized `A`/`AAAA` names; audit forwards observation traffic while
-  simulating the same bounded name policy without a containment claim
-  (`src/dns_mediator.rs`).
+- **Workflow author -> Action launcher:** Native inputs or bounded raw JSON configure the Action. The wrapper rejects conflicting inputs; the agent rejects unknown fields and invalid values (`action/lib.cts`, `src/config.rs::parse_and_normalize`).
+- **Runner user -> root launcher:** Fixed `sudo` and `systemd-run` commands start one root-owned service. Configuration files are copied to fixed root-owned paths; arbitrary commands and executable paths are rejected (`action/main.cts`, `src/lifecycle.rs`).
+- **Root agent -> Linux host controls:** Verified executable descriptors and generated firewall rules can change only reviewed sudo, container, resolver, and `nftables` settings. The runner cannot write those trusted paths, and subprocess output and runtime are bounded (`src/trusted_executable.rs`, `src/lockdown.rs`, `src/nft_backend.rs`, `src/dns_mediator.rs`).
+- **Workflow process -> DNS mediator:** A read-only resolver mount sends host DNS queries directly to Fence, while Docker uses a separate local route. Block mode forwards only approved `A` and `AAAA` queries; audit mode observes traffic without claiming containment (`src/dns_mediator.rs`).
 - **DNS mediator -> fixed resolver and firewall owner:** local UDP and TCP queries share the bounded root-only UDP resolver path. An approved answer is withheld until all matching transport rules are applied and structurally verified (`src/dns_mediator.rs::MaterializationSubmitter`).
 - **Platform compatibility -> GitHub service domains:** Fence permits fixed workflow roots, five exact reviewed static results-storage compatibility accounts, and at most eight single-label `*.githubapp.com` names unless broad GitHub compatibility is disabled. Each resulting HTTPS grant is available to other local code and remains an explicit residual channel (`src/platform_profile.rs`, `src/dns_mediator.rs`).
-- **User wildcard policy -> concrete DNS names:** one- and two-label leading
-  patterns share eight lifetime concrete-name admissions. Names materialize
-  lazily, all matching transports are unioned, and failed or empty lookups
-  still consume a slot because the query label is itself a data channel.
-  Derived CNAME targets may leave the configured suffix only through one
-  bounded response-local chain rooted at the queried concrete name. Every
-  returned address owner must be the terminal name, and the derived policy
-  remains the queried root's policy. A rooted CNAME response without address
-  records retains no derived authorization (`src/hostname_policy.rs`,
-  `src/dns_mediator.rs`).
+- **User wildcard policy -> concrete DNS names:** One- and two-label wildcard patterns share a limit of eight hostnames per job. Failed lookups still count because DNS names can carry data. CNAMEs must form one bounded chain rooted at the requested hostname, keep the original policy, and end in a matching address; responses without addresses grant no access (`src/hostname_policy.rs`, `src/dns_mediator.rs`).
 - **Pinned runner -> additional GitHub results storage:** by default, Fence accepts up to four other exact results-storage names only when their host DNS sockets belong to the unique pinned `Runner.Worker` identity. The resulting HTTPS grants are also available to other local code (`src/attribution.rs::TrustedRunnerWorker`, `src/dns_mediator.rs`).
 - **Explicit artifact compatibility -> additional GitHub results storage:** block-only `allow_github_artifacts: true` permits a uniquely owned host DNS socket belonging to a runner-UID-matching, bounded descendant of the pinned `Runner.Worker` to authorize an exact GitHub-shaped account within the same shared four-account lifetime budget. The distinct `opt_in_github_artifact_dns` origin and verified process ancestry do not authenticate an official action, GitHub's ownership of the account, a signed upload URL, or uploaded contents. Later workflow code can reuse the resulting TCP-`443` access to exfiltrate data (`src/attribution.rs`, `src/dns_mediator.rs`).
 - **CNAME lineage -> restricted storage:** exact and wildcard user hostnames cannot derive non-static GitHub results-storage accounts; every restricted account remains subject to the selected default or explicit opt-in attribution boundary and the shared four-account cap.
-- **Kernel NFLOG -> resident agent:** group `4242` may copy at most 64 packet
-  bytes. Fence immediately reduces this to endpoint metadata and drops raw
-  bytes (`src/nflog.rs`, `src/findings.rs`).
-- **Finding tuple -> attribution worker:** an internal source/destination tuple
-  enters a queue of 128 requests. Bounded `/proc` snapshots return only a
-  status, actor class, PID, executable basename, and four parent basenames;
-  local endpoints are not serialized (`src/attribution.rs`).
-- **Resident agent -> post hook:** root-owned `ready.json`, `report.json`, and
-  `dns-report.json` are runner-readable but not runner-writable. Schema-`5`
-  preserves the live systemd PID, worker health, evidence freshness, bounded
-  concrete wildcard authorizations, and rejection counters that the post hook
-  validates before trusting the report. Writable self-bind guards pin every
-  runner-renameable ancestor of the registered Action path, while protected
-  mount, device/inode, and runtime-digest checks apply at the wrapper boundary
-  (`src/runtime.rs`, `action/post.cts`).
+- **Kernel NFLOG -> resident agent:** Group `4242` copies at most 64 packet bytes. Fence extracts approved endpoint metadata and discards the raw bytes (`src/nflog.rs`, `src/findings.rs`).
+- **Finding -> attribution worker:** A queue of up to 128 requests matches local sockets against bounded `/proc` snapshots. Reports include only attribution status, actor class, PID, executable name, and up to four parent executable names (`src/attribution.rs`).
+- **Resident agent -> post hook:** The runner can read root-owned readiness and report files but cannot modify them. The post hook verifies the live service, worker health, fresh evidence, wildcard records, rejection counters, protected mounts, and runtime identity before trusting a report (`src/runtime.rs`, `action/post.cts`).
 - **Release workflow -> distribution commit:** after all protected checks pass on source commit `M`, the workflow builds the artifact once, assembles the bundle offline, and creates signed child `D` with exactly the two generated bundle files. Full Action acceptance, the strict fixed-runner canary, final-asset attestations, and release-state verification must pass before the immutable tag targets `D` and `action-release.json` exposes it to consumers (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
 
 #### Diagram
@@ -187,23 +107,16 @@ flowchart TD
 - Run arbitrary native code as the later workflow's `runner` user.
 - Read workflow-readable files, source, environment values, and credentials.
 - Generate DNS and network traffic, including traffic to approved endpoints.
-- Race local files and processes before readiness and attempt post-ready
-  modification of runner-writable paths.
-- Create high event volume within the fixed NFLOG, DNS, report, and attribution
-  limits.
-- Use passwordless sudo or Docker/containerd before Fence verifies their
-  removal, or retain container access in explicit `unsafe_preserve` mode.
+- Race local files and processes before readiness, or modify runner-writable paths after Fence starts.
+- Generate large amounts of traffic within Fence's NFLOG, DNS, reporting, and attribution limits.
+- Use sudo or Docker before Fence verifies that they are disabled, or use containers when `unsafe_preserve` is explicitly enabled.
 
 ### Non-capabilities
 
 - Compromise the Linux kernel, GitHub service, or reviewed hosted-runner image.
-- Begin after Fence readiness with undisclosed root authority in standard block
-  mode on a matching supported host.
-- Modify root-owned runtime files, the protected read-only Action mount, or the
-  bundled binary after successful readiness without exploiting a kernel or
-  privileged-component vulnerability.
-- Cause Fence to semantically inspect encrypted content sent to an approved
-  destination.
+- Gain undisclosed root access after Fence starts in standard block mode on a supported runner.
+- Modify root-owned runtime files, the read-only Action mount, or the bundled binary after Fence starts without exploiting the kernel or another privileged component.
+- Force Fence to inspect encrypted content sent to an approved destination.
 
 ## Entry points and attack surfaces
 
@@ -226,41 +139,15 @@ flowchart TD
 
 ## Top abuse paths
 
-1. **Exfiltrate through an approved channel:** malicious later code reads a
-   token, sends it to an allowed GitHub, exact user, or wildcard-derived user
-   destination, and the
-   firewall permits it because Fence does not inspect TLS/HTTP semantics.
-2. **Regain root and rewrite policy:** later code uses a residual sudo or
-   container-control path, modifies `inet fence_v0`, and opens arbitrary
-   egress. Fence prevents readiness unless trusted path access, the closed
-   root-control inventory, and the measured privilege paths verify; later
-   inventory drift is critical. Pre-capture image or privileged-platform
-   compromise remains the key prerequisite.
-3. **Exploit DNS authorization:** later code requests an allowed suffix or
-   triggers a CNAME/address transition that broadens usable IP space, then
-   sends data to another service sharing an authorized address. Fence bounds
-   names, depth, TTL, and transports but cannot bind an IP to TLS identity.
-4. **Race answer before firewall state:** a client attempts the first
-   connection immediately after DNS resolution. Fence withholds the answer
-   until the resident firewall owner applies and verifies the entire rule
-   batch; queue rejection returns `SERVFAIL`.
-5. **Replace the post hook:** later code overwrites the registered Action code
-   or renames an ancestor and recreates the registered pathname so post-job
-   validation reports success. Fence self-bind-guards each renameable
-   ancestor, root-copies and bind-mounts the runtime read-only, then checks the
-   exact mounts, device/inode identities, and digest in post.
-6. **Forge or replay evidence:** later code writes a false report or leaves a
-   stale healthy file after killing the service. In the schema-`5` runtime
-   contract, root ownership, active MainPID checks, worker health, monotonic
-   verification sequence, and a 20-second freshness bound reject the evidence.
-7. **Disable or alter firewall state after readiness:** later code or host drift
-   removes an owned rule. Five-second structured verification records a
-   critical finding; the post hook fails the job, but traffic during the
-   verification window remains a residual risk.
+1. **Send data to an allowed destination:** A later step reads a token or source file and sends it to an approved GitHub service, allowlisted hostname, wildcard match, or shared IP address. Fence cannot inspect encrypted request contents.
+2. **Regain root access:** A later step uses a remaining sudo or container-control path to change `inet fence_v0` and allow arbitrary traffic. Fence checks trusted paths, root-controlled services, and privilege removal before startup; later changes are reported as critical.
+3. **Expand access through DNS:** A later step uses an allowed hostname, CNAME, or shared address to reach another service. Fence bounds hostnames, alias depth, TTLs, and transports, but cannot prove which TLS service owns an IP address.
+4. **Connect before the firewall updates:** A client tries to connect immediately after a DNS response. Fence withholds that response until the matching firewall rules are applied and verified; rejected updates return `SERVFAIL`.
+5. **Replace the post hook:** A later step changes the registered Action code or its parent directory to forge a successful result. Fence protects writable ancestors, mounts the runtime read-only, and verifies mount identity, file identity, and content digests.
+6. **Forge or replay evidence:** A later step writes a false report or reuses an old healthy report after killing the agent. Fence checks root ownership, the live service PID, worker health, a monotonic verification sequence, and the 20-second freshness limit.
+7. **Change the firewall after startup:** A later step or runner-image change removes an owned firewall rule. Checks run every five seconds and fail the job on critical drift, but traffic during that interval remains a known risk.
 8. **Substitute a release binary:** an attacker changes the bundled executable independently of reviewed source. The release workflow reuses one artifact built from `M`, requires `D` to be a signed one-parent child with an exact two-file diff, compares the committed bytes to the artifact, runs complete acceptance and canary gates on `D`, verifies source-bound attestations, and publishes the full-SHA mapping only after final immutable-release verification. Offline CI revalidates the schema-`4` manifest and binary digest.
-9. **Exhaust local evidence work:** later code floods DNS, NFLOG, or attribution
-   paths. Fixed queues, sample rates, scan caps, finding caps, and report size
-   bounds protect memory, but the attacker can still slow or fail its own job.
+9. **Overload local reporting:** A later step floods DNS, NFLOG, or process attribution. Fixed queue, scan, and report limits protect memory, but the step can still slow down or fail its own job.
 10. **Reuse an authorized results account:** after one of the five static compatibility accounts is prehydrated or the pinned runner authorizes an additional exact storage account, later workflow code connects to the same resolved HTTPS addresses. Fence cannot determine whether an encrypted request carries a GitHub-issued signed URL, another valid credential, or unrelated data.
 
 ## Threat model table
@@ -280,23 +167,12 @@ flowchart TD
 
 ## Criticality calibration
 
-- **Critical:** a supported standard-block run reports healthy while arbitrary
-  egress or a root bypass remains available; a published bundle is not the
-  attested reviewed agent; or remote/untrusted input gains pre-readiness root
-  code execution.
-- **High:** an attacker can exfiltrate protected credentials through an
-  unintended default channel, persistently disable controls, or forge post-job
-  evidence with realistic runner-user capabilities.
-- **Medium:** a bounded race creates temporary policy drift, a malicious step
-  can reliably deny service to its own job, or a release/control weakness needs
-  an additional privileged or platform prerequisite.
-- **Low:** local attribution is missing or ambiguous, low-sensitivity metadata
-  is exposed, or a noisy failure is already fail-closed and clearly reported.
+- **Critical:** Standard block reports success while arbitrary egress or root access remains possible, a published binary differs from the reviewed artifact, or untrusted input gains root execution before startup.
+- **High:** An attacker sends protected credentials through an unexpected default channel, permanently disables a protection, or forges post-job evidence.
+- **Medium:** A bounded race temporarily changes policy, a malicious step can fail its own job, or exploitation also requires a privileged or platform compromise.
+- **Low:** Process attribution is missing, low-sensitivity metadata is exposed, or a noisy failure is already blocked and clearly reported.
 
-Examples are context-dependent: an allowed GitHub channel is **high** residual
-risk for a credential-bearing job, while attribution ambiguity is **low**
-because attribution is not an enforcement input. Kernel compromise would be
-**critical** in impact but is outside this threat model.
+Severity depends on context. An approved GitHub destination can be a high-risk data channel in a job with credentials, while missing process attribution is low risk because attribution does not enforce policy. Kernel compromise would have critical impact but is outside this model.
 
 ## Focus paths for security review
 
