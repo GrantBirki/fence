@@ -1,6 +1,6 @@
 # CLI Reference 💻
 
-Most users should run Fence as a GitHub Action. The Rust agent also provides a small CLI for inspecting its version, checking runner information, and previewing a policy.
+Most people should use Fence as a GitHub Action. Its Rust agent also includes a CLI for checking the version, inspecting a runner, and previewing a policy:
 
 ```console
 fence --version
@@ -15,7 +15,7 @@ fence run --config /run/fence/example/config.json
 fence --version
 ```
 
-Prints the agent version. Source builds use `Cargo.toml`; published Action bundles record their version and provenance in `action/bundle-manifest.json`.
+This prints the agent version. Source builds use `Cargo.toml`; published Action bundles record their version and provenance in `action/bundle-manifest.json`.
 
 ## Check Runner Information
 
@@ -23,7 +23,7 @@ Prints the agent version. Source builds use `Cargo.toml`; published Action bundl
 fence check-support
 ```
 
-Shows the host operating system, architecture, available backend, and expected runner fingerprint. This command does not activate Fence or establish protection.
+This shows the operating system, architecture, available backend, and expected runner fingerprint. It does not activate Fence or protect the runner.
 
 ## Preview A Policy
 
@@ -31,7 +31,7 @@ Shows the host operating system, architecture, available backend, and expected r
 fence render-plan --config policy.json
 ```
 
-Validates a JSON configuration and prints the resulting firewall plan without applying it.
+This validates a JSON configuration and prints the firewall rules without applying them.
 
 ## Run The Agent
 
@@ -39,6 +39,6 @@ Validates a JSON configuration and prints the resulting firewall plan without ap
 fence run --config /run/fence/example/config.json
 ```
 
-Production execution must start through the Fence GitHub Action. Running this command directly fails with `trusted_launcher_required`; that check prevents an ordinary process from claiming it has activated runner protection.
+Fence must start through its GitHub Action. Running the command directly fails with `trusted_launcher_required`, so an ordinary process cannot claim the runner is protected.
 
 See [how Fence works](how-it-works.md) and the [configuration contract](v0.md#configuration-interface) for more detail.

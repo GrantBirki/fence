@@ -1,6 +1,6 @@
 # Allowlist Guide 📝
 
-Use the `allowlist` input to give your workflow access to specific network destinations:
+An allowlist tells Fence which network destinations your job is allowed to reach:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -11,7 +11,7 @@ Use the `allowlist` input to give your workflow access to specific network desti
       udp://dns.example.com:53
 ```
 
-Each line adds one destination. Blank lines and comments starting with `#` are ignored.
+Put one destination on each line. Fence ignores blank lines and comments that start with `#`.
 
 ## Supported Formats
 
@@ -42,31 +42,31 @@ cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
 
-A hostname without a port uses TCP port `443`. Use the `ip` or `cidr` format for IP addresses and networks, especially IPv6.
+A hostname without a port uses TCP port `443`. Use the explicit `ip` or `cidr` form for addresses and networks, especially IPv6.
 
 ## Entry Limit
 
-Fence accepts up to 64 unique, normalized entries. Repeating a hostname, changing its capitalization, or writing the same IP address another way does not create an extra entry. Different ports, protocols, or destination types do count separately.
+An allowlist can contain up to 64 unique entries. Fence normalizes hostnames and IP addresses before counting, so duplicates, capitalization differences, and equivalent address formats count only once. Different ports, protocols, and destination types count separately.
 
-Fence rejects the 65th unique entry before changing the runner.
+The 65th unique entry fails before Fence changes the runner.
 
 > [!NOTE]
-> The advanced JSON `config` input has its own 64-entry validation. Do not combine `config` with native Action inputs.
+> The advanced JSON `config` input also has a 64-entry limit. It cannot be combined with native Action inputs.
 
 ## Wildcards
 
-Wildcards match exactly one hostname level per `*`:
+Each `*` matches exactly one part of a hostname:
 
 - `*.example.com` matches `api.example.com`.
 - `*.example.com` does not match `example.com` or `one.two.example.com`.
 - `*.*.example.com` matches `one.two.example.com`.
 - `*.*.example.com` does not match `api.example.com` or `three.one.two.example.com`.
 
-All wildcard entries share a limit of eight matched hostnames for the job. Use exact hostnames when you can; a broad wildcard gives a workflow more places to send data.
+Across the entire job, wildcard entries can match at most eight unique hostnames. Prefer exact hostnames when possible: every wildcard gives the job more places to send data.
 
 ## CIDR Networks
 
-CIDR entries must use a real network address:
+CIDR entries must start at the network address:
 
 ```text
 # Valid
@@ -76,12 +76,12 @@ cidr 192.0.2.0/24 udp 123
 cidr 192.0.2.1/24 udp 123
 ```
 
-Fence rejects invalid entries before applying any runner changes.
+Fence rejects invalid entries before changing the runner.
 
 ## GitHub Storage
 
-You do not need to add GitHub's job-reporting storage accounts to your allowlist. Fence handles the small set of accounts required by the GitHub runner.
+GitHub's normal job-reporting storage is already covered. You do not need to add its storage accounts to your allowlist.
 
-If your job needs GitHub artifacts, Pages, or caches, use `allow_github_artifacts: true` instead of allowlisting storage domains. This setting is disabled by default because it gives later workflow steps a limited storage channel.
+If your job uses GitHub artifacts, Pages, or caches, set `allow_github_artifacts: true` instead of adding storage domains yourself. This option is off by default because later workflow steps can also use that storage access.
 
 See the [configuration examples](examples.md) for complete workflows or the [v0 specification](v0.md#effective-policy) for the full policy.

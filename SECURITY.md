@@ -2,17 +2,17 @@
 
 ## Supported Versions
 
-Security fixes are applied to `main` and the latest stable Fence release.
+Security fixes land on `main` and in the latest stable release.
 
-Fence supports GitHub-hosted x64 runners using `ubuntu-24.04` or `ubuntu-latest`. Each release is validated on `ubuntu-24.04`, while `ubuntu-latest` is regularly tested against the same runner security checks. Self-hosted runners, container jobs, and other operating systems or architectures are outside the supported protection boundary.
+Fence supports GitHub-hosted x64 runners using `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`, and `ubuntu-latest` is tested regularly. Fence does not support self-hosted runners, container jobs, or other operating systems and architectures.
 
-Audit mode observes network activity without blocking it. `container_policy: unsafe_preserve` keeps Docker and containerd available and has weaker isolation than default block mode.
+Audit mode observes network activity without blocking it. `container_policy: unsafe_preserve` leaves Docker and containerd available, which weakens runner isolation.
 
-See the [security guide](docs/security.md), [v0 specification](docs/v0.md), and [threat model](docs/threat-model.md) for the full security and support boundaries.
+See the [security guide](docs/security.md), [v0 specification](docs/v0.md), and [threat model](docs/threat-model.md) for the full security model.
 
 ## Reporting A Vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/openai/fence/security/advisories/new) when it is available. Otherwise, contact the repository maintainer directly.
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/openai/fence/security/advisories/new). If it is unavailable, contact the repository maintainer directly.
 
 > [!IMPORTANT]
 > Do not open a public issue containing exploit details for an unresolved vulnerability.
@@ -23,12 +23,12 @@ Use [GitHub private vulnerability reporting](https://github.com/openai/fence/sec
 - Commit `Cargo.lock` and the vendored dependencies in `vendor/cache`.
 - Use `script/update` for dependency updates.
 - Use `script/vendor-rust` for Rust toolchain updates.
-- Use `script/vendor-update-tools`, `script/vendor-release-tools`, and `script/vendor-test-tools` for their respective pinned tools.
+- Use `script/vendor-update-tools`, `script/vendor-release-tools`, and `script/vendor-test-tools` to update their pinned tools.
 - Keep routine builds and tests offline after the Rust toolchain is prepared.
 
 ## Offline Development
 
-Prepare Rust explicitly, then run the standard offline project commands:
+Prepare the Rust toolchain, then run the normal project commands:
 
 ```console
 script/prepare-rust
@@ -38,13 +38,13 @@ script/lint
 script/build
 ```
 
-`script/prepare-rust` verifies the pinned Rust distribution before installing it. The remaining commands use checked-in dependencies and do not download tools.
+`script/prepare-rust` downloads and verifies the pinned Rust toolchain. The remaining commands run offline using checked-in dependencies.
 
-GitHub-hosted jobs are not completely air-gapped. Checkout, runner preparation, artifact uploads, release publication, and attestation verification still use GitHub network services.
+GitHub-hosted jobs are not completely air-gapped. Checkout, runner setup, artifact uploads, releases, and attestation verification still use GitHub's network services.
 
 ## Verify Release Artifacts
 
-Use the checksums and attestations attached to a published release:
+Verify a published release with its checksums and attestations:
 
 ```console
 shasum -a 256 -c checksums.txt
@@ -56,6 +56,6 @@ gh attestation verify <artifact> \
 
 On Linux, use `sha256sum -c checksums.txt` if `shasum` is unavailable.
 
-Releases through `v0.8.3` were published before the repository transfer. Verify those artifacts against the repository and signer recorded in their original attestations.
+Releases through `v0.8.3` predate the repository transfer. Verify them against the repository and signer in their original attestations.
 
 See [release provenance](docs/release-provenance.md) for the source commit, distribution commit, and published Action pin.

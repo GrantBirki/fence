@@ -1,20 +1,20 @@
 # Configuration Examples 🧪
 
-Use the full commit SHA and matching version from the [latest Fence release](https://github.com/openai/fence/releases). Run Fence before checkout and the rest of your job.
+Copy the full commit SHA and matching version from a [Fence release](https://github.com/openai/fence/releases). Add Fence before checkout and the rest of your job.
 
 ## Default Block Mode
 
-No extra configuration is needed:
+Fence blocks unexpected outbound connections by default:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
 ```
 
-Fence blocks unexpected outbound traffic and disables passwordless `sudo` and Docker.
+It also disables passwordless `sudo`, Docker, and container access.
 
 ## Audit A Workflow
 
-See what your workflow needs without blocking it:
+Record which connections your job needs without blocking them:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -22,11 +22,11 @@ See what your workflow needs without blocking it:
     mode: audit
 ```
 
-Review the job summary, add the recommended hostnames or IP addresses to your allowlist, and switch back to block mode.
+Check the job summary, add the required hostnames or IP addresses to your allowlist, and switch back to block mode.
 
 ## Allow HTTPS Destinations
 
-Bare hostnames default to TCP port `443`:
+A hostname without a port uses TCP port `443`:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -38,7 +38,7 @@ Bare hostnames default to TCP port `443`:
 
 ## Use Custom Ports And Protocols
 
-Mix hostnames, ports, IP addresses, and CIDR networks:
+Hostnames, custom ports, IP addresses, and network ranges can share one allowlist:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -53,11 +53,11 @@ Mix hostnames, ports, IP addresses, and CIDR networks:
       cidr 2001:db8::/64 tcp 443
 ```
 
-See the [allowlist guide](allowlist.md) for entry limits and validation rules.
+See the [allowlist guide](allowlist.md) for limits, supported formats, and validation rules.
 
 ## Upload GitHub Artifacts
 
-Enable GitHub storage access when a job needs artifacts, GitHub Pages, or caches:
+Allow GitHub Actions storage when your job needs artifacts, GitHub Pages, or caches:
 
 ```yaml
 jobs:
@@ -79,11 +79,11 @@ jobs:
 ```
 
 > [!IMPORTANT]
-> Artifact uploads can move data off the runner. Enable this option only when the job needs it.
+> Later workflow steps can use the same storage access to send data out of the runner. Enable this option only when the job needs it.
 
 ## Use Docker
 
-Keep container access available when your workflow requires Docker or containerd:
+Keep container access available when your job requires Docker or containerd:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -94,14 +94,14 @@ Keep container access available when your workflow requires Docker or containerd
       registry-1.docker.io
 ```
 
-Image pulls can require additional registry, layer, or storage domains. Start with audit mode if you need help identifying them.
+Image pulls may also need registry, layer, or storage domains. Use audit mode to identify them.
 
 > [!WARNING]
-> Preserving Docker access weakens runner isolation.
+> Keeping Docker access weakens runner isolation.
 
 ## Use A Hostname Wildcard
 
-Allow exactly one or two hostname levels:
+Use one or two `*` labels to match specific hostname depths:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -111,11 +111,11 @@ Allow exactly one or two hostname levels:
       *.*.example.com
 ```
 
-`*.docker.io` matches `auth.docker.io`, but not `docker.io` or `one.two.docker.io`. All wildcard entries share a limit of eight matched hostnames.
+`*.docker.io` matches `auth.docker.io`, but not `docker.io` or `one.two.docker.io`. All wildcard entries share a limit of eight unique matched hostnames per job.
 
 ## Restrict Optional GitHub Domains
 
-Remove optional GitHub web, API, release, and application destinations:
+Remove optional GitHub website, API, release, and application destinations:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -123,11 +123,11 @@ Remove optional GitHub web, API, release, and application destinations:
     disable_broad_github_domains: true
 ```
 
-Core GitHub Actions reporting still works. Enable this setting only when later steps do not need the excluded GitHub services.
+GitHub Actions can still report job status and finish the run. Steps such as `actions/checkout` may need `github.com` added back to your allowlist.
 
 ## Set The Platform Profile
 
-Fence selects the supported platform profile automatically. If you need to set it explicitly:
+Fence chooses its supported platform profile automatically. Set it explicitly only if your workflow needs to:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -135,11 +135,11 @@ Fence selects the supported platform profile automatically. If you need to set i
     platform_profile: github_hosted_workflow_bootstrap_v5
 ```
 
-Other profile values are rejected.
+Other profile values are not supported.
 
 ## Use Raw JSON
 
-The `config` input is intended for advanced use:
+Use raw JSON only when you need the advanced configuration format:
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
@@ -148,6 +148,6 @@ The `config` input is intended for advanced use:
       {"schema_version":1,"mode":"block","invocation_id":"my-job-1","allowlist":[]}
 ```
 
-Do not combine `config` with native inputs such as `allowlist` or `mode`. Most workflows should use native inputs and let Fence create its own invocation ID.
+The `config` input cannot be combined with native inputs such as `allowlist` or `mode`. Most jobs should use native inputs and let Fence choose the invocation ID.
 
 For the complete configuration contract, see the [v0 specification](v0.md#configuration-interface).

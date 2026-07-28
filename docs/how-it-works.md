@@ -1,14 +1,14 @@
 # How Fence Works 🔧
 
-Fence is a GitHub Action with a bundled Rust agent. It runs before the rest of your workflow, applies the runner's network and security rules, and keeps checking those rules until the job finishes.
+Fence runs first in a GitHub Actions job, limits outbound network access, and keeps checking those restrictions until the job ends. Its Rust agent is bundled with the Action.
 
 ## Job Lifecycle
 
-1. **Start:** Fence verifies the runner and the bundled agent.
-2. **Configure:** It combines the GitHub connections needed by the runner with your `allowlist`.
-3. **Protect:** Block mode restricts outbound traffic and turns off passwordless `sudo` and Docker.
-4. **Monitor:** The agent checks the runner throughout the job.
-5. **Report:** The post-job step summarizes network activity and fails the job if a security control changed unexpectedly.
+1. Fence checks the runner and its bundled agent.
+2. It allows the connections GitHub Actions needs, plus the destinations in your `allowlist`.
+3. Block mode blocks other outbound connections and disables passwordless `sudo` and Docker.
+4. The agent checks its protections throughout the job.
+5. A final step reports network activity and fails the job if a protection changed unexpectedly.
 
 ```mermaid
 flowchart LR
@@ -17,24 +17,24 @@ flowchart LR
     monitor --> report["Report activity"]
 ```
 
-Fence does not restore network or privilege access at the end of a job. GitHub discards the hosted runner instead.
+Fence does not turn network or privilege access back on. GitHub discards the runner after the job ends.
 
 ## Block And Audit Modes
 
-Block mode is the default. It allows required runner connections and your configured destinations, blocks everything else, and disables passwordless `sudo` and Docker.
+Block mode is the default. It allows the runner's required connections and your allowlisted destinations, blocks other network access, and disables passwordless `sudo` and Docker.
 
-Audit mode shows what block mode would reject without blocking traffic or changing `sudo` and Docker access. Use it to work out which destinations a job needs.
+Audit mode shows what block mode would reject without blocking traffic or disabling `sudo` and Docker. Use it to find the destinations a job needs.
 
-You can optionally keep Docker with `container_policy: unsafe_preserve` or enable GitHub artifacts with `allow_github_artifacts: true`. Both options reduce the default security guarantees, so use them only when required.
+If a job needs Docker, use `container_policy: unsafe_preserve`. If it needs GitHub artifacts, Pages, or caches, use `allow_github_artifacts: true`. Both options make it easier for a job to send data or bypass isolation, so turn them on only when needed.
 
 ## Network Reports
 
 Fence reports network activity in two places:
 
-- The GitHub job summary contains a human-readable activity table.
-- The post-job log contains the same activity and one machine-readable `FENCE_REPORT_JSON=` line.
+- The GitHub job summary shows a readable activity table.
+- The post-job log includes the same activity and one machine-readable `FENCE_REPORT_JSON=` line.
 
-The report tells you which destinations were allowed, blocked, or observed in audit mode. It includes control status, warnings, and recommended audit-mode allowlist entries. Fence limits the report to 20 destinations, keeps the complete JSON record under 16 KiB, and does not include secrets, environment variables, command arguments, or packet contents.
+The report lists allowed, blocked, or observed destinations, the status of Fence's protections, and any warnings. Audit reports also suggest allowlist entries. Reports include at most 20 destinations, stay under 16 KiB, and never contain secrets, environment variables, command arguments, or packet contents.
 
 ### Fetch A Report
 
@@ -53,7 +53,7 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
-Fence writes the report as one compact line in the job log. The command above formats it for reading:
+The job log stores the report on one line. `jq` formats it like this:
 
 ```json
 {
@@ -125,6 +125,6 @@ Fence writes the report as one compact line in the job log. The command above fo
 }
 ```
 
-Anyone who can read the workflow job log can read the report. In audit mode, `would_block` means a request was observed, not denied. In block mode, a blocked request is expected and does not make an otherwise healthy job a warning.
+Anyone who can read the job log can read this report. In audit mode, `would_block` means a request was observed but not denied. In block mode, blocking a request is normal and does not turn a healthy job into a warning.
 
 For implementation details and the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security guide](security.md).
