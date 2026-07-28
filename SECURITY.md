@@ -56,12 +56,6 @@ gh attestation verify <artifact> \
 
 On Linux, use `sha256sum -c checksums.txt` if `shasum` is unavailable.
 
-Releases through `v0.8.3` were published before the repository transfer and retain their original `GrantBirki/fence` provenance:
-
-```console
-gh attestation verify <artifact> \
-  --repo GrantBirki/fence \
-  --signer-workflow GrantBirki/fence/.github/workflows/release.yml
-```
+Releases through `v0.8.3` were published before the repository transfer. Verify those artifacts against the repository and signer recorded in their original attestations.
 
 See [release provenance](docs/release-provenance.md) for the source commit, distribution commit, and published Action pin.

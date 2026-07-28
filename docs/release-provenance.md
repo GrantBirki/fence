@@ -38,6 +38,6 @@ The release tag identifies the distribution commit, but workflows should use the
 
 Fence verifies the binary, bundled manifest, artifact checksums, build attestations, and signed `D -> M` commit relationship before considering a release complete. The Action runs its verified bundled binary and never downloads an agent or policy at runtime.
 
-Historical releases through `v0.6.3` keep their original tag behavior. Releases through `v0.8.3` retain their original `GrantBirki/fence` provenance.
+Historical releases through `v0.6.3` keep their original tag behavior. Releases through `v0.8.3` retain their original pre-transfer provenance.
 
 See the [security policy](../SECURITY.md) for artifact verification commands and the [v0 specification](v0.md#ci-and-release-contract) for the full release contract.
