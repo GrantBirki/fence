@@ -1,56 +1,87 @@
-# Allowlist Syntax And DNS Behavior
+# Allowlist Guide 📝
 
-The native Action `allowlist` input accepts one entry per line and supports up to 64 unique, normalized destinations. Blank lines and lines beginning with `#` are ignored. Equivalent hostnames, IPv4 addresses, IPv6 addresses, and CIDR networks are deduplicated using the destination type, normalized destination, protocol, and port before the limit is applied; a 65th unique entry fails before privileged setup.
+Use the `allowlist` input to give your workflow access to specific network destinations:
 
-The advanced raw JSON `config` input follows the Rust agent's separate limit of 64 declared allowlist entries. Duplicate JSON object fields, malformed integer values, unknown configuration fields, and invalid destination policies are rejected before privileged setup; the original JSON is passed to the agent unchanged.
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    allowlist: |
+      api.example.com
+      registry.example.com:8443
+      udp://dns.example.com:53
+```
 
-## Accepted Forms
+Each line adds one destination. Blank lines and comments starting with `#` are ignored.
+
+## Supported Formats
 
 ```text
+# HTTPS hostname
 example.com
+
+# Hostname with a custom TCP port
 example.com:8443
 tcp://example.com:443
+
+# Hostname with a UDP port
 udp://dns.example.com:53
+
+# Explicit hostname
 hostname example.com tcp 443
+
+# Hostname wildcards
 *.example.com
 *.*.example.com
+
+# IPv4 and IPv6 addresses
 ip 192.0.2.10 tcp 443
 ip 2001:db8::10 udp 53
+
+# IPv4 and IPv6 networks
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
 
-- `example.com` means TCP port `443`.
-- `example.com:8443`, `tcp://...`, and `udp://...` select a specific transport and port.
-- `hostname ...`, `ip ...`, and `cidr ...` are the explicit forms.
-- Literal IPv6 addresses and address ranges should use `ip` or `cidr` so the port remains unambiguous.
-- CIDR entries must identify a canonical network with an unsigned prefix and no host bits; for example, `192.0.2.0/24` is valid but `192.0.2.1/24` and `192.0.2.0/+24` are rejected before privileged setup.
+A hostname without a port uses TCP port `443`. Use the `ip` or `cidr` format for IP addresses and networks, especially IPv6.
 
-## Exact Hostnames
+## Entry Limit
 
-Fence resolves every required exact hostname before readiness, applies and verifies rules for all approved addresses, and refreshes those addresses while the job runs. Each refreshed address retains the protocol and port from its allowlist entry.
+Fence accepts up to 64 unique, normalized entries. Repeating a hostname, changing its capitalization, or writing the same IP address another way does not create an extra entry. Different ports, protocols, or destination types do count separately.
 
-Non-static `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts are bounded platform destinations, not exact user destinations. Fence rejects an exact user entry for one of those accounts before mutation. By default, the selected profile authorizes up to four non-static accounts at TCP port `443` only after a DNS request from the pinned runner process. The five source-defined static compatibility exceptions are `productionresultssa19.blob.core.windows.net`, `productionresultssa13.blob.core.windows.net`, `productionresultssa9.blob.core.windows.net`, `productionresultssa15.blob.core.windows.net`, and `productionresultssa17.blob.core.windows.net`.
+Fence rejects the 65th unique entry before changing the runner.
 
-For GitHub artifact uploads, Pages, or caches, set the separate native Action input `allow_github_artifacts: true`; do not add dynamically selected storage accounts to `allowlist`. The option lets uniquely attributed runner-owned descendants of the pinned worker authorize exact matching accounts within the same four-account lifetime cap, bounded DNS lifetimes, CNAME checks, and TCP-`443` firewall rules. It is off by default and creates an intentional data-egress channel: other workflow code can also use an authorized account, and matching the account-name pattern does not prove GitHub ownership.
+> [!NOTE]
+> The advanced JSON `config` input has its own 64-entry validation. Do not combine `config` with native Action inputs.
 
-Only `A` and `AAAA` questions are forwarded in block mode. Fence rebuilds outbound questions in canonical lowercase form and releases an approved address-bearing answer only after the corresponding firewall access has been applied and structurally verified.
+## Wildcards
 
-## Wildcard Hostnames
+Wildcards match exactly one hostname level per `*`:
 
-The supported wildcard forms are `*.example.com` and `*.*.example.com`. Each `*` matches exactly one DNS label:
+- `*.example.com` matches `api.example.com`.
+- `*.example.com` does not match `example.com` or `one.two.example.com`.
+- `*.*.example.com` matches `one.two.example.com`.
+- `*.*.example.com` does not match `api.example.com` or `three.one.two.example.com`.
 
-- `*.example.com` matches `api.example.com` but not `example.com` or `one.two.example.com`.
-- `*.*.example.com` matches `one.two.example.com` but not `api.example.com` or `three.one.two.example.com`.
+All wildcard entries share a limit of eight matched hostnames for the job. Use exact hostnames when you can; a broad wildcard gives a workflow more places to send data.
 
-All user wildcard entries share one eight-name lifetime authorization budget. Wildcard names materialize only after matching runtime DNS queries, do not prehydrate, and do not delay readiness.
+## CIDR Networks
 
-Fence validates DNS structure, not registrable-domain ownership. A wildcard over a broad or shared suffix therefore creates both an egress choice and a DNS data channel; use the narrowest suffix that fits the workflow.
+CIDR entries must use a real network address:
 
-## CNAME And Address Handling
+```text
+# Valid
+cidr 192.0.2.0/24 udp 123
 
-Derived CNAME authorization must form one acyclic response-local chain rooted at the echoed question. Every alias inherits the queried root's transport policy and stays within bounded TTL, depth, and capacity limits. An unrelated alias, address-family mismatch, malformed response, incomplete address coverage, or attribution failure fails closed without creating later authorization.
+# Invalid: host bits are set
+cidr 192.0.2.1/24 udp 123
+```
 
-Duplicate terminal addresses use the minimum observed TTL. Valid zero-TTL addresses and zero-TTL CNAME edges receive a one-second materialization lifetime before the fixed refresh overlap.
+Fence rejects invalid entries before applying any runner changes.
 
-For the complete normative policy, see [Effective Policy](v0.md#effective-policy) in the Fence v0 specification.
+## GitHub Storage
+
+You do not need to add GitHub's job-reporting storage accounts to your allowlist. Fence handles the small set of accounts required by the GitHub runner.
+
+If your job needs GitHub artifacts, Pages, or caches, use `allow_github_artifacts: true` instead of allowlisting storage domains. This setting is disabled by default because it gives later workflow steps a limited storage channel.
+
+See the [configuration examples](examples.md) for complete workflows or the [v0 specification](v0.md#effective-policy) for the full policy.

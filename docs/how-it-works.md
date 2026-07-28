@@ -1,81 +1,51 @@
-# Architecture And Lifecycle
+# How Fence Works 🔧
 
-Fence combines an immutable GitHub Action wrapper, a native Rust agent, local DNS mediation, Linux nftables policy, privilege and container controls, resident verification, and a protected post-job summary.
+Fence is a GitHub Action with a bundled Rust agent. It runs before the rest of your workflow, applies the runner's network and security rules, and keeps checking those rules until the job finishes.
 
-## Lifecycle
+## Job Lifecycle
 
-1. The workflow invokes the pinned Fence Action before checkout or other untrusted steps.
-2. The wrapper validates its bundled manifest and protects the registered Action path with a root-owned read-only mount.
-3. The wrapper validates native inputs, writes a root-owned configuration below `/run/fence/<invocation-id>/`, and launches the bundled agent as the main process of a matching transient systemd service.
-4. The agent checks the supported GitHub-hosted runner fingerprint, including trusted executables and ancestors, sudo-policy sources, runner identity, and the bounded local root-control inventory.
-5. The agent builds the selected profile and user policy, starts local DNS mediation, applies mode-specific nftables and privilege controls, and verifies the resulting state before writing readiness.
-6. In block mode, approved DNS answers are released only after all corresponding firewall rules have been applied and structurally verified.
-7. The agent remains resident and rechecks the firewall, privilege/container state, local-control inventory, worker health, and local evidence every five seconds. Critical resident health never returns to healthy.
-8. The protected post-job hook validates the active service and evidence, writes the **Fence Summary**, prints bounded human-readable and machine-readable network reports, and fails the job when critical drift is present. Fence does not restore access; disposable runner teardown removes the VM.
-
-## Detailed Flow
+1. **Start:** Fence verifies the runner and the bundled agent.
+2. **Configure:** It combines the GitHub connections needed by the runner with your `allowlist`.
+3. **Protect:** Block mode restricts outbound traffic and turns off passwordless `sudo` and Docker.
+4. **Monitor:** The agent checks the runner throughout the job.
+5. **Report:** The post-job step summarizes network activity and fails the job if a security control changed unexpectedly.
 
 ```mermaid
-flowchart TD
-    start["GitHub-hosted Linux job starts"] --> action["Fence Action runs first"]
-    action --> input["Read native Action inputs<br/>default: block mode + empty allowlist"]
-    input --> protect["Protect registered Action path<br/>stable ancestors + read-only runtime"]
-    protect --> config["Write root-owned config<br/>under /run/fence/"]
-    config --> launch["Launch bundled agent<br/>with sudo + systemd"]
-
-    launch --> support["Check supported runner shape"]
-    support --> plan["Build network plan<br/>Built-in platform policy + allowlist"]
-    plan --> network["Apply Linux nftables rules<br/>and local DNS handling"]
-    network --> gate["Release approved DNS answers<br/>after matching firewall access is verified"]
-
-    gate --> mode{"Selected mode"}
-    mode --> block["block<br/>turn off passwordless sudo<br/>turn off Docker"]
-    mode --> degraded["unsafe_preserve<br/>turn off passwordless sudo<br/>keep Docker"]
-    mode --> audit["audit<br/>observe only<br/>keep sudo and Docker"]
-
-    block --> ready["Write ready/report files"]
-    degraded --> ready
-    audit --> ready
-
-    ready --> resident["Fence keeps running<br/>checks controls every 5 seconds"]
-    resident --> post["Protected post hook<br/>verifies runtime + evidence"]
-    post --> summary["Render Fence Summary<br/>fail on critical drift"]
-    summary --> teardown["Runner teardown removes the VM"]
+flowchart LR
+    start["Verify runner"] --> policy["Apply network rules"]
+    policy --> monitor["Monitor the job"]
+    monitor --> report["Report activity"]
 ```
 
-## Major Components
+Fence does not restore network or privilege access at the end of a job. GitHub discards the hosted runner instead.
 
-- **Action wrapper:** Converts the common native inputs into strict agent configuration, validates the bundled artifact, creates the protected launcher path, and registers the post-job hook.
-- **Runtime intake:** Accepts only the expected root-owned, no-follow configuration path and matching transient service identity.
-- **Platform profile:** Describes the supported runner fingerprint and the bounded GitHub Actions, Azure platform, DNS, sudo, container, and local-control expectations.
-- **DNS mediator and firewall owner:** Attribute DNS requests, validate policy and response lineage, serialize firewall updates, and publish answers only after access is verified.
-- **Resident verifier:** Rechecks controls and worker health every five seconds and records bounded local evidence.
-- **Post-job hook:** Validates the live service and evidence, renders the final summary and bounded network reports, and converts critical findings into job failure.
+## Block And Audit Modes
+
+Block mode is the default. It allows required runner connections and your configured destinations, blocks everything else, and disables passwordless `sudo` and Docker.
+
+Audit mode shows what block mode would reject without blocking traffic or changing `sudo` and Docker access. Use it to work out which destinations a job needs.
+
+You can optionally keep Docker with `container_policy: unsafe_preserve` or enable GitHub artifacts with `allow_github_artifacts: true`. Both options reduce the default security guarantees, so use them only when required.
 
 ## Network Reports
 
-Fence automatically reports bounded network activity at the end of both `block` and `audit` jobs. The GitHub job summary remains the primary human-readable presentation. The post-job log also contains a short readable activity table followed by exactly one machine-readable line beginning with `FENCE_REPORT_JSON=`.
+Fence reports network activity in two places:
 
-The JSON record uses stable `schema_version: 1` and includes the selected mode, `healthy`, `warning`, or `critical` result, final control states, at most 20 grouped network destinations, bounded warning and omission counters, and safe audit-mode allowlist recommendations. Its complete prefixed line is at most 16 KiB. Allowed DNS queries, rejected connections, and audit-mode `would_block` observations remain distinct; a DNS lookup does not claim that a network connection succeeded.
+- The GitHub job summary contains a human-readable activity table.
+- The post-job log contains the same activity and one machine-readable `FENCE_REPORT_JSON=` line.
 
-In `block` mode, a successfully denied results-storage DNS request remains visible in the network table and `warnings.results_storage_rejections` without turning an otherwise protected job into a warning. Caller-attribution failures, exhausted account capacity, intentionally reduced assurance, missing or truncated evidence, and control failures still receive the appropriate warning or critical result. In `audit` mode, a storage-capacity warning describes what `block` mode would deny; the observed request is not blocked.
+The report tells you which destinations were allowed, blocked, or observed in audit mode. It includes control status, warnings, and recommended audit-mode allowlist entries. Fence limits the report to 20 destinations, keeps the complete JSON record under 16 KiB, and does not include secrets, environment variables, command arguments, or packet contents.
 
-When `allow_github_artifacts: true` is enabled, the report shows `result: "warning"`, records `warnings.github_artifact_uploads_enabled: true`, and counts `warnings.github_artifact_authorizations`. The warning identifies intentionally reduced results-storage assurance; normal block-mode network, sudo, and container controls remain verified. The bounded root-owned DNS evidence separately records exact account names and `opt_in_github_artifact_dns` authorization origins.
+### Fetch A Report
 
-For example, an audit-mode report with one observed network destination is emitted as a single complete line:
-
-```text
-FENCE_REPORT_JSON={"schema_version":1,"mode":"audit","result":"healthy","controls":{"network":"verified","sudo":"preserved_verified","containers":"preserved_verified","protection_available":false,"readiness":"ready_observation_only","resident_health":"healthy"},"network":[{"destination_kind":"hostname","destination":"api.example.com","decision":"would_block","activities":[{"kind":"dns_query","query_type":"a","count":1},{"kind":"connection_attempt","protocol":"tcp","port":443,"count":2}],"actors":[{"label":"runner: curl (PID 4242)","count":2}],"count":3}],"warnings":{"critical_findings":0,"critical_codes":[],"materialization_rejections":0,"wildcard_rejections":0,"wildcard_authorizations_truncated":false,"results_storage_attribution_failures":0,"results_storage_rejections":0,"results_storage_authorizations_truncated":false},"omissions":{"network_rows":0,"hostname_recommendations":0,"ip_recommendations":0,"actor_entries":0,"activity_entries":0,"critical_codes":0,"unparsed_findings":0,"dns_evidence_missing":false,"source_truncated":false,"byte_budget_exceeded":false},"suggested_allowlist":["api.example.com"]}
-```
-
-List the jobs for a run:
+First, find the job ID:
 
 ```bash
 gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \
   --jq '.jobs[] | {id, name}'
 ```
 
-Fetch and parse a job's final Fence report:
+Then extract and pretty-print the report:
 
 ```bash
 gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
@@ -83,6 +53,78 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
-Fence writes this report only after checking the protected Action runtime, resident service, and local evidence. It writes verified critical results before intentionally failing the job, so diagnostics remain available without weakening the fail-closed behavior. Job logs expose validated hostnames, literal IP addresses, and bounded actor details to anyone who can read the workflow run. They never include raw reports, credentials, environment values, packet contents, process arguments, full executable paths, or remote telemetry.
+Fence writes the report as one compact line in the job log. The command above formats it for reading:
 
-The [Fence v0 specification](v0.md) is the normative behavior contract. The [threat model](threat-model.md) explains the trust boundaries and attacker assumptions.
+```json
+{
+  "schema_version": 1,
+  "mode": "audit",
+  "result": "healthy",
+  "controls": {
+    "network": "verified",
+    "sudo": "preserved_verified",
+    "containers": "preserved_verified",
+    "protection_available": false,
+    "readiness": "ready_observation_only",
+    "resident_health": "healthy"
+  },
+  "network": [
+    {
+      "destination_kind": "hostname",
+      "destination": "api.example.com",
+      "decision": "would_block",
+      "activities": [
+        {
+          "kind": "dns_query",
+          "query_type": "a",
+          "count": 1
+        },
+        {
+          "kind": "connection_attempt",
+          "protocol": "tcp",
+          "port": 443,
+          "count": 2
+        }
+      ],
+      "actors": [
+        {
+          "label": "runner: curl (PID 4242)",
+          "count": 2
+        }
+      ],
+      "count": 3
+    }
+  ],
+  "warnings": {
+    "critical_findings": 0,
+    "critical_codes": [],
+    "materialization_rejections": 0,
+    "wildcard_rejections": 0,
+    "wildcard_authorizations_truncated": false,
+    "results_storage_attribution_failures": 0,
+    "results_storage_rejections": 0,
+    "results_storage_authorizations_truncated": false,
+    "github_artifact_uploads_enabled": false,
+    "github_artifact_authorizations": 0
+  },
+  "omissions": {
+    "network_rows": 0,
+    "hostname_recommendations": 0,
+    "ip_recommendations": 0,
+    "actor_entries": 0,
+    "activity_entries": 0,
+    "critical_codes": 0,
+    "unparsed_findings": 0,
+    "dns_evidence_missing": false,
+    "source_truncated": false,
+    "byte_budget_exceeded": false
+  },
+  "suggested_allowlist": [
+    "api.example.com"
+  ]
+}
+```
+
+Anyone who can read the workflow job log can read the report. In audit mode, `would_block` means a request was observed, not denied. In block mode, a blocked request is expected and does not make an otherwise healthy job a warning.
+
+For implementation details and the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security guide](security.md).

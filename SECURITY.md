@@ -2,87 +2,61 @@
 
 ## Supported Versions
 
-Fence publishes a stable v0 release. Security fixes are applied to the
-latest `main` branch and the latest published stable release. The implemented
-protection boundary is intentionally limited to GitHub-hosted `ubuntu-24.04`
-x64 host jobs as documented in `docs/v0.md`. Audit mode is observation-only,
-and `unsafe_preserve` is explicitly degraded because it retains container
-control paths. `Cargo.toml` is the checked-out source-agent version authority,
-and `action/bundle-manifest.json` identifies the agent carried by the Action.
-The latest stable GitHub Release is the supported publication; this policy does
-not duplicate a version number that can become stale.
+Security fixes are applied to `main` and the latest stable Fence release.
+
+Fence supports GitHub-hosted x64 runners using `ubuntu-24.04` or `ubuntu-latest`. Each release is validated on `ubuntu-24.04`, while `ubuntu-latest` is regularly tested against the same runner security checks. Self-hosted runners, container jobs, and other operating systems or architectures are outside the supported protection boundary.
+
+Audit mode observes network activity without blocking it. `container_policy: unsafe_preserve` keeps Docker and containerd available and has weaker isolation than default block mode.
+
+See the [security guide](docs/security.md), [v0 specification](docs/v0.md), and [threat model](docs/threat-model.md) for the full security and support boundaries.
+
+## Reporting A Vulnerability
+
+Use [GitHub private vulnerability reporting](https://github.com/openai/fence/security/advisories/new) when it is available. Otherwise, contact the repository maintainer directly.
+
+> [!IMPORTANT]
+> Do not open a public issue containing exploit details for an unresolved vulnerability.
 
 ## Dependency Policy
 
-- Cargo dependencies must be exact-pinned where practical.
-- `Cargo.lock` must be committed.
-- `vendor/cache` must be committed.
-- Routine repo scripts must not implicitly download third-party tools; hosted validation runs checksum-gated Rust preparation with `script/prepare-rust` before entering the offline script surface.
-- Cargo dependency updates must use `script/update`.
-- Dependency update changes must include any required `Cargo.lock` and `vendor/cache` changes.
-- Rust toolchain updates must use `script/vendor-rust` and commit `.cargo/tooling/rust-toolchain.lock.toml` changes.
-- Update-tool lock refreshes for `cargo-audit` and `cargo-deny` must use `script/vendor-update-tools`.
-- Prepared cross-build-tool updates must use `script/vendor-release-tools` and commit `vendor/release-tools` changes.
+- Pin direct Cargo dependencies to exact versions.
+- Commit `Cargo.lock` and the vendored dependencies in `vendor/cache`.
+- Use `script/update` for dependency updates.
+- Use `script/vendor-rust` for Rust toolchain updates.
+- Use `script/vendor-update-tools`, `script/vendor-release-tools`, and `script/vendor-test-tools` for their respective pinned tools.
+- Keep routine builds and tests offline after the Rust toolchain is prepared.
 
-## Offline Expectations
+## Offline Development
 
-The normal offline project scripts are intended to validate offline Cargo behavior:
+Prepare Rust explicitly, then run the standard offline project commands:
 
 ```console
+script/prepare-rust
 script/bootstrap
 script/test
 script/lint
 script/build
 ```
 
-GitHub-hosted runners are not fully air-gapped infrastructure. Hosted lint, test, PR build, and release build validation run `script/validate-locks --ci` and `script/prepare-rust` first, then the repository scripts stay on the offline surface. Those offline scripts do not ask Cargo or rustup to hydrate dependencies or toolchains implicitly. Checkout, action loading, Rust preparation, artifact transfer, release publication, and attestation verification still require network access.
+`script/prepare-rust` verifies the pinned Rust distribution before installing it. The remaining commands use checked-in dependencies and do not download tools.
 
-## Tooling
+GitHub-hosted jobs are not completely air-gapped. Checkout, runner preparation, artifact uploads, release publication, and attestation verification still use GitHub network services.
 
-Rust tooling is checksum-locked in `.cargo/tooling/rust-toolchain.lock.toml`:
+## Verify Release Artifacts
 
-- Rust distribution URLs and SHA-256s for `rustc`, `cargo`, `rustfmt`, `clippy`, and configured Rust target standard libraries are committed.
-- `script/prepare-rust` verifies the lock against the official Rust channel metadata before installing with `rustup`.
-- `script/vendor-rust` is the only normal Rust toolchain lock refresh path.
-
-Online update tooling is checksum-locked in `.cargo/tooling/update-tools.lock.toml`:
-
-- `cargo-audit` and `cargo-deny` top-level crate URLs and SHA-256s are committed.
-- The packaged `Cargo.lock` inside each tool crate is checksum-verified after extraction.
-- `script/vendor-update-tools` is the only normal update-tool lock refresh path.
-
-Prepared cross-build tooling is vendored in `vendor/release-tools`:
-
-- Zig host archives are committed and checksum-verified before extraction.
-- `cargo-zigbuild` crate, source archive, lockfile, and vendored transitive dependency archive are committed and checksum-verified before extraction.
-- `script/install-zig` installs retained cross-build tools from committed artifacts only.
-- `script/vendor-release-tools` is the only online refresh path for those tools.
-- Retaining these tools does not establish macOS, ARM, or other protected-agent support.
-
-The published Fence agent target is limited to `x86_64-unknown-linux-gnu` on
-GitHub-hosted `ubuntu-24.04` x64 after its documented security assertions are
-proved. Release publication, Action-bundle refresh, artifact upload/download,
-and attestation verification are intentionally GitHub-networked operations.
-The current threat model and residual boundaries are recorded in
-[`docs/threat-model.md`](docs/threat-model.md). Focused review findings are
-recorded in [`docs/security-review.md`](docs/security-review.md).
-
-## Reporting Vulnerabilities
-
-Report vulnerabilities through GitHub Security Advisories for this repository when available. If that is not available, contact the maintainer directly. Do not open public issues with exploit details for unresolved vulnerabilities.
-
-## Verifying Release Artifacts
-
-Release assets include checksums and GitHub artifact attestations. Verify releases published from `openai/fence` with:
+Use the checksums and attestations attached to a published release:
 
 ```console
 shasum -a 256 -c checksums.txt
+
 gh attestation verify <artifact> \
   --repo openai/fence \
   --signer-workflow openai/fence/.github/workflows/release.yml
 ```
 
-Releases through `v0.8.3` retain their original `GrantBirki/fence` provenance. Verify those historical artifacts with:
+On Linux, use `sha256sum -c checksums.txt` if `shasum` is unavailable.
+
+Releases through `v0.8.3` were published before the repository transfer and retain their original `GrantBirki/fence` provenance:
 
 ```console
 gh attestation verify <artifact> \
@@ -90,4 +64,4 @@ gh attestation verify <artifact> \
   --signer-workflow GrantBirki/fence/.github/workflows/release.yml
 ```
 
-Use `sha256sum -c checksums.txt` instead of `shasum` on systems where that is the standard checksum tool.
+See [release provenance](docs/release-provenance.md) for the source commit, distribution commit, and published Action pin.

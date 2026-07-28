@@ -1,41 +1,61 @@
-# Troubleshooting
+# Troubleshooting 🔍
 
-Fence prints a short progress log during setup and a compact **Fence Summary** with control and network-activity tables at the end of the job.
+Start with the Fence job summary. It shows network activity, blocked destinations, warnings, and the final state of the runner's security controls.
 
-## Enable Action Debug Logging
+## Fence Fails To Start
 
-If setup fails and you need more detail, set the standard GitHub Actions repository secret `ACTIONS_STEP_DEBUG` to `true` and rerun the job. Debug output includes bounded transient-service status and Fence-specific diagnostics while avoiding raw configuration bodies, environment values, packet payloads, and unrelated system logs.
+Check that the job uses a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Fence does not support self-hosted runners, container jobs, or other architectures.
 
-## Check The Supported Runner
+Make Fence the first step. Checkout, setup actions, and other commands can change the runner before Fence has verified it.
 
-Fence supports GitHub-hosted x64 host jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the stable, release-validated image. `ubuntu-latest` is regularly tested, but GitHub can change its image; Fence fails closed if the current runner does not pass its security checks. Other architectures, container jobs, and self-hosted runners are unsupported.
+If you need more detail, set the standard `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
 
-Fence must be the first meaningful step in the job. Move checkout, setup actions, and workflow commands after Fence so the Action can validate the expected runner state before other code changes it.
+## A Network Request Is Blocked
 
-## Investigate A Blocked Destination
+Temporarily switch to audit mode:
 
-Start with `mode: audit` and inspect the final **Fence Summary**. Add the narrowest exact hostname, protocol, and port that the workflow needs, then return to `block` mode. Avoid broad wildcard suffixes when a small set of exact hostnames is sufficient.
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    mode: audit
+```
 
-If a hostname is allowlisted but still fails, check whether the service redirects to a different hostname, uses a CDN or object-storage domain, or opens a non-default port. Container image pulls commonly span authentication, registry, layer, CDN, and storage destinations.
+Check the job summary, add the required hostname or IP address to your allowlist, and return to block mode. Use the narrowest destination, protocol, and port that works.
 
-## Investigate GitHub Artifact, Pages, Or Cache Failures
+If an allowed hostname still fails, check whether the service uses redirects, a CDN, a separate storage domain, or a non-default port.
 
-GitHub artifact uploads, Pages deployments, and caches may resolve a dynamically assigned results-storage account from an action process rather than the trusted GitHub runner. Default block mode intentionally refuses those requests.
+## Artifact Uploads Or Pages Fail
 
-If the job must perform one of these operations, set `allow_github_artifacts: true` on its Fence step. This permits up to four exact, dynamically discovered results-storage accounts on HTTPS while preserving normal blocking for unrelated destinations. Artifact uploads become an explicit data-egress channel, so leave the option disabled in jobs that do not need them. Do not allowlist `*.blob.core.windows.net` or manually add dynamic storage accounts.
+Artifact uploads, GitHub Pages, and caches can need extra GitHub storage access:
 
-## Investigate Container Failures
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    allow_github_artifacts: true
+```
 
-Standard block mode intentionally disables Docker and containerd control paths. Workflows that require containers must set `container_policy: unsafe_preserve` and accept that the result no longer carries the standard containment claim.
+Enable this only for jobs that need it. Do not allowlist all Azure Blob Storage or add changing GitHub storage domains by hand.
 
-## Investigate Critical Drift
+## Docker Does Not Work
 
-A critical finding after readiness is permanent for that Fence lifecycle. The post-job hook fails the job because a required worker exited, an owned firewall object changed, a privilege or container control drifted, an unexpected root control endpoint appeared, or another verified invariant stopped holding.
+Fence disables Docker and containerd by default. Keep them available only when your workflow requires containers:
 
-Do not paper over a critical drift failure with a broader network allowlist. Use the summary and debug diagnostics to identify the failed control, then compare it with the [supported security boundary](security.md) and [normative v0 contract](v0.md).
+```yaml
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
+  with:
+    container_policy: unsafe_preserve
+```
 
-## Direct Agent Execution
+This weakens runner isolation. Image pulls may also need registry, authentication, CDN, or storage destinations in your allowlist.
 
-`fence render-plan` and `fence check-support` are inspection commands. An ordinary direct `fence run` is rejected with `trusted_launcher_required`; production activation must come through the checked-in Action and matching transient systemd service.
+## The Job Reports Critical Drift
 
-See the [CLI reference](cli.md) for command details.
+Critical drift means a required protection changed or a monitored Fence component stopped working. Fence fails the job because it can no longer verify the original security guarantees.
+
+Check the job summary and debug logs for the affected control. Do not work around the failure by adding a broader allowlist.
+
+## The Agent Cannot Run Directly
+
+`fence check-support` and `fence render-plan` are inspection commands. Running `fence run` directly fails with `trusted_launcher_required` because production protection must start through the GitHub Action.
+
+See the [CLI reference](cli.md), [security guide](security.md), and [allowlist guide](allowlist.md) for more detail.

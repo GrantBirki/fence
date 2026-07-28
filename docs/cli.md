@@ -1,6 +1,6 @@
-# CLI Reference
+# CLI Reference 💻
 
-Most users should use the GitHub Action. The native Rust agent exposes a narrow command-line interface for version inspection, support checks, deterministic plan rendering, and the trusted production lifecycle.
+Most users should run Fence as a GitHub Action. The Rust agent also provides a small CLI for inspecting its version, checking runner information, and previewing a policy.
 
 ```console
 fence --version
@@ -9,32 +9,36 @@ fence render-plan --config policy.json
 fence run --config /run/fence/example/config.json
 ```
 
-## `fence --version`
+## Print The Version
 
-Prints the source-agent version. `Cargo.toml` is the version authority for source builds; a published bundle's schema-`4` manifest is the bundled-agent version and provenance authority.
+```console
+fence --version
+```
 
-## `fence check-support`
+Prints the agent version. Source builds use `Cargo.toml`; published Action bundles record their version and provenance in `action/bundle-manifest.json`.
 
-Reports the current host's operating system, architecture, and native-backend presence, and exposes the accepted hosted-runner fingerprint reference without comparing it to the live host. Fingerprint comparison is deferred to Action activation; this inspection result does not apply controls or claim active protection.
+## Check Runner Information
 
-## `fence render-plan`
+```console
+fence check-support
+```
 
-Parses strict JSON configuration and emits a deterministic native nftables preview without applying the production lifecycle:
+Shows the host operating system, architecture, available backend, and expected runner fingerprint. This command does not activate Fence or establish protection.
+
+## Preview A Policy
 
 ```console
 fence render-plan --config policy.json
 ```
 
-The configuration must satisfy the same schema and bounded policy validation used by the agent.
+Validates a JSON configuration and prints the resulting firewall plan without applying it.
 
-## `fence run`
-
-Production `run` is intentionally not a general-purpose root CLI. It accepts only `/run/fence/<invocation-id>/config.json`, requires pinned root-owned runtime directories and a root-owned `0600` regular configuration file, and validates that the process is the root `MainPID` of the matching `fence-<invocation-id>.service` transient unit.
-
-An ordinary direct invocation fails with `trusted_launcher_required` before reading configuration:
+## Run The Agent
 
 ```console
 fence run --config /run/fence/example/config.json
 ```
 
-Use the checked-in GitHub Action to create the protected launcher path and production lifecycle. See [Architecture and Lifecycle](how-it-works.md) for the full sequence and the [configuration interface](v0.md#configuration-interface) for the normative CLI contract.
+Production execution must start through the Fence GitHub Action. Running this command directly fails with `trusted_launcher_required`; that check prevents an ordinary process from claiming it has activated runner protection.
+
+See [how Fence works](how-it-works.md) and the [configuration contract](v0.md#configuration-interface) for more detail.
