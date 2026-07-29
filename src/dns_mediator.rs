@@ -11,7 +11,7 @@ use crate::findings::{
     ConnectionEvent, ConnectionEventDrain, ConnectionFinding, FindingCollection,
     bounded_timestamp_now, drain_connection_events,
 };
-use crate::hosted_runner::{AcceptedResolverV2, hosted_runner_fingerprint_requirement};
+use crate::hosted_runner::hosted_runner_fingerprint_requirement;
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -26,7 +26,8 @@ use crate::local_control::{
     verify_no_additive_local_control_since, verify_reviewed_local_control_observation,
 };
 use crate::lockdown::{
-    LockdownControl, LockdownPosture, SystemLockdownControl, runner_path_writable,
+    LockdownControl, LockdownPosture, SystemLockdownControl,
+    fixed_command as lockdown_fixed_command, runner_docker_available, runner_path_writable,
 };
 use crate::nflog::NflogReader;
 use crate::nft::{
@@ -145,6 +146,10 @@ const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
 const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
+const REVIEWED_RESOLVER_TARGETS: [&str; 2] = [
+    "/run/systemd/resolve/stub-resolv.conf",
+    "/run/systemd/resolve/resolv.conf",
+];
 const DOCKER_DAEMON_PATH: &str = "/etc/docker/daemon.json";
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_PREHYDRATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -202,7 +207,7 @@ struct ResidentWorkerSupervisor {
     disconnected_reported: bool,
 }
 
-fn initial_resident_health() -> ResidentHealth {
+fn initial_resident_health(docker_available: bool) -> ResidentHealth {
     ResidentHealth {
         status: "starting",
         resident_pid: std::process::id(),
@@ -211,6 +216,7 @@ fn initial_resident_health() -> ResidentHealth {
         verification_interval_seconds: RESIDENT_VERIFICATION_INTERVAL.as_secs(),
         workers: REQUIRED_RESIDENT_WORKERS
             .into_iter()
+            .filter(|name| docker_available || !name.starts_with("docker_"))
             .map(|name| ResidentWorkerHealth {
                 name,
                 status: "starting",
@@ -238,11 +244,12 @@ fn advance_resident_health(
 }
 
 impl ResidentWorkerSupervisor {
-    fn new(events: Receiver<ResidentWorkerEvent>) -> Self {
+    fn new(events: Receiver<ResidentWorkerEvent>, docker_available: bool) -> Self {
         Self {
             events,
             statuses: REQUIRED_RESIDENT_WORKERS
                 .into_iter()
+                .filter(|worker| docker_available || !worker.starts_with("docker_"))
                 .map(|worker| (worker, "starting"))
                 .collect(),
             disconnected_reported: false,
@@ -1431,6 +1438,7 @@ fn query_authorization(
 
 struct DnsRouting {
     executables: Arc<TrustedExecutableSet>,
+    docker_available: bool,
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
@@ -1443,13 +1451,20 @@ impl DnsRouting {
     fn activate(
         runtime_directory: &Path,
         executables: Arc<TrustedExecutableSet>,
+        docker_available: bool,
     ) -> Result<Self, DnsMediationError> {
-        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
+        let resolver_target = fs::canonicalize("/etc/resolv.conf").map_err(|_| {
+            DnsMediationError::new(
+                "unsupported_resolver_layout",
+                "host resolver target could not be resolved safely",
+            )
+        })?;
         let mut routing = Self {
             executables,
+            docker_available,
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
-            resolver_target: PathBuf::from(accepted.canonical_target),
+            resolver_target,
             resolver_source_created: false,
             resolver_mounted: false,
             docker_changed: false,
@@ -1507,6 +1522,9 @@ impl DnsRouting {
         )?;
         self.verify_active_resolver_mount()?;
 
+        if !self.docker_available {
+            return Ok(());
+        }
         let docker_path = Path::new(DOCKER_DAEMON_PATH);
         self.docker_original = read_optional_external_file(docker_path)?;
         let mut docker_config = match self.docker_original.as_deref() {
@@ -1584,12 +1602,20 @@ impl DnsRouting {
 
     fn verify_active(&self) -> Result<(), DnsMediationError> {
         self.verify_active_resolver_mount()?;
-        verify_docker_dns_route()
+        if self.docker_available {
+            verify_docker_dns_route()
+        } else if runner_docker_available(&self.executables).map_err(lockdown_error)? {
+            Err(DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "a container runtime appeared after host-only DNS routing was selected",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn verify_supported_resolver_layout(&self) -> Result<(), DnsMediationError> {
-        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
-        let resolv_conf = Path::new(accepted.resolv_conf_path);
+        let resolv_conf = Path::new("/etc/resolv.conf");
         let metadata = fs::symlink_metadata(resolv_conf).map_err(|_| {
             DnsMediationError::new(
                 "unsupported_resolver_layout",
@@ -1608,21 +1634,83 @@ impl DnsRouting {
                 "host resolver target could not be inspected safely",
             )
         })?;
+        let (resolver_uid, resolver_gid) = self.reviewed_resolver_service_identity()?;
+        for path in ["/run", "/run/systemd", "/run/systemd/resolve"] {
+            let metadata = fs::symlink_metadata(path).map_err(|_| unsupported_resolver_layout())?;
+            if !metadata.file_type().is_dir()
+                || fs::canonicalize(path).ok().as_deref() != Some(Path::new(path))
+                || (metadata.uid() != 0 && metadata.uid() != resolver_uid)
+                || (metadata.gid() != 0 && metadata.gid() != resolver_gid)
+                || metadata.permissions().mode() & 0o022 != 0
+                || runner_path_writable(&self.executables, path.as_ref(), SOCKET_PROBE_TIMEOUT)
+                    .map_err(lockdown_error)?
+            {
+                return Err(unsupported_resolver_layout());
+            }
+        }
         if !resolver_layout_is_supported(
             metadata.file_type().is_symlink(),
             &canonical,
-            &accepted,
             target_metadata.file_type().is_file(),
             target_metadata.file_type().is_symlink(),
-            target_metadata.uid(),
-            target_metadata.permissions().mode() & 0o777,
+            (target_metadata.uid(), target_metadata.gid()),
+            target_metadata.permissions().mode() & 0o7777,
+            (resolver_uid, resolver_gid),
         ) {
-            return Err(DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver layout does not match the reviewed runner fingerprint",
-            ));
+            return Err(unsupported_resolver_layout());
+        }
+        if runner_path_writable(
+            &self.executables,
+            canonical.as_os_str(),
+            SOCKET_PROBE_TIMEOUT,
+        )
+        .map_err(lockdown_error)?
+        {
+            return Err(unsupported_resolver_layout());
         }
         Ok(())
+    }
+
+    fn reviewed_resolver_service_identity(&self) -> Result<(u32, u32), DnsMediationError> {
+        let (uid, gid) = self
+            .executables
+            .reviewed_resolver_identity()
+            .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+        let output = lockdown_fixed_command(
+            &self.executables,
+            TrustedExecutable::Systemctl,
+            &[
+                "show",
+                "--no-pager",
+                "--property=MainPID",
+                "systemd-resolved.service",
+            ],
+        )
+        .map_err(lockdown_error)?;
+        let pid = std::str::from_utf8(&output.stdout)
+            .ok()
+            .and_then(reviewed_resolver_service_pid)
+            .ok_or_else(unsupported_resolver_layout)?;
+        if !output.status.success() {
+            return Err(unsupported_resolver_layout());
+        }
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let process_metadata = fs::metadata(&process).map_err(|_| unsupported_resolver_layout())?;
+        let executable = process.join("exe");
+        let executable_path =
+            fs::canonicalize(executable).map_err(|_| unsupported_resolver_layout())?;
+        let executable_metadata =
+            fs::metadata(&executable_path).map_err(|_| unsupported_resolver_layout())?;
+        if process_metadata.uid() != uid
+            || executable_path != Path::new("/usr/lib/systemd/systemd-resolved")
+            || !executable_metadata.file_type().is_file()
+            || executable_metadata.uid() != 0
+            || executable_metadata.gid() != 0
+            || executable_metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(unsupported_resolver_layout());
+        }
+        Ok((uid, gid))
     }
 
     fn verify_active_resolver_mount(&self) -> Result<(), DnsMediationError> {
@@ -1672,18 +1760,37 @@ impl DnsRouting {
 fn resolver_layout_is_supported(
     resolv_conf_is_symlink: bool,
     canonical_target: &Path,
-    accepted: &AcceptedResolverV2,
     target_is_file: bool,
     target_is_symlink: bool,
-    target_uid: u32,
+    target_identity: (u32, u32),
     target_mode: u32,
+    resolver_identity: (u32, u32),
 ) -> bool {
+    let (target_uid, target_gid) = target_identity;
+    let (resolver_uid, resolver_gid) = resolver_identity;
     resolv_conf_is_symlink
-        && canonical_target == Path::new(accepted.canonical_target)
+        && REVIEWED_RESOLVER_TARGETS
+            .iter()
+            .any(|target| canonical_target == Path::new(target))
         && target_is_file
         && !target_is_symlink
-        && target_uid == accepted.target_uid
-        && target_mode == 0o644
+        && (target_uid == 0 || target_uid == resolver_uid)
+        && (target_gid == 0 || target_gid == resolver_gid)
+        && target_mode & 0o7022 == 0
+        && target_mode & 0o400 != 0
+}
+
+fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
+    let mut lines = contents.lines();
+    let pid = lines.next()?.strip_prefix("MainPID=")?.parse().ok()?;
+    (pid != 0 && lines.next().is_none()).then_some(pid)
+}
+
+fn unsupported_resolver_layout() -> DnsMediationError {
+    DnsMediationError::new(
+        "unsupported_resolver_layout",
+        "host DNS resolver does not meet the reviewed ownership and routing requirements",
+    )
 }
 
 fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
@@ -1721,6 +1828,7 @@ impl DnsMediationSession {
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
+        let docker_available = runner_docker_available(&executables).map_err(lockdown_error)?;
         let fence_owner =
             PinnedCurrentFenceOwner::capture(Path::new("/proc")).map_err(local_control_error)?;
         let trusted_runner_worker = Arc::new(
@@ -1728,7 +1836,7 @@ impl DnsMediationSession {
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
         );
         let report_path = runtime_directory.join("dns-report.json");
-        let resident_health = Arc::new(Mutex::new(initial_resident_health()));
+        let resident_health = Arc::new(Mutex::new(initial_resident_health(docker_available)));
         let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
@@ -1765,7 +1873,11 @@ impl DnsMediationSession {
             mut threads,
             mut supervisor,
             attribution,
-        } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers))?;
+        } = start_dns_proxy(
+            recorder.clone(),
+            Arc::clone(&stop_workers),
+            docker_available,
+        )?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
             return Err(error);
@@ -1776,7 +1888,7 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate(runtime_directory, executables) {
+        let routing = match DnsRouting::activate(runtime_directory, executables, docker_available) {
             Ok(routing) => routing,
             Err(error) => {
                 shutdown_dns_workers(&stop_workers, &mut threads);
@@ -2034,9 +2146,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            lockdown
-                .verify_containers_available()
-                .map_err(lockdown_error)?;
+            if mediation.routing.docker_available {
+                lockdown
+                    .verify_containers_available()
+                    .map_err(lockdown_error)?;
+            }
             backend.preflight(&ruleset).map_err(backend_error)?;
             backend.apply_provisional(&ruleset).map_err(backend_error)?;
             evidence.network_application_status = "applied";
@@ -2045,9 +2159,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 .map_err(backend_error)?;
             evidence.network_verification_status = "verified";
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            lockdown
-                .verify_containers_available()
-                .map_err(lockdown_error)?;
+            if mediation.routing.docker_available {
+                lockdown
+                    .verify_containers_available()
+                    .map_err(lockdown_error)?;
+            }
             evidence.sudo_status = "preserved_verified";
             evidence.container_status = "preserved_verified";
             evidence.counters.total_violations =
@@ -2227,7 +2343,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                     "measured passwordless sudo availability drifted after observation readiness",
                 );
             }
-            if self.lockdown.verify_containers_available().is_err() {
+            if self._mediation.routing.docker_available
+                && self.lockdown.verify_containers_available().is_err()
+            {
                 verification_succeeded = false;
                 self.evidence.container_status = "critical_drift";
                 self.record_critical(
@@ -2417,9 +2535,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            lockdown
-                .verify_containers_available()
-                .map_err(lockdown_error)?;
+            if mediation.routing.docker_available
+                || scope.lockdown_posture() == LockdownPosture::UnsafePreserve
+            {
+                lockdown
+                    .verify_containers_available()
+                    .map_err(lockdown_error)?;
+            }
             backend.preflight(&ruleset).map_err(backend_error)?;
             backend.apply_provisional(&ruleset).map_err(backend_error)?;
             evidence.network_application_status = "applied";
@@ -4252,6 +4374,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn start_dns_proxy(
     recorder: ObservationRecorder,
     stop: Arc<AtomicBool>,
+    docker_available: bool,
 ) -> Result<DnsProxyRuntime, DnsMediationError> {
     let mut listeners = Vec::new();
     for (address, listener_kind, udp_worker, tcp_worker) in [
@@ -4268,6 +4391,9 @@ fn start_dns_proxy(
             "docker_tcp_dns",
         ),
     ] {
+        if listener_kind == DnsListenerKind::Docker && !docker_available {
+            continue;
+        }
         let udp = UdpSocket::bind(address).map_err(|_| {
             DnsMediationError::new(
                 "dns_proxy_bind_failed",
@@ -4345,7 +4471,7 @@ fn start_dns_proxy(
     drop(events);
     Ok(DnsProxyRuntime {
         threads,
-        supervisor: ResidentWorkerSupervisor::new(receiver),
+        supervisor: ResidentWorkerSupervisor::new(receiver, docker_available),
         attribution,
     })
 }
@@ -5941,7 +6067,7 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(),
+        &initial_resident_health(true),
     )
 }
 
@@ -5974,11 +6100,19 @@ fn evidence_from_state_and_authorizations(
             }
             _ => "local_mediator_test_only",
         },
-        docker_dns_routing: match scope {
-            DnsEvidenceScope::ProtectedHostAudit
-            | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => "local_root_resident_mediator",
-            _ => "local_mediator_test_only",
+        docker_dns_routing: if !resident_health
+            .workers
+            .iter()
+            .any(|worker| worker.name == "docker_udp_dns")
+        {
+            "not_present"
+        } else {
+            match scope {
+                DnsEvidenceScope::ProtectedHostAudit
+                | DnsEvidenceScope::ProtectedHostBlock
+                | DnsEvidenceScope::ProtectedHostBlockDegraded => "local_root_resident_mediator",
+                _ => "local_mediator_test_only",
+            }
         },
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
@@ -6453,7 +6587,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,
@@ -8112,7 +8246,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
@@ -8310,7 +8444,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(),
+            &initial_resident_health(true),
         );
         assert_eq!(evidence.runner_authorized_results_storage.len(), 4);
         assert!(
@@ -8443,7 +8577,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &artifact_policy,
-            &initial_resident_health(),
+            &initial_resident_health(true),
         );
         assert!(evidence.allow_github_artifacts);
         assert!(evidence.hostname_policy.allow_github_artifacts);
@@ -9035,7 +9169,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(),
+            &initial_resident_health(true),
         );
         assert_eq!(
             evidence.bounded_githubapp_suffix_authorizations.len(),
@@ -9066,7 +9200,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &CnameAuthorizationState::default(),
             &opt_out_policy,
-            &initial_resident_health(),
+            &initial_resident_health(true),
         );
         assert!(
             opt_out_evidence
@@ -9145,7 +9279,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(),
+            &initial_resident_health(true),
         );
         assert_eq!(
             evidence.bounded_user_wildcard_authorizations.len(),
@@ -12081,59 +12215,111 @@ mod tests {
 
     #[test]
     fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
-        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
-        let accepted_target = Path::new(accepted.canonical_target);
-        assert!(resolver_layout_is_supported(
-            true,
-            accepted_target,
-            &accepted,
-            true,
-            false,
-            991,
-            0o644,
-        ));
+        let accepted_target = Path::new(REVIEWED_RESOLVER_TARGETS[0]);
+        for target in REVIEWED_RESOLVER_TARGETS {
+            for (uid, gid, mode) in [(991, 992, 0o644), (0, 0, 0o640), (1201, 1202, 0o444)] {
+                let resolver_uid = if uid == 0 { 991 } else { uid };
+                let resolver_gid = if gid == 0 { 992 } else { gid };
+                assert!(resolver_layout_is_supported(
+                    true,
+                    Path::new(target),
+                    true,
+                    false,
+                    (uid, gid),
+                    mode,
+                    (resolver_uid, resolver_gid),
+                ));
+            }
+        }
         for unsupported in [
             resolver_layout_is_supported(
                 false,
                 accepted_target,
-                &accepted,
                 true,
                 false,
-                991,
+                (991, 992),
                 0o644,
+                (991, 992),
             ),
             resolver_layout_is_supported(
                 true,
-                Path::new("/run/systemd/resolve/resolv.conf"),
-                &accepted,
+                Path::new("/run/unreviewed/resolv.conf"),
                 true,
                 false,
-                991,
+                (991, 992),
                 0o644,
+                (991, 992),
+            ),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                false,
+                false,
+                (991, 992),
+                0o644,
+                (991, 992),
             ),
             resolver_layout_is_supported(
                 true,
                 accepted_target,
-                &accepted,
-                false,
-                false,
-                991,
+                true,
+                true,
+                (991, 992),
                 0o644,
+                (991, 992),
             ),
-            resolver_layout_is_supported(true, accepted_target, &accepted, true, true, 991, 0o644),
-            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 0, 0o644),
             resolver_layout_is_supported(
                 true,
                 accepted_target,
-                &accepted,
                 true,
                 false,
-                1000,
+                (1000, 992),
                 0o644,
+                (991, 992),
             ),
-            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 991, 0o666),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                true,
+                false,
+                (991, 1000),
+                0o644,
+                (991, 992),
+            ),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                true,
+                false,
+                (991, 992),
+                0o666,
+                (991, 992),
+            ),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                true,
+                false,
+                (991, 992),
+                0o244,
+                (991, 992),
+            ),
         ] {
             assert!(!unsupported);
+        }
+    }
+
+    #[test]
+    fn resolver_service_identity_requires_exactly_one_active_process() {
+        assert_eq!(reviewed_resolver_service_pid("MainPID=123\n"), Some(123));
+        for unsupported in [
+            "MainPID=0\n",
+            "MainPID=nope\n",
+            "User=systemd-resolve\n",
+            "MainPID=123\nMainPID=456\n",
+            "MainPID=123\nUnexpected=true\n",
+        ] {
+            assert!(reviewed_resolver_service_pid(unsupported).is_none());
         }
     }
 
@@ -12145,7 +12331,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: root.join("missing/report.json"),
             scope: DnsEvidenceScope::ProtectedHostAudit,
@@ -12161,7 +12347,7 @@ mod tests {
     #[test]
     fn resident_worker_supervisor_requires_all_workers_and_reports_fatal_exit() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -12189,9 +12375,34 @@ mod tests {
     }
 
     #[test]
+    fn host_only_worker_supervision_omits_only_container_dns_workers() {
+        let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, false);
+        for worker in ["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME] {
+            sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
+        }
+        supervisor.wait_for_startup().unwrap();
+        assert!(supervisor.all_healthy());
+        assert_eq!(
+            supervisor
+                .worker_health()
+                .iter()
+                .map(|worker| worker.name)
+                .collect::<Vec<_>>(),
+            vec!["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME]
+        );
+        assert!(
+            initial_resident_health(false)
+                .workers
+                .iter()
+                .all(|worker| !worker.name.starts_with("docker_"))
+        );
+    }
+
+    #[test]
     fn resident_worker_supervisor_reports_channel_disconnect_once() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -12208,7 +12419,7 @@ mod tests {
         for panic_worker in [false, true] {
             let stop = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-            let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+            let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
             let worker = if panic_worker {
                 ATTRIBUTION_WORKER_NAME
             } else {
@@ -12241,7 +12452,7 @@ mod tests {
 
     #[test]
     fn resident_verification_sequence_and_timestamp_are_bounded() {
-        let mut health = initial_resident_health();
+        let mut health = initial_resident_health(true);
         health.verification_sequence = u64::MAX;
         let workers = health
             .workers

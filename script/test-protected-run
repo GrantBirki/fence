@@ -780,12 +780,15 @@ if scenario == "audit":
     observation = json.loads(host_observation_path.read_text(encoding="utf-8"))
     require(observation["schema_version"] == 4)
     azure_agent = observation["systemd"]["azure_platform_agent"]
-    require(azure_agent["name"] == "walinuxagent.service")
-    require(azure_agent["active_state"] == "active")
-    require(azure_agent["sub_state"] == "running")
-    require(azure_agent["configured_user_class"] == "root_or_default")
-    require(azure_agent["process_owner_class"] == "root")
-    require(azure_agent["process_status"] == "observed")
+    agent_available = azure_agent.get("status") == "observed"
+    if agent_available:
+        require(azure_agent["active_state"] == "active")
+        require(azure_agent["sub_state"] == "running")
+        require(azure_agent["configured_user_class"] == "root_or_default")
+        require(azure_agent["process_owner_class"] == "root")
+        require(azure_agent["process_status"] == "observed")
+    else:
+        require(azure_agent == {"status": "unavailable"})
     wireserver_findings = [
         item for item in report["findings"]
         if item.get("remote_address") == "168.63.129.16"
@@ -798,20 +801,23 @@ if scenario == "audit":
     )
     require(wireserver_observation["schema_version"] == 1)
     require(wireserver_observation["status"] == "wireserver_agent_observation_only")
-    require(wireserver_observation["control_group"] == "/azure.slice/walinuxagent.service")
+    require(
+        wireserver_observation["control_group"]
+        == (azure_agent["control_group"] if agent_available else None)
+    )
     require(wireserver_observation["destination"] == "168.63.129.16")
     require(wireserver_observation["observations_truncated"] is False)
     agent_socket_ports = {
         item["port"] for item in wireserver_observation["observations"]
     }
     diagnostic = {
-        "agent_control_group": azure_agent["control_group"],
+        "agent_control_group": azure_agent.get("control_group"),
         "agent_processes": [
             {
                 "executable_basename": process["executable_basename"],
                 "pid": process["pid"],
             }
-            for process in azure_agent["processes"]
+            for process in azure_agent.get("processes", [])
         ],
         "agent_socket_observations": wireserver_observation["observations"],
         "agent_socket_ports": sorted(agent_socket_ports),

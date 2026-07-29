@@ -21,7 +21,9 @@ if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
   die "Action acceptance requires Linux x86_64"
 fi
 
-require_cmd docker
+if [[ "$scenario" != "standard" && "$scenario" != "audit" ]]; then
+  require_cmd docker
+fi
 require_cmd curl
 require_cmd findmnt
 require_cmd python3
@@ -279,8 +281,6 @@ import sys
 import time
 
 expected_workers = [
-    {"name": "docker_tcp_dns", "status": "running"},
-    {"name": "docker_udp_dns", "status": "running"},
     {"name": "host_tcp_dns", "status": "running"},
     {"name": "host_udp_dns", "status": "running"},
     {"name": "process_attribution", "status": "running"},
@@ -317,6 +317,16 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+docker_routing = dns.get("docker_dns_routing")
+if docker_routing == "local_root_resident_mediator":
+    expected_workers[:0] = [
+        {"name": "docker_tcp_dns", "status": "running"},
+        {"name": "docker_udp_dns", "status": "running"},
+    ]
+elif docker_routing == "not_present":
+    require(scenario in {"standard", "audit"})
+else:
+    raise SystemExit("unsupported Docker DNS routing evidence")
 require(manifest["schema_version"] == 4)
 require(manifest["source_ref"] == "refs/heads/main")
 require(manifest["signer_digest"] == manifest["source_commit"])
@@ -349,7 +359,6 @@ require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")
 require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v5")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
-require(dns["docker_dns_routing"] == "local_root_resident_mediator")
 expected_proxy_policy = (
     "audit_forwards_while_simulating_name_authorization"
     if mode == "audit"
@@ -462,6 +471,18 @@ else:
     require(broad_roots.issubset(bootstrap_roots))
 PY
 
+docker_routing="$(python3 -E - "$dns_report" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["docker_dns_routing"])
+PY
+)"
+if [[ "$docker_routing" == "local_root_resident_mediator" ]]; then
+  require_cmd docker
+fi
+
 case "$scenario" in
   standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts)
     if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
@@ -474,12 +495,18 @@ case "$scenario" in
 esac
 case "$scenario" in
   standard|standard-opt-out|github-artifacts)
-    if docker ps --quiet >/dev/null 2>&1; then
+    if [[ "$docker_routing" == "local_root_resident_mediator" ]] \
+      && docker ps --quiet >/dev/null 2>&1; then
       die "Fence Action standard block did not disable Docker access"
     fi
     ;;
-  unsafe-preserve|wildcard-docker|audit)
+  unsafe-preserve|wildcard-docker)
     docker ps --quiet >/dev/null
+    ;;
+  audit)
+    if [[ "$docker_routing" == "local_root_resident_mediator" ]]; then
+      docker ps --quiet >/dev/null
+    fi
     ;;
 esac
 
@@ -520,8 +547,6 @@ import sys
 import time
 
 expected_workers = [
-    {"name": "docker_tcp_dns", "status": "running"},
-    {"name": "docker_udp_dns", "status": "running"},
     {"name": "host_tcp_dns", "status": "running"},
     {"name": "host_udp_dns", "status": "running"},
     {"name": "process_attribution", "status": "running"},
@@ -532,6 +557,14 @@ report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:4])
 docker_lifecycle_start_sequence = int(sys.argv[4])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
+if dns.get("docker_dns_routing") == "local_root_resident_mediator":
+    expected_workers[:0] = [
+        {"name": "docker_tcp_dns", "status": "running"},
+        {"name": "docker_udp_dns", "status": "running"},
+    ]
+else:
+    require(dns.get("docker_dns_routing") == "not_present")
+    require(scenario in {"standard", "audit"})
 require(report["runtime_evidence_schema_version"] == 5)
 require(report["policy_hash_schema_version"] == 9)
 require(report["network_verification_status"] == "verified")

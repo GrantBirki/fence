@@ -2438,7 +2438,7 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(canary_job, 4)
     == {
-        "name": "${{ matrix.runner }} zero-input canary",
+        "name": "${{ matrix.runner }} ${{ matrix.mode }} canary",
         "timeout-minutes": "8",
         "runs-on": "${{ matrix.runner }}",
     },
@@ -2467,15 +2467,16 @@ canary_matrix = indented_block(
 require_exact_mapping_keys(
     canary_matrix,
     8,
-    ["runner"],
-    "Action drift canary matrix may select only its reviewed runner dimension",
+    ["runner", "mode"],
+    "Action drift canary matrix may select only its reviewed runner and mode dimensions",
 )
 require(
     scalar_mapping(canary_matrix, 8)
     == {
         "runner": "[ubuntu-24.04, ubuntu-latest]",
+        "mode": "[block, audit]",
     },
-    "Action drift canary runner matrix must always use both supported labels",
+    "Action drift canary matrix must test both supported labels in block and audit mode",
 )
 require(
     len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
@@ -2512,10 +2513,10 @@ canary_fragments = [
 for fragment in canary_fragments:
     require(fragment in canary, "Action drift canary contract is incomplete")
 
-require(canary.count("uses: ./") == 1, "Action drift canary must activate the bundle exactly once")
+require(canary.count("uses: ./") == 2, "Action drift canary must define exactly one activation per mode")
 require(
-    canary.count("script/test-action-acceptance standard") == 1,
-    "Action drift canary must validate one standard lifecycle",
+    canary.count('script/test-action-acceptance "$scenario"') == 1,
+    "Action drift canary must validate exactly one mode-selected lifecycle",
 )
 
 for forbidden in [
@@ -2528,18 +2529,25 @@ for forbidden in [
     require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
 require(
     re.findall(r"(?m)^        if:[ \t]*(.+)$", canary)
-    == ["steps.resolve.outputs.mapped_release == 'true'"],
-    "Action drift canary may condition only the mapped-release provenance gate",
+    == [
+        "steps.resolve.outputs.mapped_release == 'true'",
+        "matrix.mode == 'block'",
+        "matrix.mode == 'audit'",
+    ],
+    "Action drift canary may condition only release provenance and exact mode activation",
 )
 
 guard_marker = "\n      - name: require bundled Action activation\n"
 activation_marker = "\n      - name: activate bundled Fence agent with strict defaults\n"
-verification_marker = "\n      - name: verify zero-input Action lifecycle\n"
+audit_activation_marker = "\n      - name: activate bundled Fence agent in audit mode\n"
+verification_marker = "\n      - name: verify Action lifecycle\n"
 require(canary.count(guard_marker) == 1, "Action drift canary classifier guard must be unique")
 require(canary.count(activation_marker) == 1, "Action drift canary activation step must be unique")
+require(canary.count(audit_activation_marker) == 1, "Action drift canary audit activation step must be unique")
 require(canary.count(verification_marker) == 1, "Action drift canary lifecycle step must be unique")
 guard = canary.split(guard_marker, 1)[1].split(activation_marker, 1)[0]
-activation = canary.split(activation_marker, 1)[1].split(verification_marker, 1)[0]
+activation = canary.split(activation_marker, 1)[1].split(audit_activation_marker, 1)[0]
+audit_activation = canary.split(audit_activation_marker, 1)[1].split(verification_marker, 1)[0]
 verification = canary.split(verification_marker, 1)[1]
 expected_guard = (
     "        env:\n"
@@ -2552,11 +2560,28 @@ expected_guard = (
     "          fi\n"
 )
 require(guard == expected_guard, "Action drift canary classifier guard must fail closed")
-require(activation == "        uses: ./\n", "Action drift canary activation must use zero inputs")
+require(
+    activation == "        if: matrix.mode == 'block'\n        uses: ./\n",
+    "Action drift canary block activation must use zero inputs",
+)
+require(
+    audit_activation
+    == "        if: matrix.mode == 'audit'\n        uses: ./\n        with:\n          mode: audit\n",
+    "Action drift canary audit activation must use only its explicit audit input",
+)
 require(
     verification
-    == '        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n',
-    "Action drift canary lifecycle validation must be unconditional",
+    == (
+        "        env:\n"
+        "          FENCE_MODE: ${{ matrix.mode }}\n"
+        "        run: |\n"
+        "          scenario=standard\n"
+        '          if [[ "$FENCE_MODE" == "audit" ]]; then\n'
+        "            scenario=audit\n"
+        "          fi\n"
+        '          script/test-action-acceptance "$scenario" "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n'
+    ),
+    "Action drift canary lifecycle validation must remain unconditional for both modes",
 )
 
 release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")

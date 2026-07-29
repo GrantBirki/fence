@@ -1,4 +1,6 @@
-use crate::hosted_runner::{AcceptedTrustedExecutableV2, hosted_runner_fingerprint_requirement};
+use crate::hosted_runner::{
+    AcceptedTrustedExecutableV2, hosted_runner_fingerprint_requirement, reviewed_ubuntu_os_release,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -12,6 +14,7 @@ use std::process::{Command, Stdio};
 const ROOT_UID: u32 = 0;
 const ROOT_GID: u32 = 0;
 const RUNNER_PRINCIPAL: &str = "runner";
+const RESOLVER_PRINCIPAL: &str = "systemd-resolve";
 const MIN_RETAINED_EXECUTABLE_FD: i32 = 3;
 const STANDARD_DESCRIPTOR_RESERVATION_COUNT: usize = 3;
 const PROC_SELF_STAT_PATH: &str = "/proc/self/stat";
@@ -318,6 +321,14 @@ impl TrustedExecutableSet {
         let standard_descriptor_reservations = reserve_standard_descriptors()?;
         let mut executables = BTreeMap::new();
         for spec in specs {
+            if spec.executable == TrustedExecutable::Docker
+                && matches!(
+                    fs::symlink_metadata(spec.canonical_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                continue;
+            }
             let pinned = PinnedExecutable::capture(
                 Path::new(spec.canonical_path),
                 ROOT_UID,
@@ -328,6 +339,28 @@ impl TrustedExecutableSet {
         }
         drop(standard_descriptor_reservations);
         Ok(Self { executables })
+    }
+
+    pub(crate) fn contains(&self, executable: TrustedExecutable) -> bool {
+        self.executables.contains_key(&executable)
+    }
+
+    pub(crate) fn reviewed_resolver_identity(&self) -> Result<(u32, u32), TrustedExecutableError> {
+        self.verify_all()?;
+        let etc = open_reviewed_directory("/etc")?;
+        if etc.metadata.uid() != ROOT_UID
+            || etc.metadata.gid() != ROOT_GID
+            || etc.metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(TrustedExecutableError::unavailable());
+        }
+        let (_, passwd) = read_reviewed_host_file(&etc.descriptor, "passwd")?;
+        let runner = reviewed_account_identity(&passwd, RUNNER_PRINCIPAL)?;
+        let resolver = reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
+        if runner.0 == resolver.0 {
+            return Err(TrustedExecutableError::unavailable());
+        }
+        Ok(resolver)
     }
 
     pub(crate) fn verify_all(&self) -> Result<(), TrustedExecutableError> {
@@ -536,9 +569,19 @@ fn read_reviewed_host_file(
 }
 
 fn reviewed_runner_identity(contents: &[u8]) -> Result<(u32, u32), TrustedExecutableError> {
+    reviewed_account_identity(contents, RUNNER_PRINCIPAL)
+}
+
+fn reviewed_account_identity(
+    contents: &[u8],
+    principal: &str,
+) -> Result<(u32, u32), TrustedExecutableError> {
     let contents =
         std::str::from_utf8(contents).map_err(|_| TrustedExecutableError::unavailable())?;
-    let mut entries = contents.lines().filter(|line| line.starts_with("runner:"));
+    let mut entries = contents.lines().filter(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name == principal)
+    });
     let fields = entries
         .next()
         .ok_or_else(TrustedExecutableError::unavailable)?
@@ -600,10 +643,9 @@ fn verify_reviewed_host_image(usr: &File) -> Result<(), TrustedExecutableError> 
 }
 
 fn reviewed_host_os_release(contents: &[u8]) -> bool {
-    std::str::from_utf8(contents).ok().is_some_and(|contents| {
-        contents.lines().any(|line| line == "ID=ubuntu")
-            && contents.lines().any(|line| line == "VERSION_ID=\"24.04\"")
-    })
+    std::str::from_utf8(contents)
+        .ok()
+        .is_some_and(reviewed_ubuntu_os_release)
 }
 
 fn validate_repairable_ancestor(
@@ -790,14 +832,38 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_repair_requires_exact_ubuntu_24_04_identity() {
-        assert!(reviewed_host_os_release(
-            b"NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n"
-        ));
-        for unsupported in [
-            b"ID=debian\nVERSION_ID=\"24.04\"\n".as_slice(),
+    fn reviewed_service_accounts_use_dynamic_unaliased_non_root_identities() {
+        let valid = concat!(
+            "root:x:0:0:root:/root:/bin/bash\n",
+            "runner:x:1001:1002:runner:/home/runner:/bin/bash\n",
+            "systemd-resolve:x:1250:1251:resolver:/:/usr/sbin/nologin\n"
+        );
+        assert_eq!(
+            reviewed_account_identity(valid.as_bytes(), "systemd-resolve").unwrap(),
+            (1250, 1251)
+        );
+        for invalid in [
+            "systemd-resolve:x:0:1251:resolver:/:/usr/sbin/nologin\n",
+            "systemd-resolve:x:1250:0:resolver:/:/usr/sbin/nologin\n",
+            "systemd-resolve:x:1250:1251:resolver:/:/usr/sbin/nologin\nother:x:1250:1252:alias:/:/usr/sbin/nologin\n",
+        ] {
+            assert!(reviewed_account_identity(invalid.as_bytes(), "systemd-resolve").is_err());
+        }
+    }
+
+    #[test]
+    fn ancestor_repair_requires_a_reviewed_ubuntu_lts_identity() {
+        for supported in [
+            b"NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n".as_slice(),
             b"ID=ubuntu\nVERSION_ID=\"26.04\"\n".as_slice(),
             b"ID=ubuntu\nVERSION_ID=24.04\n".as_slice(),
+        ] {
+            assert!(reviewed_host_os_release(supported));
+        }
+        for unsupported in [
+            b"ID=debian\nVERSION_ID=\"24.04\"\n".as_slice(),
+            b"ID=ubuntu\nVERSION_ID=\"25.04\"\n".as_slice(),
+            b"ID=ubuntu\nVERSION_ID=\"42.04\"\n".as_slice(),
             b"ID=ubuntu\n".as_slice(),
         ] {
             assert!(!reviewed_host_os_release(unsupported));

@@ -1,11 +1,12 @@
 use crate::hosted_runner::{
     AcceptedHostedRunnerFactsV3, AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
-    hosted_runner_fingerprint_requirement,
+    hosted_runner_fingerprint_requirement, reviewed_ubuntu_os_release,
 };
 use crate::lifecycle::validate_test_service_context;
 use crate::local_control::{
-    NoCurrentFenceOwner, OBSERVATION_TIMEOUT, SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess,
-    observe_local_control_inventory, verify_reviewed_local_control_observation,
+    NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner, SOCKET_PROBE_TIMEOUT,
+    SystemUnixSocketAccess, observe_local_control_inventory,
+    verify_reviewed_local_control_observation,
 };
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
@@ -16,8 +17,8 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -31,7 +32,6 @@ const MAX_POLICY_SOURCE_BYTES: u64 = 256 * 1024;
 const MAX_SUDO_POLICY_SOURCES: usize = 64;
 const SUDOERS_PATH: &str = "/etc/sudoers";
 const SUDOERS_DROP_IN_ROOT: &str = "/etc/sudoers.d";
-const RUNNER_DROP_IN_PATH: &str = "/etc/sudoers.d/runner";
 const RESTORED_SUDO_VISUDO_ARGUMENTS: [&str; 3] = ["--check", "--file", SUDOERS_PATH];
 const RUNNER_SUDO_VALIDATION_ARGUMENTS: [&str; 3] =
     ["--non-interactive", "--reset-timestamp", "--validate"];
@@ -281,13 +281,18 @@ fn establish_controls(
 ) -> Result<(), LockdownError> {
     control.verify_supported_host()?;
     control.verify_sudo_available()?;
-    control.verify_containers_available()?;
     match posture {
         LockdownPosture::Audit => {
+            match control.verify_containers_available() {
+                Ok(()) => {}
+                Err(error) if error.code == "container_shape_unsupported" => {}
+                Err(error) => return Err(error),
+            }
             evidence.sudo_status = "preserved";
             evidence.container_status = "preserved";
         }
         LockdownPosture::UnsafePreserve => {
+            control.verify_containers_available()?;
             control.disable_sudo()?;
             control.verify_sudo_disabled()?;
             control.verify_containers_available()?;
@@ -350,6 +355,7 @@ fn initial_evidence(posture: LockdownPosture) -> LockdownEvidence {
 
 #[derive(Debug, Eq, PartialEq)]
 struct SudoRollbackSource {
+    name: String,
     bytes: Vec<u8>,
     mode: u32,
     uid: u32,
@@ -362,7 +368,7 @@ struct SudoRollbackSource {
 #[derive(Debug)]
 enum SudoRollbackState {
     Unchanged,
-    RollbackAvailable(SudoRollbackSource),
+    RollbackAvailable(Vec<SudoRollbackSource>),
     CommittedNoRestore,
 }
 
@@ -370,6 +376,7 @@ pub struct SystemLockdownControl {
     executables: Arc<TrustedExecutableSet>,
     sudo_rollback: SudoRollbackState,
     sudo_source_pins: Option<Vec<SudoPolicySourcePin>>,
+    removed_sudo_source_names: Vec<String>,
     containers_masked: bool,
 }
 
@@ -379,6 +386,7 @@ impl SystemLockdownControl {
             executables,
             sudo_rollback: SudoRollbackState::Unchanged,
             sudo_source_pins: None,
+            removed_sudo_source_names: Vec::new(),
             containers_masked: false,
         }
     }
@@ -424,7 +432,7 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_ps(executables)?.status.success() {
+        if runner_docker_available(executables)? {
             Ok(())
         } else {
             Err(LockdownError::new(
@@ -441,20 +449,33 @@ impl LockdownControl for SystemLockdownControl {
                 "sudo lockdown state does not permit another disable operation",
             ));
         }
-        let source = capture_runner_sudo_source()?;
-        let source_pin = self
+        let source_pins = self
             .sudo_source_pins
             .as_ref()
-            .and_then(|pins| {
-                pins.iter()
-                    .find(|pin| pin.path_class == "drop_in" && pin.name == "runner")
-            })
             .ok_or_else(unsupported_fingerprint)?;
-        if !rollback_source_matches_pin(&source, source_pin) {
+        let source_names = discover_runner_sudo_source_names(&self.executables, source_pins)?;
+        if source_names.is_empty() {
             return Err(unsupported_fingerprint());
         }
-        remove_captured_runner_sudo_source(&source)?;
-        self.sudo_rollback = SudoRollbackState::RollbackAvailable(source);
+        for name in source_names {
+            let source = capture_runner_sudo_source(&name)?;
+            let source_pin = source_pins
+                .iter()
+                .find(|pin| pin.path_class == "drop_in" && pin.name == name)
+                .ok_or_else(unsupported_fingerprint)?;
+            if !rollback_source_matches_pin(&source, source_pin) {
+                return Err(unsupported_fingerprint());
+            }
+            remove_captured_runner_sudo_source(&source)?;
+            self.removed_sudo_source_names.push(name);
+            match &mut self.sudo_rollback {
+                SudoRollbackState::Unchanged => {
+                    self.sudo_rollback = SudoRollbackState::RollbackAvailable(vec![source]);
+                }
+                SudoRollbackState::RollbackAvailable(sources) => sources.push(source),
+                SudoRollbackState::CommittedNoRestore => unreachable!("checked above"),
+            }
+        }
         require_success(
             fixed_command(&self.executables, TrustedExecutable::Visudo, &["--check"])?,
             "sudo_lockdown_failed",
@@ -463,6 +484,9 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn disable_containers(&mut self) -> Result<(), LockdownError> {
+        if !runner_docker_available(&self.executables)? {
+            return Ok(());
+        }
         self.containers_masked = true;
         require_success(
             fixed_command(
@@ -491,14 +515,14 @@ impl LockdownControl for SystemLockdownControl {
             .sudo_source_pins
             .as_deref()
             .ok_or_else(unsupported_fingerprint)?;
-        verify_locked_sudo_sources(executables, source_pins)?;
+        verify_locked_sudo_sources(executables, source_pins, &self.removed_sudo_source_names)?;
         let sudo_available = runner_sudo_validate(executables)?.status.success();
         let policy_listing = fixed_command(
             executables,
             TrustedExecutable::Sudo,
             &RUNNER_SUDO_POLICY_LIST_ARGUMENTS,
         )?;
-        verify_locked_sudo_sources(executables, source_pins)?;
+        verify_locked_sudo_sources(executables, source_pins, &self.removed_sudo_source_names)?;
         if !sudo_privileges_disabled(sudo_available, &policy_listing) {
             Err(LockdownError::new(
                 "sudo_lockdown_failed",
@@ -514,7 +538,7 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_ps(executables)?.status.success() {
+        if runner_docker_available(executables)? {
             return Err(LockdownError::new(
                 "container_lockdown_failed",
                 "runner Docker access remains usable after lockdown",
@@ -523,26 +547,16 @@ impl LockdownControl for SystemLockdownControl {
         for unit in CONTAINER_UNITS {
             let state = observe_unit(executables, unit)?;
             if state.active_state == "active"
-                || !matches!(state.unit_file_state.as_str(), "masked" | "masked-runtime")
+                || self.containers_masked
+                    && !matches!(state.unit_file_state.as_str(), "masked" | "masked-runtime")
             {
                 return Err(LockdownError::new(
                     "container_lockdown_failed",
-                    "an accepted container unit is not stopped and runtime-masked",
+                    "an accepted container unit remains active or was not runtime-masked",
                 ));
             }
         }
-        for path in [
-            "/var/run/docker.sock",
-            "/run/docker.sock",
-            "/run/containerd/containerd.sock",
-        ] {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(LockdownError::new(
-                    "container_lockdown_failed",
-                    "a container runtime socket remains connectable after lockdown",
-                ));
-            }
-        }
+        verify_container_runtime_unavailable(executables)?;
         Ok(())
     }
 
@@ -556,7 +570,12 @@ impl LockdownControl for SystemLockdownControl {
         rollback_pre_ready_components(
             &mut self.sudo_rollback,
             &mut self.containers_masked,
-            move |source| restore_runner_sudo_source(&sudo_executables, source),
+            move |sources| {
+                for source in sources {
+                    restore_runner_sudo_source(&sudo_executables, source)?;
+                }
+                Ok(())
+            },
             move || restore_container_controls(&executables),
         )
     }
@@ -588,7 +607,7 @@ fn rollback_pre_ready_components<RestoreSudo, RestoreContainers>(
     mut restore_containers: RestoreContainers,
 ) -> Result<bool, LockdownError>
 where
-    RestoreSudo: FnMut(&SudoRollbackSource) -> Result<(), LockdownError>,
+    RestoreSudo: FnMut(&[SudoRollbackSource]) -> Result<(), LockdownError>,
     RestoreContainers: FnMut() -> Result<(), LockdownError>,
 {
     if matches!(sudo_rollback, SudoRollbackState::CommittedNoRestore) {
@@ -603,7 +622,7 @@ where
     let changed = sudo_restore_required || container_restore_required;
 
     let sudo_result = match sudo_rollback {
-        SudoRollbackState::RollbackAvailable(source) => restore_sudo(source),
+        SudoRollbackState::RollbackAvailable(sources) => restore_sudo(sources),
         SudoRollbackState::Unchanged => Ok(()),
         SudoRollbackState::CommittedNoRestore => unreachable!("checked above"),
     };
@@ -738,13 +757,17 @@ fn verify_test_local_control_inventory(
     .map_err(|error| LockdownError::new(error.code, error.message))
 }
 
-fn runner_access_probe_plan(
-    accepted: &AcceptedHostedRunnerFactsV3,
-) -> Vec<RunnerAccessProbeSpec<'_>> {
+fn runner_access_probe_plan<'a>(
+    accepted: &'a AcceptedHostedRunnerFactsV3,
+    docker_present: bool,
+) -> Vec<RunnerAccessProbeSpec<'a>> {
     let mut plan = Vec::with_capacity(
         accepted.trusted_executables.len() * 2 + accepted.permission_ancestor_directories.len() * 2,
     );
     for executable in &accepted.trusted_executables {
+        if executable.path == TrustedExecutable::Docker.path() && !docker_present {
+            continue;
+        }
         let target = RunnerProbeTarget::TrustedExecutable(executable);
         plan.push(RunnerAccessProbeSpec {
             target,
@@ -774,7 +797,6 @@ fn runner_access_probe_plan(
 }
 
 fn collect_runner_probe_baselines<'a>(
-    accepted: &'a AcceptedHostedRunnerFactsV3,
     plan: &[RunnerAccessProbeSpec<'a>],
 ) -> Result<BTreeMap<&'static str, RunnerProbeIdentity>, LockdownError> {
     let mut baselines = BTreeMap::new();
@@ -789,8 +811,11 @@ fn collect_runner_probe_baselines<'a>(
             baselines.insert(path, observed);
         }
     }
-    let expected_target_count =
-        accepted.trusted_executables.len() + accepted.permission_ancestor_directories.len();
+    let expected_target_count = plan
+        .iter()
+        .map(|spec| spec.target.path())
+        .collect::<BTreeSet<_>>()
+        .len();
     if baselines.len() != expected_target_count {
         return Err(unsupported_fingerprint());
     }
@@ -801,8 +826,8 @@ fn verify_runner_access_probes(
     executables: &TrustedExecutableSet,
     accepted: &AcceptedHostedRunnerFactsV3,
 ) -> Result<(), LockdownError> {
-    let plan = runner_access_probe_plan(accepted);
-    let baselines = collect_runner_probe_baselines(accepted, &plan)?;
+    let plan = runner_access_probe_plan(accepted, executables.contains(TrustedExecutable::Docker));
+    let baselines = collect_runner_probe_baselines(&plan)?;
     for spec in plan {
         let expected = baselines
             .get(spec.target.path())
@@ -899,11 +924,7 @@ fn verify_host_identity(accepted: &AcceptedHostedRunnerFactsV3) -> Result<(), Lo
     }
     let os_release =
         fs::read_to_string("/etc/os-release").map_err(|_| unsupported_fingerprint())?;
-    let expected_os_id = format!("ID={}", accepted.os_id);
-    let expected_os_version = format!("VERSION_ID=\"{}\"", accepted.os_version_id);
-    if !os_release.lines().any(|line| line == expected_os_id)
-        || !os_release.lines().any(|line| line == expected_os_version)
-    {
+    if accepted.os_id != "ubuntu" || !reviewed_ubuntu_os_release(&os_release) {
         return Err(unsupported_fingerprint());
     }
     Ok(())
@@ -947,13 +968,11 @@ fn verify_host_capabilities(
         .verify_all()
         .map_err(|_| unsupported_fingerprint())?;
     verify_runner_identity(executables, &accepted)?;
-    verify_reviewed_runner_groups(executables, &accepted)?;
+    let docker_available = runner_docker_available(executables)?;
+    verify_reviewed_runner_groups(executables, &accepted, docker_available)?;
     verify_runner_access_probes(executables, &accepted)?;
     let sudo_source_pins = capture_sudo_sources(executables)?;
-    if !sudo_source_pins
-        .iter()
-        .any(|pin| pin.path_class == "drop_in" && pin.name == "runner")
-    {
+    if discover_runner_sudo_source_names(executables, &sudo_source_pins)?.is_empty() {
         return Err(unsupported_fingerprint());
     }
     let sudo_syntax = fixed_command(
@@ -967,16 +986,13 @@ fn verify_host_capabilities(
     if capture_sudo_sources(executables)? != sudo_source_pins {
         return Err(unsupported_fingerprint());
     }
-    let docker = runner_docker_ps(executables)?;
-    if !docker.status.success() || !docker.stdout.is_empty() {
-        return Err(unsupported_fingerprint());
-    }
     Ok(sudo_source_pins)
 }
 
 fn verify_reviewed_runner_groups(
     executables: &TrustedExecutableSet,
     accepted: &AcceptedHostedRunnerFactsV3,
+    docker_available: bool,
 ) -> Result<(), LockdownError> {
     let groups = fixed_command(
         executables,
@@ -994,7 +1010,7 @@ fn verify_reviewed_runner_groups(
         .copied()
         .collect::<BTreeSet<_>>();
     if !observed.contains("runner")
-        || !observed.contains("docker")
+        || docker_available && !observed.contains("docker")
         || !observed.is_subset(&reviewed)
     {
         return Err(unsupported_fingerprint());
@@ -1115,7 +1131,6 @@ where
         || !policy_source_metadata_is_safe(&metadata)
         || !sudo_includes_are_bounded(&bytes, allow_drop_in_directory_include)
         || !sudo_authentication_defaults_are_safe(&bytes)
-        || (path_class == "drop_in" && name == "runner" && !reviewed_runner_sudo_policy(&bytes))
     {
         return Err(unsupported_fingerprint());
     }
@@ -1179,7 +1194,12 @@ fn sudo_authentication_defaults_are_safe(bytes: &[u8]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn reviewed_runner_sudo_policy(bytes: &[u8]) -> bool {
+    reviewed_runner_sudo_policy_for_principals(bytes, &["runner".to_owned()])
+}
+
+fn reviewed_runner_sudo_policy_for_principals(bytes: &[u8], principals: &[String]) -> bool {
     let mut lines = bytes
         .split(|byte| *byte == b'\n')
         .map(trim_ascii_whitespace)
@@ -1194,11 +1214,64 @@ fn reviewed_runner_sudo_policy(bytes: &[u8]) -> bool {
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|field| !field.is_empty())
         .collect::<Vec<_>>();
-    fields.len() == 3
-        && fields[0] == b"runner"
-        && matches!(fields[1], b"ALL=(ALL)" | b"ALL=(ALL:ALL)")
-        && fields[2] == b"NOPASSWD:ALL"
+    let Some(principal) = fields.first() else {
+        return false;
+    };
+    let policy = fields[1..].concat();
+    principals
+        .iter()
+        .any(|candidate| principal == &candidate.as_bytes())
+        && matches!(
+            policy.as_slice(),
+            b"ALL=(ALL)NOPASSWD:ALL" | b"ALL=(ALL:ALL)NOPASSWD:ALL"
+        )
         && lines.next().is_none()
+}
+
+fn discover_runner_sudo_source_names(
+    executables: &TrustedExecutableSet,
+    pins: &[SudoPolicySourcePin],
+) -> Result<Vec<String>, LockdownError> {
+    let groups = fixed_command(
+        executables,
+        TrustedExecutable::Id,
+        &["--groups", "--name", "runner"],
+    )?;
+    let uid = fixed_command(executables, TrustedExecutable::Id, &["--user", "runner"])?;
+    if !groups.status.success() || !uid.status.success() {
+        return Err(unsupported_fingerprint());
+    }
+    let group_names = std::str::from_utf8(&groups.stdout).map_err(|_| unsupported_fingerprint())?;
+    let uid = std::str::from_utf8(&uid.stdout)
+        .ok()
+        .and_then(|value| value.trim_end_matches('\n').parse::<u32>().ok())
+        .filter(|uid| *uid != 0)
+        .ok_or_else(unsupported_fingerprint)?;
+    let mut principals = vec!["runner".to_owned(), format!("#{uid}")];
+    principals.extend(
+        group_names
+            .split_whitespace()
+            .map(|group| format!("%{group}")),
+    );
+
+    let mut matches = Vec::new();
+    for pin in pins.iter().filter(|pin| pin.path_class == "drop_in") {
+        let path = sudo_drop_in_path(&pin.name)?;
+        let (bytes, metadata) = read_bounded_policy_file_with_metadata(&path)?;
+        if metadata.dev() != pin.device
+            || metadata.ino() != pin.inode
+            || metadata.uid() != pin.uid
+            || metadata.gid() != pin.gid
+            || metadata.permissions().mode() & 0o7777 != pin.mode
+            || sha256_bytes(&bytes) != pin.sha256
+        {
+            return Err(unsupported_fingerprint());
+        }
+        if reviewed_runner_sudo_policy_for_principals(&bytes, &principals) {
+            matches.push(pin.name.clone());
+        }
+    }
+    Ok(matches)
 }
 
 fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
@@ -1214,22 +1287,32 @@ fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
 fn verify_locked_sudo_sources(
     executables: &TrustedExecutableSet,
     pinned: &[SudoPolicySourcePin],
+    removed: &[String],
 ) -> Result<(), LockdownError> {
-    require_policy_source_absent(Path::new(RUNNER_DROP_IN_PATH))?;
-    let observed = capture_sudo_sources(executables)?;
-    if !remaining_sudo_source_pins_match(&observed, pinned) {
+    if removed.is_empty() {
         return Err(unsupported_fingerprint());
     }
-    require_policy_source_absent(Path::new(RUNNER_DROP_IN_PATH))
+    for name in removed {
+        require_policy_source_absent(&sudo_drop_in_path(name)?)?;
+    }
+    let observed = capture_sudo_sources(executables)?;
+    if !remaining_sudo_source_pins_match(&observed, pinned, removed) {
+        return Err(unsupported_fingerprint());
+    }
+    for name in removed {
+        require_policy_source_absent(&sudo_drop_in_path(name)?)?;
+    }
+    Ok(())
 }
 
 fn remaining_sudo_source_pins_match(
     observed: &[SudoPolicySourcePin],
     pinned: &[SudoPolicySourcePin],
+    removed: &[String],
 ) -> bool {
     observed.iter().eq(pinned
         .iter()
-        .filter(|pin| pin.path_class != "drop_in" || pin.name != "runner"))
+        .filter(|pin| pin.path_class != "drop_in" || !removed.iter().any(|name| name == &pin.name)))
 }
 
 fn policy_source_metadata_is_safe(metadata: &fs::Metadata) -> bool {
@@ -1250,40 +1333,61 @@ fn require_policy_source_absent(path: &Path) -> Result<(), LockdownError> {
 }
 
 fn sudo_privileges_disabled(validation_succeeded: bool, policy_listing: &Output) -> bool {
-    let Some(hostname) = policy_listing
-        .stdout
-        .strip_prefix(b"User runner is not allowed to run sudo on ")
-        .and_then(|value| value.strip_suffix(b".\n"))
-    else {
+    let Ok(message) = std::str::from_utf8(&policy_listing.stdout) else {
         return false;
     };
+    let message = message.trim_end_matches(['\r', '\n']);
+    if message.is_empty()
+        || !message.is_ascii()
+        || message
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b':' | b'(' | b')' | b'='))
+    {
+        return false;
+    }
+    let words = message.split_ascii_whitespace().collect::<Vec<_>>();
+    let denied = words
+        .windows(2)
+        .any(|pair| pair == ["not", "allowed"] || pair == ["not", "permitted"])
+        || words.iter().any(|word| {
+            matches!(
+                word.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
+                "cannot" | "denied"
+            )
+        });
     !validation_succeeded
         && policy_listing.status.success()
         && policy_listing.stderr.is_empty()
-        && (1..=253).contains(&hostname.len())
-        && hostname.split(|byte| *byte == b'.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.first().is_some_and(u8::is_ascii_alphanumeric)
-                && label.last().is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-        })
+        && words.starts_with(&["User", "runner"])
+        && words.iter().any(|word| word.trim_matches('.').eq("sudo"))
+        && denied
 }
 
-fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
-    let (bytes, metadata) = read_bounded_policy_file_with_metadata(Path::new(RUNNER_DROP_IN_PATH))?;
+fn sudo_drop_in_path(name: &str) -> Result<PathBuf, LockdownError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(unsupported_fingerprint());
+    }
+    Ok(Path::new(SUDOERS_DROP_IN_ROOT).join(name))
+}
+
+fn capture_runner_sudo_source(name: &str) -> Result<SudoRollbackSource, LockdownError> {
+    let path = sudo_drop_in_path(name)?;
+    let (bytes, metadata) = read_bounded_policy_file_with_metadata(&path)?;
     let mode = metadata.permissions().mode() & 0o7777;
     let raw_sha256 = sha256_bytes(&bytes);
-    if fs::canonicalize(RUNNER_DROP_IN_PATH).ok().as_deref() != Some(Path::new(RUNNER_DROP_IN_PATH))
+    if fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
         || !policy_source_metadata_is_safe(&metadata)
         || !sudo_includes_are_bounded(&bytes, false)
-        || !reviewed_runner_sudo_policy(&bytes)
     {
         return Err(unsupported_fingerprint());
     }
     Ok(SudoRollbackSource {
+        name: name.to_owned(),
         bytes,
         mode,
         uid: metadata.uid(),
@@ -1296,7 +1400,7 @@ fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
 
 fn rollback_source_matches_pin(source: &SudoRollbackSource, pin: &SudoPolicySourcePin) -> bool {
     pin.path_class == "drop_in"
-        && pin.name == "runner"
+        && pin.name == source.name
         && source.mode == pin.mode
         && source.uid == pin.uid
         && source.gid == pin.gid
@@ -1306,14 +1410,14 @@ fn rollback_source_matches_pin(source: &SudoRollbackSource, pin: &SudoPolicySour
 }
 
 fn remove_captured_runner_sudo_source(captured: &SudoRollbackSource) -> Result<(), LockdownError> {
-    let current = capture_runner_sudo_source()?;
+    let current = capture_runner_sudo_source(&captured.name)?;
     if current != *captured {
         return Err(LockdownError::new(
             "sudo_lockdown_failed",
             "accepted runner sudo policy source changed before removal",
         ));
     }
-    fs::remove_file(RUNNER_DROP_IN_PATH).map_err(|_| {
+    fs::remove_file(sudo_drop_in_path(&captured.name)?).map_err(|_| {
         LockdownError::new(
             "sudo_lockdown_failed",
             "failed to remove the accepted runner sudo policy source",
@@ -1327,7 +1431,7 @@ fn restore_runner_sudo_source(
     source: &SudoRollbackSource,
 ) -> Result<(), LockdownError> {
     write_policy_exclusive(
-        Path::new(RUNNER_DROP_IN_PATH),
+        &sudo_drop_in_path(&source.name)?,
         &source.bytes,
         source.mode,
         "sudo_source_write_rollback_failed",
@@ -1340,7 +1444,7 @@ fn verify_restored_runner_sudo_source(
     executables: &TrustedExecutableSet,
     expected: &SudoRollbackSource,
 ) -> Result<(), LockdownError> {
-    let restored = capture_runner_sudo_source().map_err(|_| {
+    let restored = capture_runner_sudo_source(&expected.name).map_err(|_| {
         LockdownError::new(
             "sudo_restore_verification_rollback_failed",
             "restored sudo policy source is unavailable or no longer accepted",
@@ -1508,6 +1612,85 @@ fn runner_docker_ps(executables: &TrustedExecutableSet) -> Result<Output, Lockdo
     runner_command(executables, TrustedExecutable::Docker, &["ps", "--quiet"])
 }
 
+pub(crate) fn runner_docker_available(
+    executables: &TrustedExecutableSet,
+) -> Result<bool, LockdownError> {
+    if executables.contains(TrustedExecutable::Docker) {
+        let output = runner_docker_ps(executables)?;
+        if output.status.success() {
+            if !output.stdout.is_empty() {
+                return Err(unsupported_fingerprint());
+            }
+            return Ok(true);
+        }
+        if output.status.code().is_none() {
+            return Err(unsupported_fingerprint());
+        }
+    }
+    verify_container_runtime_unavailable(executables)?;
+    Ok(false)
+}
+
+fn verify_container_runtime_unavailable(
+    executables: &TrustedExecutableSet,
+) -> Result<(), LockdownError> {
+    for unit in CONTAINER_UNITS {
+        let state = observe_unit(executables, unit)?;
+        if state.active_state == "active" {
+            return Err(LockdownError::new(
+                "container_lockdown_failed",
+                "a container service remains active without verified runner access",
+            ));
+        }
+    }
+    for path in [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/run/containerd/containerd.sock",
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                if runner_path_writable(executables, OsStr::new(path), SOCKET_PROBE_TIMEOUT)? {
+                    return Err(LockdownError::new(
+                        "container_lockdown_failed",
+                        "a container runtime socket remains accessible to the runner",
+                    ));
+                }
+            }
+            Ok(_) | Err(_) => return Err(unsupported_fingerprint()),
+        }
+    }
+    let deadline = Instant::now() + OBSERVATION_TIMEOUT;
+    let socket_access = SystemUnixSocketAccess::new(|path: &OsStr| {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let timeout = remaining.min(SOCKET_PROBE_TIMEOUT);
+        if timeout.is_zero() {
+            None
+        } else {
+            runner_path_writable(executables, path, timeout).ok()
+        }
+    });
+    let fence_owner = PinnedCurrentFenceOwner::capture(Path::new("/proc"))
+        .map_err(|error| LockdownError::new(error.code, error.message))?;
+    let observed =
+        observe_local_control_inventory(Path::new("/proc"), &socket_access, &fence_owner);
+    verify_reviewed_local_control_observation(
+        &hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory,
+        &observed,
+    )
+    .map_err(|error| LockdownError::new(error.code, error.message))?;
+    if !observed.snapshot.root_container_processes.is_empty() {
+        return Err(LockdownError::new(
+            "container_lockdown_failed",
+            "root-owned container runtime processes remain available",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn runner_path_writable(
     executables: &TrustedExecutableSet,
     path: &OsStr,
@@ -1564,7 +1747,7 @@ fn observe_unit(
     })
 }
 
-fn fixed_command(
+pub(crate) fn fixed_command(
     executables: &TrustedExecutableSet,
     executable: TrustedExecutable,
     arguments: &[&str],
@@ -1672,6 +1855,7 @@ mod tests {
     struct FakeControl {
         operations: Rc<RefCell<Vec<&'static str>>>,
         rollback_result: Result<bool, LockdownError>,
+        containers_result: Result<(), LockdownError>,
     }
 
     impl FakeControl {
@@ -1679,6 +1863,7 @@ mod tests {
             Self {
                 operations: Rc::new(RefCell::new(Vec::new())),
                 rollback_result: Ok(true),
+                containers_result: Ok(()),
             }
         }
 
@@ -1686,6 +1871,17 @@ mod tests {
             Self {
                 operations: Rc::new(RefCell::new(Vec::new())),
                 rollback_result: Err(error),
+                containers_result: Ok(()),
+            }
+        }
+
+        fn without_containers() -> Self {
+            Self {
+                containers_result: Err(LockdownError::new(
+                    "container_shape_unsupported",
+                    "the accepted runner Docker control path is unavailable",
+                )),
+                ..Self::new()
             }
         }
     }
@@ -1703,7 +1899,7 @@ mod tests {
 
         fn verify_containers_available(&mut self) -> Result<(), LockdownError> {
             self.operations.borrow_mut().push("containers_available");
-            Ok(())
+            self.containers_result.clone()
         }
 
         fn disable_sudo(&mut self) -> Result<(), LockdownError> {
@@ -1747,6 +1943,7 @@ mod tests {
 
     fn test_rollback_source() -> SudoRollbackSource {
         SudoRollbackSource {
+            name: "runner".to_owned(),
             bytes: b"captured policy".to_vec(),
             mode: 0o440,
             uid: 0,
@@ -1773,7 +1970,7 @@ mod tests {
     #[test]
     fn fingerprint_v3_builds_the_exact_runner_access_probe_plan() {
         let accepted = hosted_runner_fingerprint_requirement().accepted;
-        let plan = runner_access_probe_plan(&accepted);
+        let plan = runner_access_probe_plan(&accepted, true);
         assert_eq!(
             plan.len(),
             accepted.trusted_executables.len() * 2
@@ -1819,6 +2016,12 @@ mod tests {
                 RunnerAccessProbe::NotWritable,
                 RunnerAccessProbe::NotExecutable
             ]
+        );
+        let without_docker = runner_access_probe_plan(&accepted, false);
+        assert!(
+            without_docker
+                .iter()
+                .all(|spec| spec.target.path() != "/usr/bin/docker")
         );
 
         assert_eq!(
@@ -1951,7 +2154,6 @@ mod tests {
             vec![
                 "fingerprint",
                 "sudo_available",
-                "containers_available",
                 "disable_sudo",
                 "disable_containers",
                 "sudo_disabled",
@@ -2005,6 +2207,60 @@ mod tests {
     }
 
     #[test]
+    fn missing_containers_are_safe_for_audit_and_standard_but_not_unsafe_preserve() {
+        let audit = LockdownSession::establish_test_only(
+            runtime("audit-no-containers"),
+            LockdownPosture::Audit,
+            FakeControl::without_containers(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(audit.evidence.container_status, "preserved");
+
+        let standard = LockdownSession::establish_test_only(
+            runtime("standard-no-containers"),
+            LockdownPosture::StandardBlock,
+            FakeControl::without_containers(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(standard.evidence.container_status, "disabled_verified");
+
+        let unsafe_runtime = runtime("unsafe-no-containers");
+        let unsafe_root = unsafe_runtime.directory.parent().unwrap().to_path_buf();
+        let error = LockdownSession::establish_test_only(
+            unsafe_runtime,
+            LockdownPosture::UnsafePreserve,
+            FakeControl::without_containers(),
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "container_shape_unsupported");
+
+        fs::remove_dir_all(audit.runtime.directory.parent().unwrap()).unwrap();
+        fs::remove_dir_all(standard.runtime.directory.parent().unwrap()).unwrap();
+        fs::remove_dir_all(unsafe_root).unwrap();
+    }
+
+    #[test]
+    fn audit_rejects_container_failures_other_than_proven_absence() {
+        let mut control = FakeControl::new();
+        control.containers_result = Err(LockdownError::new(
+            "container_lockdown_failed",
+            "a container runtime socket remains accessible to the runner",
+        ));
+        let runtime = runtime("audit-dangerous-containers");
+        let root = runtime.directory.parent().unwrap().to_path_buf();
+        let error =
+            LockdownSession::establish_test_only(runtime, LockdownPosture::Audit, control, false)
+                .err()
+                .unwrap();
+        assert_eq!(error.code, "container_lockdown_failed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pre_ready_failure_rolls_back_provisional_controls() {
         let runtime = runtime("rollback-proof");
         let report = runtime.report.clone();
@@ -2027,7 +2283,6 @@ mod tests {
             vec![
                 "fingerprint",
                 "sudo_available",
-                "containers_available",
                 "disable_sudo",
                 "disable_containers",
                 "sudo_disabled",
@@ -2071,7 +2326,7 @@ mod tests {
 
     #[test]
     fn container_rollback_failure_does_not_skip_sudo_restoration() {
-        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(test_rollback_source());
+        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]);
         let mut containers_masked = true;
         let operations = Rc::new(RefCell::new(Vec::new()));
         let sudo_operations = Rc::clone(&operations);
@@ -2105,7 +2360,7 @@ mod tests {
 
     #[test]
     fn rollback_preserves_each_failed_component_state_and_aggregates_errors() {
-        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(test_rollback_source());
+        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]);
         let mut containers_masked = true;
 
         let error = rollback_pre_ready_components(
@@ -2135,7 +2390,7 @@ mod tests {
         ));
         assert!(containers_masked);
 
-        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(test_rollback_source());
+        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]);
         let mut containers_masked = true;
         let error = rollback_pre_ready_components(
             &mut sudo_rollback,
@@ -2160,7 +2415,7 @@ mod tests {
 
     #[test]
     fn committed_lockdown_discards_rollback_state_and_rejects_restore() {
-        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(test_rollback_source());
+        let mut sudo_rollback = SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]);
         let mut containers_masked = true;
         commit_no_restore_state(&mut sudo_rollback);
         assert!(matches!(
@@ -2269,8 +2524,18 @@ mod tests {
         for policy in [
             b"runner ALL=(ALL) NOPASSWD:ALL\n".as_slice(),
             b"# image metadata\n  runner\tALL=(ALL:ALL)\tNOPASSWD:ALL  \n# note\n",
+            b"runner ALL=(ALL:ALL) NOPASSWD: ALL\n",
         ] {
             assert!(reviewed_runner_sudo_policy(policy));
+        }
+        for (principal, policy) in [
+            ("%runner", b"%runner ALL=(ALL) NOPASSWD: ALL\n".as_slice()),
+            ("#1001", b"#1001 ALL=(ALL:ALL) NOPASSWD:ALL\n".as_slice()),
+        ] {
+            assert!(reviewed_runner_sudo_policy_for_principals(
+                policy,
+                &[principal.to_owned()]
+            ));
         }
         for policy in [
             b"runner ALL=(ALL) NOPASSWD:/bin/sh\n".as_slice(),
@@ -2294,6 +2559,18 @@ mod tests {
         };
         let denied = b"User runner is not allowed to run sudo on fv-az123-45.\n";
         assert!(sudo_privileges_disabled(false, &listing(0, denied, b"")));
+        assert!(sudo_privileges_disabled(
+            false,
+            &listing(0, b"User runner cannot invoke sudo here.\n", b"")
+        ));
+        assert!(sudo_privileges_disabled(
+            false,
+            &listing(
+                0,
+                b"User runner is not allowed to run sudo on image_host.\n",
+                b""
+            )
+        ));
         assert!(!sudo_privileges_disabled(true, &listing(0, denied, b"")));
         assert!(!sudo_privileges_disabled(false, &listing(256, denied, b"")));
         assert!(!sudo_privileges_disabled(false, &listing(9, denied, b"")));
@@ -2302,11 +2579,8 @@ mod tests {
                 b"User runner may run the following commands on host:\n".as_slice(),
                 b"".as_slice(),
             ),
-            (b"User runner is not allowed to run sudo on .\n", b""),
-            (
-                b"User runner is not allowed to run sudo on bad_host.\n",
-                b"",
-            ),
+            (b"User runner is allowed to run sudo.\n", b""),
+            (b"User runner can run sudo with no password.\n", b""),
             (
                 b"User runner is not allowed to run sudo on host.\nextra\n",
                 b"",
@@ -2359,16 +2633,41 @@ mod tests {
             test_policy_pin("main_policy", "sudoers"),
             test_policy_pin("drop_in", "90-cloud-init-users"),
         ];
-        assert!(remaining_sudo_source_pins_match(&observed, &pinned));
+        let removed = vec!["runner".to_owned()];
+        assert!(remaining_sudo_source_pins_match(
+            &observed, &pinned, &removed
+        ));
+
+        let mut renamed = pinned.clone();
+        renamed[2].name = "90-hosted-grant".to_owned();
+        assert!(remaining_sudo_source_pins_match(
+            &observed,
+            &renamed,
+            &["90-hosted-grant".to_owned()]
+        ));
+
+        let mut multiple = pinned.clone();
+        multiple.push(test_policy_pin("drop_in", "runner-extra"));
+        assert!(remaining_sudo_source_pins_match(
+            &observed,
+            &multiple,
+            &["runner".to_owned(), "runner-extra".to_owned()]
+        ));
 
         observed[1].inode += 1;
-        assert!(!remaining_sudo_source_pins_match(&observed, &pinned));
+        assert!(!remaining_sudo_source_pins_match(
+            &observed, &pinned, &removed
+        ));
         observed[1].inode -= 1;
         observed[1].mode = 0o400;
-        assert!(!remaining_sudo_source_pins_match(&observed, &pinned));
+        assert!(!remaining_sudo_source_pins_match(
+            &observed, &pinned, &removed
+        ));
         observed[1].mode = 0o440;
         observed[1].sha256 = "different-digest".to_owned();
-        assert!(!remaining_sudo_source_pins_match(&observed, &pinned));
+        assert!(!remaining_sudo_source_pins_match(
+            &observed, &pinned, &removed
+        ));
     }
 
     #[test]

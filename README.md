@@ -27,7 +27,7 @@ jobs:
       - run: script/test
 ```
 
-Copy the full commit SHA and version comment from the [latest release](https://github.com/openai/fence/releases). Both `ubuntu-24.04` and `ubuntu-latest` are supported while they run Ubuntu 24.04.
+Copy the full commit SHA and version comment from the [latest release](https://github.com/openai/fence/releases). Both `ubuntu-24.04` and `ubuntu-latest` are supported on reviewed Ubuntu LTS x64 images.
 
 By default, Fence:
 
@@ -128,7 +128,7 @@ See [Network reports](docs/how-it-works.md#network-reports) for an example.
 
 Fence makes it harder for later workflow steps to send data to unexpected destinations or undo the runner's network restrictions. It is not a full sandbox.
 
-- **Supported runners:** GitHub-hosted Ubuntu 24.04 x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Releases are checked on both labels and reject unsupported operating-system versions.
+- **Supported runners:** GitHub-hosted Ubuntu LTS x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Fence checks the runner's security controls instead of requiring a specific image build.
 - **Built-in connections:** GitHub Actions, job reporting, and the hosted runner still need a small set of GitHub and Azure connections.
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. Azure WireServer access is limited to root-owned host processes.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.

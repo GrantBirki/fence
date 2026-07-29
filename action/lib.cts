@@ -160,12 +160,15 @@ const RUNTIME_EVIDENCE_SCHEMA_VERSION = 5;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
-const REQUIRED_RESIDENT_WORKERS = [
-  "docker_tcp_dns",
-  "docker_udp_dns",
+const REQUIRED_HOST_RESIDENT_WORKERS = [
   "host_tcp_dns",
   "host_udp_dns",
   "process_attribution",
+];
+const REQUIRED_RESIDENT_WORKERS = [
+  "docker_tcp_dns",
+  "docker_udp_dns",
+  ...REQUIRED_HOST_RESIDENT_WORKERS,
 ];
 const RELEASE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -1589,7 +1592,10 @@ function validateReady(ready: any, report: any): any {
     fail("Fence readiness identity does not match the resident report");
   }
   const readyHealth = validateResidentHealth(ready.resident_health);
-  if (readyHealth.resident_pid !== report.resident_health.resident_pid) {
+  if (
+    readyHealth.resident_pid !== report.resident_health.resident_pid ||
+    !sameResidentWorkers(readyHealth, report.resident_health)
+  ) {
     fail("Fence readiness resident process does not match the report");
   }
   return ready;
@@ -1618,8 +1624,26 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
     Date.now(),
     report.resident_health.status === "critical",
   );
-  if (dnsHealth.resident_pid !== report.resident_health.resident_pid) {
+  if (
+    dnsHealth.resident_pid !== report.resident_health.resident_pid ||
+    !sameResidentWorkers(dnsHealth, report.resident_health)
+  ) {
     fail("Fence DNS evidence resident process does not match the report");
+  }
+  const expectedWorkers = dnsEvidence.docker_dns_routing === "local_root_resident_mediator"
+    ? REQUIRED_RESIDENT_WORKERS
+    : dnsEvidence.docker_dns_routing === "not_present" && (
+      (report.mode === "block" && report.container_status === "disabled_verified") ||
+      (report.mode === "audit" && report.container_status === "preserved_verified")
+    )
+    ? REQUIRED_HOST_RESIDENT_WORKERS
+    : undefined;
+  if (
+    expectedWorkers === undefined ||
+    JSON.stringify(dnsHealth.workers.map((worker: any) => worker.name).sort()) !==
+      JSON.stringify(expectedWorkers)
+  ) {
+    fail("Fence DNS evidence worker set does not match its container routing");
   }
   validateDnsProvenanceEvidence(dnsEvidence);
   return dnsEvidence;
@@ -1694,7 +1718,7 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   const wildcardRejections = dnsEvidence.user_wildcard_request_rejections;
   if (
     dnsEvidence.host_dns_routing !== "direct_client_to_root_resident_mediator" ||
-    dnsEvidence.docker_dns_routing !== "local_root_resident_mediator" ||
+    !["local_root_resident_mediator", "not_present"].includes(dnsEvidence.docker_dns_routing) ||
     dnsEvidence.answer_attribution_status !== "bounded_reportable_hostname_answers_only" ||
     !Array.isArray(authorizations) ||
     authorizations.length > MAX_RESULTS_STORAGE_AUTHORIZATIONS ||
@@ -1830,10 +1854,19 @@ function validateResidentHealth(
     }
     return worker.name;
   });
-  if (JSON.stringify(workers.sort()) !== JSON.stringify(REQUIRED_RESIDENT_WORKERS)) {
+  const sorted = JSON.stringify(workers.sort());
+  if (
+    sorted !== JSON.stringify(REQUIRED_RESIDENT_WORKERS) &&
+    sorted !== JSON.stringify(REQUIRED_HOST_RESIDENT_WORKERS)
+  ) {
     fail("Fence resident worker set does not match the reviewed runtime");
   }
   return health;
+}
+
+function sameResidentWorkers(left: any, right: any): boolean {
+  return JSON.stringify(left.workers.map((worker: any) => worker.name).sort()) ===
+    JSON.stringify(right.workers.map((worker: any) => worker.name).sort());
 }
 
 function parseResidentUnitStatus(output: unknown): Record<string, string> {

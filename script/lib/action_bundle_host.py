@@ -25,6 +25,7 @@ from host_observation import (
     observation_limits,
     public_runner_group_name,
     public_sudo_source_name,
+    supported_ubuntu_lts_version,
     validate_schema4_observation,
 )
 
@@ -34,7 +35,6 @@ class ClassificationError(ValueError):
 
 
 UNIX_NAME_HASH_SCHEMA_V1 = "fence-unix-name-v1"
-SCHEMA3_EVIDENCE_ONLY_UNITS = {"walinuxagent.service"}
 SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1 = "exact_file_v1"
 SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 = (
     "cloud_init_generated_header_v1"
@@ -358,18 +358,16 @@ def validate_schema3_fingerprint(fingerprint):
             isinstance(source, dict) and set(source) == source_fields,
             "bundle sudo source shape mismatch",
         )
-        expected_profile = (
-            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1
-            if (source["path_class"], source["name"])
-            == ("drop_in", "90-cloud-init-users")
-            else SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1
-        )
         require(
             source["path_class"] in {"main_policy", "drop_in"}
             and isinstance(source["name"], str)
             and isinstance(source["canonical_target"], str)
             and is_mode(source["mode"])
-            and source["digest_profile"] == expected_profile
+            and source["digest_profile"]
+            in {
+                SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1,
+                SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+            }
             and is_sha256(source["sha256"]),
             "bundle sudo source value mismatch",
         )
@@ -397,7 +395,7 @@ def validate_schema3_fingerprint(fingerprint):
     index_by(units, "name")
     require(
         {unit["name"] for unit in units}
-        == set(SCHEMA4_FIXED_UNITS) - SCHEMA3_EVIDENCE_ONLY_UNITS,
+        == set(SCHEMA4_FIXED_UNITS),
         "bundle container unit identity set mismatch",
     )
 
@@ -493,11 +491,14 @@ def validate_host_observation(observation, accepted):
     host = observation["host"]
     for actual, expected, message in (
         ("os_id", "os_id", "host OS identity drifted"),
-        ("os_version_id", "os_version_id", "host OS version drifted"),
         ("architecture", "architecture", "host architecture drifted"),
         ("runner_principal", "expected_principal", "runner principal drifted"),
     ):
         require(host[actual] == accepted[expected], message)
+    require(
+        supported_ubuntu_lts_version(host["os_version_id"]),
+        "host Ubuntu LTS version is unsupported",
+    )
 
     require(
         observation["sudo"]["policy_sources_truncated"] is False
@@ -780,7 +781,6 @@ def fixture():
                 **SCHEMA4_REVIEWED_UNIT_STATES[name],
             }
             for name in SCHEMA4_FIXED_UNITS
-            if name not in SCHEMA3_EVIDENCE_ONLY_UNITS
         ],
         "container_sockets": [
             {
@@ -971,6 +971,63 @@ class ClassificationTests(unittest.TestCase):
             {"run_bundle": True, "classification": "bundle_compatible"},
         )
 
+    def test_reviewed_ubuntu_lts_updates_do_not_require_a_bundle_update(self):
+        for version in ("24.04", "26.04", "40.04"):
+            with self.subTest(version=version):
+                observation, support, transitions = fixture()
+                observation["host"]["os_version_id"] = version
+                self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+        for version in ("22.04", "25.04", "42.04", "24.10"):
+            with self.subTest(version=version):
+                observation, support, transitions = fixture()
+                observation["host"]["os_version_id"] = version
+                with self.assertRaises(ClassificationError):
+                    classify(observation, support, transitions)
+
+    def test_reviewed_resolver_targets_and_service_owners_may_change(self):
+        observation, support, transitions = fixture()
+        observation["resolver"]["canonical_target"] = "/run/systemd/resolve/resolv.conf"
+        observation["resolver"]["target_uid"] = 992
+        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
+    def test_docker_absence_is_delegated_to_resident_security_verification(self):
+        observation, support, transitions = fixture()
+        observation["host"]["runner_groups"].remove("docker")
+        docker = next(
+            item
+            for item in observation["required_paths"]
+            if item["path"] == "/usr/bin/docker"
+        )
+        docker.clear()
+        docker.update(
+            {
+                "path": "/usr/bin/docker",
+                "present": False,
+                "executable": False,
+                "runner_executable": False,
+            }
+        )
+        for unit in observation["systemd"]["units"]:
+            for field in ("load_state", "active_state", "unit_file_state"):
+                unit[field] = UNREVIEWED_UNIT_STATE
+        observation["container_runtime"] = {
+            "sockets": [
+                {"path": path, "present": False} for path in SCHEMA4_FIXED_SOCKETS
+            ],
+            "docker_running_workload_count": None,
+        }
+        inventory = observation["local_control_inventory"]["snapshot"]
+        inventory["root_container_processes"] = []
+        inventory["unix_listeners"] = [
+            listener
+            for listener in inventory["unix_listeners"]
+            if all(
+                owner["executable_basename"] != "dockerd"
+                for owner in listener["owners"]
+            )
+        ]
+        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
     def test_safe_image_drift_is_verified_by_the_rust_resident(self):
         mutations = {
             "runner groups": lambda observation: observation["host"].__setitem__(
@@ -985,6 +1042,11 @@ class ClassificationTests(unittest.TestCase):
             "local service": lambda observation: observation["local_control_inventory"]["snapshot"][
                 "tcp_listeners"
             ].pop(),
+            "reviewed service cgroup": lambda observation: observation[
+                "local_control_inventory"
+            ]["snapshot"]["tcp_listeners"][0]["owners"][0].__setitem__(
+                "unified_cgroup", "/system.slice/hosted-platform.service"
+            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -1285,18 +1347,20 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_schema4_azure_identity_remains_validated_observation_evidence(self):
+    def test_platform_agent_is_optional_bounded_observation_evidence(self):
         observation, support, transitions = fixture()
-        azure_unit = next(
-            unit
-            for unit in observation["systemd"]["units"]
-            if unit["name"] == "walinuxagent.service"
-        )
-        azure_unit["load_state"] = UNREVIEWED_UNIT_STATE
         agent = observation["systemd"]["azure_platform_agent"]
+        agent["name"] = "waagent.service"
+        agent["control_group"] = "/system.slice/waagent.service"
+        agent["executable_basename"] = "azure-agent"
+        agent["processes"][0]["executable_basename"] = "azure-agent"
         agent["executable_device"] = 99
         agent["processes"][0]["executable_device"] = 99
         validate_schema4_observation(observation)
+        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
+        observation, support, transitions = fixture()
+        observation["systemd"]["azure_platform_agent"] = {"status": "unavailable"}
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
     def test_schema3_ignores_only_bounded_inaccessible_listener_count(self):

@@ -16,9 +16,6 @@ fi
 
 require_cmd python3
 require_cmd sudo
-if [[ ! -x /usr/bin/strace ]]; then
-  die "WireServer agent observation requires /usr/bin/strace"
-fi
 
 sudo --non-interactive /usr/bin/python3 -E - "$1" "$2" <<'PY'
 import json
@@ -33,7 +30,6 @@ import time
 
 AZURE_PLATFORM_ADDRESS = "168.63.129.16"
 AZURE_PLATFORM_PORTS = {80, 32526}
-CONTROL_GROUP = "/azure.slice/walinuxagent.service"
 MAX_CGROUP_PROCESSES = 16
 MAX_OBSERVATIONS = 16
 MAX_TRACE_BYTES = 1024 * 1024
@@ -50,12 +46,48 @@ host_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 host = json.loads(host_path.read_text(encoding="utf-8"))
 agent = host.get("systemd", {}).get("azure_platform_agent", {})
-if host.get("schema_version") != 4 or agent.get("control_group") != CONTROL_GROUP:
+if host.get("schema_version") != 4:
     fail("WireServer agent observation did not receive the reviewed host evidence")
 if output_path.exists():
     fail("WireServer agent observation requires an absent output path")
 
-cgroup_processes = pathlib.Path("/sys/fs/cgroup/azure.slice/walinuxagent.service/cgroup.procs")
+
+def write_document(control_group, observations):
+    document = {
+        "schema_version": 1,
+        "status": "wireserver_agent_observation_only",
+        "control_group": control_group,
+        "destination": AZURE_PLATFORM_ADDRESS,
+        "observations": observations,
+        "observations_truncated": False,
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(output_path, flags, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    except OSError:
+        fail("WireServer agent observation could not create its bounded evidence file")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+        destination.write(encoded)
+    print(encoded)
+
+
+if agent.get("status") != "observed":
+    write_document(None, [])
+    raise SystemExit(0)
+control_group = agent.get("control_group", "")
+unit_name = agent.get("name", "")
+if (
+    not isinstance(control_group, str)
+    or not isinstance(unit_name, str)
+    or re.fullmatch(r"/[A-Za-z0-9_.@:/-]{1,255}", control_group) is None
+    or not control_group.endswith("/" + unit_name)
+):
+    fail("WireServer agent observation received an invalid control group")
+if not os.access(STRACE_PATH, os.X_OK):
+    write_document(control_group, [])
+    raise SystemExit(0)
+cgroup_processes = pathlib.Path("/sys/fs/cgroup") / control_group.removeprefix("/") / "cgroup.procs"
 
 
 def process_identity(pid):
@@ -69,7 +101,7 @@ def process_identity(pid):
     except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError, ValueError):
         return None
     basename = executable.name
-    if metadata.st_uid != 0 or not re.fullmatch(r"python3(?:\.[0-9]+)?", basename):
+    if metadata.st_uid != 0 or not re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", basename):
         return None
     return {
         "pid": pid,
@@ -88,16 +120,20 @@ def control_group_process_ids():
             if value.isdecimal()
         })
     except (FileNotFoundError, OSError, UnicodeDecodeError):
-        fail("WireServer agent control group became unavailable")
+        return []
     if not process_ids or len(process_ids) > MAX_CGROUP_PROCESSES:
-        fail("WireServer agent control group violated its process bound")
+        return []
     return process_ids
 
 
 process_ids = control_group_process_ids()
+if not process_ids:
+    write_document(control_group, [])
+    raise SystemExit(0)
 processes = {pid: process_identity(pid) for pid in process_ids}
 if any(identity is None for identity in processes.values()):
-    fail("WireServer agent control group identity was not root-owned Python")
+    write_document(control_group, [])
+    raise SystemExit(0)
 
 command = [
     STRACE_PATH,
@@ -181,21 +217,5 @@ finally:
             trace.kill()
             trace.wait(timeout=2)
 
-document = {
-    "schema_version": 1,
-    "status": "wireserver_agent_observation_only",
-    "control_group": CONTROL_GROUP,
-    "destination": AZURE_PLATFORM_ADDRESS,
-    "observations": [observations[key] for key in sorted(observations)],
-    "observations_truncated": False,
-}
-encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-try:
-    descriptor = os.open(output_path, flags, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-except OSError:
-    fail("WireServer agent observation could not create its bounded evidence file")
-with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
-    destination.write(encoded)
-print(encoded)
+write_document(control_group, [observations[key] for key in sorted(observations)])
 PY

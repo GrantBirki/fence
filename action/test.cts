@@ -1997,6 +1997,45 @@ test("validates stable runtime evidence", () => {
     protection_available: false,
     proxy_policy_status: "audit_forwards_while_simulating_name_authorization",
   }, auditReport);
+  const hostOnlyHealth = residentHealth({
+    workers: residentHealth().workers.filter((worker: any) =>
+      !worker.name.startsWith("docker_")
+    ),
+  });
+  for (const currentReport of [
+    { ...report, resident_health: hostOnlyHealth },
+    { ...auditReport, resident_health: hostOnlyHealth },
+  ]) {
+    validateReport(currentReport);
+    validateDnsEvidence(dnsEvidenceFor(currentReport, {
+      docker_dns_routing: "not_present",
+    }), currentReport);
+    assert.throws(
+      () => validateDnsEvidence(dnsEvidenceFor(currentReport, {
+        docker_dns_routing: "local_root_resident_mediator",
+      }), currentReport),
+      /worker set/,
+    );
+  }
+  assert.throws(
+    () => validateDnsEvidence({ ...dnsEvidence, docker_dns_routing: "not_present" }, report),
+    /worker set/,
+  );
+  const degradedReport = {
+    ...report,
+    status: "protected_host_block_degraded",
+    readiness_status: "ready_degraded",
+    setup_status: "resident_degraded",
+    protection_available: false,
+    container_status: "preserved_unsafe",
+    resident_health: hostOnlyHealth,
+  };
+  assert.throws(
+    () => validateDnsEvidence(dnsEvidenceFor(degradedReport, {
+      docker_dns_routing: "not_present",
+    }), degradedReport),
+    /worker set/,
+  );
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
@@ -2395,6 +2434,10 @@ test("validates fresh resident worker and service identity evidence", () => {
     ],
   };
   validateResidentHealth(health, now);
+  validateResidentHealth({
+    ...health,
+    workers: health.workers.filter((worker) => !worker.name.startsWith("docker_")),
+  }, now);
   validateResidentHealth({ ...health, status: "critical" }, now, true);
   const failedWorkerHealth = {
     ...health,

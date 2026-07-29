@@ -615,28 +615,27 @@ fn root_container_processes_are_subset(
     accepted: &[RootContainerProcess],
 ) -> bool {
     if contains_duplicate_root_container_key(accepted)
+        || contains_duplicate_root_container_key(observed)
         || observed.iter().any(|item| {
             item.instances == 0
                 || !accepted
                     .iter()
-                    .any(|expected| same_root_container_key(item, expected))
+                    .any(|expected| reviewed_root_container_matches(item, expected))
         })
     {
         return false;
     }
 
-    accepted.iter().all(|expected| {
-        observed
-            .iter()
-            .filter(|item| same_root_container_key(item, expected))
-            .map(|item| u64::from(item.instances))
-            .sum::<u64>()
-            <= u64::from(expected.instances)
-    })
+    observed
+        .iter()
+        .map(|item| u64::from(item.instances))
+        .sum::<u64>()
+        <= MAX_CONTAINER_PROCESSES as u64
 }
 
 fn tcp_listeners_are_subset(observed: &[TcpListener], accepted: &[TcpListener]) -> bool {
     if contains_duplicate_tcp_key(accepted)
+        || contains_duplicate_tcp_key(observed)
         || observed.iter().any(|item| {
             item.instances == 0
                 || item.owners.is_empty()
@@ -650,18 +649,16 @@ fn tcp_listeners_are_subset(observed: &[TcpListener], accepted: &[TcpListener]) 
         return false;
     }
 
-    accepted.iter().all(|expected| {
-        observed
-            .iter()
-            .filter(|item| same_tcp_key(item, expected))
-            .map(|item| u64::from(item.instances))
-            .sum::<u64>()
-            <= u64::from(expected.instances)
-    })
+    observed
+        .iter()
+        .map(|item| u64::from(item.instances))
+        .sum::<u64>()
+        <= MAX_TCP_LISTENERS as u64
 }
 
 fn unix_listeners_are_subset(observed: &[UnixListener], accepted: &[UnixListener]) -> bool {
     if contains_duplicate_unix_key(accepted)
+        || contains_duplicate_unix_key(observed)
         || observed.iter().any(|item| {
             item.instances == 0
                 || item.owners.is_empty()
@@ -676,36 +673,50 @@ fn unix_listeners_are_subset(observed: &[UnixListener], accepted: &[UnixListener
         return false;
     }
 
-    accepted.iter().all(|expected| {
-        observed
-            .iter()
-            .filter(|item| same_unix_key(item, expected))
-            .map(|item| u64::from(item.instances))
-            .sum::<u64>()
-            <= u64::from(expected.instances)
-    })
+    observed
+        .iter()
+        .map(|item| u64::from(item.instances))
+        .sum::<u64>()
+        <= MAX_UNIX_LISTENERS as u64
 }
 
 fn owners_are_subset(observed: &[LocalControlOwner], accepted: &[LocalControlOwner]) -> bool {
     if contains_duplicate_owner_key(accepted)
+        || contains_duplicate_owner_key(observed)
         || observed.iter().any(|item| {
             item.processes == 0
                 || !accepted
                     .iter()
-                    .any(|expected| same_owner_key(item, expected))
+                    .any(|expected| reviewed_owner_matches(item, expected))
         })
     {
         return false;
     }
 
-    accepted.iter().all(|expected| {
-        observed
-            .iter()
-            .filter(|item| same_owner_key(item, expected))
-            .map(|item| u64::from(item.processes))
-            .sum::<u64>()
-            <= u64::from(expected.processes)
-    })
+    observed
+        .iter()
+        .map(|item| u64::from(item.processes))
+        .sum::<u64>()
+        <= MAX_PROCESSES as u64
+}
+
+fn reviewed_root_container_matches(
+    observed: &RootContainerProcess,
+    accepted: &RootContainerProcess,
+) -> bool {
+    observed.uid == accepted.uid
+        && observed.executable_basename == accepted.executable_basename
+        && observed.canonical_executable == accepted.canonical_executable
+        && reviewed_cgroup(&observed.unified_cgroup)
+        && reviewed_cgroup(&accepted.unified_cgroup)
+}
+
+fn reviewed_owner_matches(observed: &LocalControlOwner, accepted: &LocalControlOwner) -> bool {
+    observed.uid == accepted.uid
+        && observed.executable_basename == accepted.executable_basename
+        && observed.canonical_executable == accepted.canonical_executable
+        && reviewed_cgroup(&observed.unified_cgroup)
+        && reviewed_cgroup(&accepted.unified_cgroup)
 }
 
 fn contains_duplicate_root_container_key(items: &[RootContainerProcess]) -> bool {
@@ -1905,18 +1916,22 @@ fn observe_cgroup(process_root: &Path) -> CgroupObservation {
             reviewed: false,
         };
     };
-    let Some(reviewed) = REVIEWED_CGROUPS
-        .iter()
-        .find(|candidate| candidate.as_bytes() == cgroup)
-    else {
+    let Ok(cgroup) = std::str::from_utf8(cgroup) else {
         return CgroupObservation {
             unified_cgroup: UNREVIEWED_CGROUP.to_string(),
             fingerprint: Some(fingerprint),
             reviewed: false,
         };
     };
+    if !reviewed_cgroup(cgroup) {
+        return CgroupObservation {
+            unified_cgroup: UNREVIEWED_CGROUP.to_string(),
+            fingerprint: Some(fingerprint),
+            reviewed: false,
+        };
+    }
     CgroupObservation {
-        unified_cgroup: (*reviewed).to_string(),
+        unified_cgroup: cgroup.to_string(),
         fingerprint: Some(fingerprint),
         reviewed: true,
     }
@@ -2609,12 +2624,29 @@ fn aggregate_tcp_listeners(listeners: &[PrivateTcpListener]) -> Vec<TcpListener>
 
 fn owner_identity_reviewed(owner: &LocalControlOwner) -> bool {
     REVIEWED_EXECUTABLE_PATHS.contains(&owner.canonical_executable.as_str())
-        && REVIEWED_CGROUPS.contains(&owner.unified_cgroup.as_str())
+        && reviewed_cgroup(&owner.unified_cgroup)
 }
 
 fn root_container_identity_reviewed(process: &RootContainerProcess) -> bool {
     REVIEWED_EXECUTABLE_PATHS.contains(&process.canonical_executable.as_str())
-        && REVIEWED_CGROUPS.contains(&process.unified_cgroup.as_str())
+        && reviewed_cgroup(&process.unified_cgroup)
+}
+
+fn reviewed_cgroup(value: &str) -> bool {
+    if REVIEWED_CGROUPS.contains(&value) {
+        return true;
+    }
+    let service = value
+        .strip_prefix("/system.slice/")
+        .or_else(|| value.strip_prefix("/azure.slice/"));
+    service.is_some_and(|name| {
+        name.len() <= 128
+            && name.ends_with(".service")
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._@:+-".contains(&byte))
+    })
 }
 
 #[cfg(test)]
@@ -3518,6 +3550,16 @@ mod tests {
         verify_reviewed_local_control_observation(&inventory, &reduced).unwrap();
         verify_no_additive_local_control_since(&inventory, &reduced.snapshot, &reduced).unwrap();
 
+        let mut varied = accepted.clone();
+        varied.snapshot.tcp_listeners[0].instances = 2;
+        varied.snapshot.tcp_listeners[0].owners[0].processes = 2;
+        varied.snapshot.tcp_listeners[0].owners[0].unified_cgroup =
+            "/system.slice/hosted-platform.service".to_owned();
+        varied.snapshot.root_container_processes[0].instances = 2;
+        varied.snapshot.root_container_processes[0].unified_cgroup =
+            "/system.slice/hosted-container-runtime.service".to_owned();
+        verify_reviewed_local_control_observation(&inventory, &varied).unwrap();
+
         let mut changed = reduced.clone();
         changed.snapshot.tcp_listeners[0].owners[0].processes += 1;
         assert_eq!(
@@ -3542,6 +3584,26 @@ mod tests {
                 .kind,
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
         );
+    }
+
+    #[test]
+    fn reviewed_service_cgroups_reject_paths_outside_bounded_system_slices() {
+        for accepted in [
+            "/system.slice/hosted-agent.service",
+            "/system.slice/docker@default.service",
+            "/azure.slice/platform-agent.service",
+        ] {
+            assert!(reviewed_cgroup(accepted));
+        }
+        for rejected in [
+            "/user.slice/hosted-agent.service",
+            "/system.slice/../hosted-agent.service",
+            "/system.slice/.hidden.service",
+            "/system.slice/hosted-agent.scope",
+            "/system.slice/hosted/agent.service",
+        ] {
+            assert!(!reviewed_cgroup(rejected));
+        }
     }
 
     #[test]

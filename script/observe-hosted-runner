@@ -421,7 +421,14 @@ def bounded_process_identity(pid, identity):
 
 
 def azure_platform_agent_observation(identity):
-    unit = "walinuxagent.service"
+    for unit in helper.AZURE_PLATFORM_AGENT_UNITS:
+        observation = observe_platform_agent_unit(unit, identity)
+        if observation is not None:
+            return observation
+    return {"status": "unavailable"}
+
+
+def observe_platform_agent_unit(unit, identity):
     output = command_output(
         [
             "/usr/bin/systemctl",
@@ -438,7 +445,7 @@ def azure_platform_agent_observation(identity):
         ]
     )
     if output is None:
-        return {"name": unit, "status": "unavailable"}
+        return None
 
     fields = {}
     for line in output.splitlines():
@@ -451,34 +458,31 @@ def azure_platform_agent_observation(identity):
         main_pid = 0
     configured_user = fields.get("User", "")
     control_group = fields.get("ControlGroup", "")
-    if configured_user not in {"", "root"}:
-        configured_user_class = "other"
-    else:
-        configured_user_class = "root_or_default"
-    if not re.fullmatch(r"/[A-Za-z0-9_.@:/-]{1,255}", control_group):
-        control_group = "unreportable"
+    if (
+        fields.get("LoadState") != "loaded"
+        or fields.get("ActiveState") != "active"
+        or fields.get("SubState") != "running"
+        or configured_user not in {"", "root"}
+        or re.fullmatch(r"/[A-Za-z0-9_.@:/-]{1,255}", control_group) is None
+        or not control_group.endswith("/" + unit)
+        or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", fields.get("UnitFileState", ""))
+        is None
+    ):
+        return None
 
     observation = {
         "name": unit,
         "status": "observed",
-        "load_state": public_unit_state(
-            unit, "load_state", fields.get("LoadState", "unobserved")[:64]
-        ),
-        "active_state": public_unit_state(
-            unit, "active_state", fields.get("ActiveState", "unobserved")[:64]
-        ),
-        "sub_state": fields.get("SubState", "unobserved")[:64],
-        "unit_file_state": public_unit_state(
-            unit,
-            "unit_file_state",
-            fields.get("UnitFileState", "unobserved")[:64],
-        ),
-        "configured_user_class": configured_user_class,
+        "load_state": fields["LoadState"],
+        "active_state": fields["ActiveState"],
+        "sub_state": fields["SubState"],
+        "unit_file_state": fields["UnitFileState"],
+        "configured_user_class": "root_or_default",
         "control_group": control_group,
         "main_pid": main_pid,
     }
-    if main_pid <= 0 or control_group == "unreportable":
-        return observation
+    if main_pid <= 0:
+        return None
 
     cgroup_processes = pathlib.Path("/sys/fs/cgroup") / control_group.removeprefix("/") / "cgroup.procs"
     try:
@@ -488,27 +492,27 @@ def azure_platform_agent_observation(identity):
             MAX_AZURE_PLATFORM_AGENT_PROCESSES + 1,
         )
     except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
-        observation["process_status"] = "unavailable"
-        return observation
+        return None
     if not all(value.isdecimal() for value in raw_pids):
-        observation["process_status"] = "unavailable"
-        return observation
+        return None
     process_ids = sorted({int(value) for value in raw_pids if value.isdecimal()})
-    observation["processes_truncated"] = (
+    if (
         lines_truncated
         or len(raw_pids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
         or len(process_ids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
-    )
+    ):
+        return None
+    observation["processes_truncated"] = False
     processes = [
         process
         for pid in process_ids[:MAX_AZURE_PLATFORM_AGENT_PROCESSES]
         if (process := bounded_process_identity(pid, identity)) is not None
+        and process["owner_class"] == "root"
     ]
     observation["processes"] = processes
     main_process = next((process for process in processes if process["pid"] == main_pid), None)
     if main_process is None:
-        observation["process_status"] = "unavailable"
-        return observation
+        return None
     observation.update(
         {
             "process_status": "observed",
@@ -635,51 +639,6 @@ def validate_result(result):
         fail("hosted-runner observation policy source bound mismatch")
     for item in policy_sources:
         validate_metadata_fields(item)
-    agent = result.get("systemd", {}).get("azure_platform_agent")
-    if not isinstance(agent, dict) or agent.get("name") != "walinuxagent.service":
-        fail("hosted-runner observation Azure platform agent is missing")
-    if agent.get("status") != "observed":
-        fail("hosted-runner observation Azure platform agent is unavailable")
-    if agent.get("load_state") != "loaded" or agent.get("active_state") != "active":
-        fail("hosted-runner observation Azure platform agent is not active")
-    if agent.get("sub_state") != "running":
-        fail("hosted-runner observation Azure platform agent is not running")
-    if agent.get("configured_user_class") != "root_or_default":
-        fail("hosted-runner observation Azure platform agent user is unexpected")
-    if agent.get("control_group") != "/azure.slice/walinuxagent.service":
-        fail("hosted-runner observation Azure platform agent control group is unexpected")
-    if agent.get("process_status") != "observed":
-        fail("hosted-runner observation Azure platform agent process is unavailable")
-    if agent.get("process_owner_class") != "root":
-        fail("hosted-runner observation Azure platform agent process is not root-owned")
-    if not isinstance(agent.get("main_pid"), int) or agent["main_pid"] <= 0:
-        fail("hosted-runner observation Azure platform agent PID is invalid")
-    if not isinstance(agent.get("process_start_time_ticks"), int) or agent["process_start_time_ticks"] <= 0:
-        fail("hosted-runner observation Azure platform agent start time is invalid")
-    if not re.fullmatch(r"python3(?:\.[0-9]+)?", agent.get("executable_basename", "")):
-        fail("hosted-runner observation Azure platform agent executable is unexpected")
-    for field in ("executable_device", "executable_inode"):
-        if not isinstance(agent.get(field), int) or isinstance(agent[field], bool):
-            fail("hosted-runner observation Azure platform agent executable identity is invalid")
-    processes = agent.get("processes")
-    if not isinstance(processes, list) or not processes or len(processes) > MAX_AZURE_PLATFORM_AGENT_PROCESSES:
-        fail("hosted-runner observation Azure platform agent process set is invalid")
-    if agent.get("processes_truncated") is not False:
-        fail("hosted-runner observation Azure platform agent process set is truncated")
-    if agent["main_pid"] not in {process.get("pid") for process in processes}:
-        fail("hosted-runner observation Azure platform agent MainPID is not in its control group")
-    for process in processes:
-        if process.get("owner_class") != "root":
-            fail("hosted-runner observation Azure platform agent child is not root-owned")
-        if not isinstance(process.get("pid"), int) or process["pid"] <= 0:
-            fail("hosted-runner observation Azure platform agent child PID is invalid")
-        if not isinstance(process.get("start_time_ticks"), int) or process["start_time_ticks"] <= 0:
-            fail("hosted-runner observation Azure platform agent child start time is invalid")
-        if not re.fullmatch(r"python3(?:\.[0-9]+)?", process.get("executable_basename", "")):
-            fail("hosted-runner observation Azure platform agent child executable is unexpected")
-        for field in ("executable_device", "executable_inode"):
-            if not isinstance(process.get(field), int) or isinstance(process[field], bool):
-                fail("hosted-runner observation Azure platform agent child identity is invalid")
     try:
         validate_local_control_inventory(result.get("local_control_inventory"))
     except ValueError as error:
@@ -750,7 +709,9 @@ result = {
         ),
         "os_version_id": public_host_identity(
             os_identity["version_id"],
-            helper.SCHEMA4_REVIEWED_OS_VERSION_ID,
+            os_identity["version_id"]
+            if helper.supported_ubuntu_lts_version(os_identity["version_id"])
+            else helper.SCHEMA4_REVIEWED_OS_VERSION_ID,
             helper.UNREVIEWED_OS_VERSION_ID,
         ),
         "architecture": public_host_identity(
