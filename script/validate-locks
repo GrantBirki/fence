@@ -1199,17 +1199,29 @@ for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-fina
     guard_keys = ["env", "run"]
     guard_scalars = {"run": "|"}
     if job_name == "nested-layout":
-        classifier_keys = ["id", "working-directory", "run"]
+        classifier_keys = ["id", "working-directory", "env", "run"]
         classifier_scalars["working-directory"] = "target/action-layout/owner/project/revision"
         guard_keys = ["working-directory", "env", "run"]
         guard_scalars["working-directory"] = "target/action-layout/owner/project/revision"
-    require_step_contract(
+    elif job_name == "tamper":
+        classifier_keys = ["id", "env", "run"]
+    classifier = require_step_contract(
         job,
         "classify bundled Action host compatibility",
         classifier_keys,
         classifier_scalars,
         f"Action acceptance {job_name} host classifier",
     )
+    if job_name in {"nested-layout", "tamper"}:
+        classifier_env = indented_block(
+            classifier,
+            "        env:",
+            f"Action acceptance {job_name} host classifier environment must be unique",
+        )
+        require(
+            scalar_mapping(classifier_env, 10) == {"FENCE_HOST_MODE": "audit"},
+            f"Action acceptance {job_name} must use audit host compatibility",
+        )
     guard = require_step_contract(
         job,
         "require bundled Action activation",
@@ -2329,8 +2341,8 @@ canary_schedule_lines = [
     if line.strip() and not line.lstrip().startswith("#")
 ]
 require(
-    canary_schedule_lines == ['    - cron: "23 13 * * *"'],
-    "Action drift canary schedule must run daily at 13:23 UTC",
+    canary_schedule_lines == ['    - cron: "23 */6 * * *"'],
+    "Action drift canary schedule must run every six hours",
 )
 
 for trigger_name, expected_required in [
@@ -2473,14 +2485,48 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(canary_matrix, 8)
     == {
-        "runner": "${{ fromJSON(inputs.action_ref == '' && '[\"ubuntu-24.04\",\"ubuntu-latest\"]' || '[\"ubuntu-24.04\"]') }}",
+        "runner": "[ubuntu-24.04, ubuntu-latest]",
     },
-    "Action drift canary runner matrix must use both reviewed labels only when action_ref is absent",
+    "Action drift canary runner matrix must always use both reviewed labels",
 )
 require(
     len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
     "Action drift canary must source exactly one runs-on field from its reviewed matrix",
 )
+
+canary_runner_image = require_step_contract(
+    canary_job,
+    "record runner image",
+    ["env", "run"],
+    {"run": "|"},
+    "Action drift canary runner image record",
+)
+canary_runner_image_env = indented_block(
+    canary_runner_image,
+    "        env:",
+    "Action drift canary runner image environment must be unique",
+)
+require(
+    scalar_mapping(canary_runner_image_env, 10)
+    == {"RUNNER_LABEL": "${{ matrix.runner }}"},
+    "Action drift canary runner image may receive only the reviewed matrix label",
+)
+canary_runner_image_body = literal_run_body(
+    canary_runner_image,
+    "Action drift canary runner image record must use a literal run body",
+)
+for fragment in [
+    "ubuntu-24.04|ubuntu-latest) ;;",
+    r'if ! [[ "${ImageVersion:-}" =~ ^[0-9]{8}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then',
+    'echo "runner image version is missing or invalid" >&2',
+    "printf -- '- Label: `%s`\\n' \"$RUNNER_LABEL\"",
+    "printf -- '- Image version: `%s`\\n' \"$ImageVersion\"",
+    '} >> "$GITHUB_STEP_SUMMARY"',
+]:
+    require(
+        fragment in canary_runner_image_body,
+        "Action drift canary must validate and safely summarize its runner image",
+    )
 
 canary_fragments = [
     f"uses: {checkout_action}",
@@ -2656,7 +2702,7 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(release_canary_with, 6)
     == {"action_ref": "${{ needs.create-candidate.outputs.action_commit }}"},
-    "Release drift canary must receive the exact candidate Action SHA and remain fixed-label",
+    "Release drift canary must receive the exact candidate Action SHA for both runner labels",
 )
 release_wait = indented_block(
     release,

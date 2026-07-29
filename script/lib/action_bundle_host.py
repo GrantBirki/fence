@@ -42,6 +42,10 @@ SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 = (
 FIXTURE_ACCEPTED_DIGEST = "0" * 64
 FIXTURE_TRANSITION_DIGEST = "1" * 64
 FIXTURE_UNKNOWN_DIGEST = "2" * 64
+RESIDENT_REVIEWED_SUDO_SOURCES = {
+    ("drop_in", "README"),
+    ("drop_in", "runner"),
+}
 
 
 def require(condition, message):
@@ -587,10 +591,6 @@ def compare_schema4_observation_to_schema3(observation, accepted):
     )
     require(resolver["target_type"] == "regular", "resolver target type drifted")
     require(
-        resolver["target_uid"] == expected_resolver["target_uid"],
-        "resolver target owner drifted",
-    )
-    require(
         resolver["target_mode"] == expected_resolver["target_mode"],
         "resolver target mode drifted",
     )
@@ -699,7 +699,32 @@ def compare_schema4_observation_to_schema3(observation, accepted):
     return digest_mismatches
 
 
-def classify(observation, support, transitions):
+def compare_audit_observation_to_schema3(observation, accepted):
+    try:
+        validate_schema4_observation(observation)
+    except ValueError as error:
+        raise ClassificationError(
+            f"host schema 4 observation is invalid: {error}"
+        ) from error
+
+    host = observation["host"]
+    require(host["os_id"] == accepted["os_id"], "host OS identity drifted")
+    require(
+        host["os_version_id"] == accepted["os_version_id"],
+        "host OS version drifted",
+    )
+    require(
+        host["architecture"] == accepted["architecture"],
+        "host architecture drifted",
+    )
+    require(
+        host["runner_principal"] == accepted["expected_principal"],
+        "runner principal drifted",
+    )
+
+
+def classify(observation, support, transitions, mode="block"):
+    require(mode in {"block", "audit"}, "host classification mode is invalid")
     require(isinstance(support, dict), "bundle support response is not an object")
     require(support.get("schema_version") == 1, "bundle support schema mismatch")
     require(support.get("command") == "check-support", "bundle support command mismatch")
@@ -714,7 +739,14 @@ def classify(observation, support, transitions):
     transition_index = validate_transitions(
         transitions, accepted["sudo_policy_sources"]
     )
-    mismatches = compare_schema4_observation_to_schema3(observation, accepted)
+    if mode == "audit":
+        compare_audit_observation_to_schema3(observation, accepted)
+        return {"run_bundle": True, "classification": "bundle_compatible"}
+    mismatches = [
+        mismatch
+        for mismatch in compare_schema4_observation_to_schema3(observation, accepted)
+        if mismatch[:2] not in RESIDENT_REVIEWED_SUDO_SOURCES
+    ]
     if not mismatches:
         return {"run_bundle": True, "classification": "bundle_compatible"}
     for mismatch in mismatches:
@@ -1130,7 +1162,7 @@ def fixture():
         "transitions": [
             {
                 "path_class": "drop_in",
-                "name": "runner",
+                "name": "90-cloud-init-users",
                 "sha256": FIXTURE_TRANSITION_DIGEST,
             }
         ],
@@ -1164,9 +1196,98 @@ class ClassificationTests(unittest.TestCase):
             {"run_bundle": True, "classification": "bundle_compatible"},
         )
 
+    def test_audit_accepts_safe_host_image_variations(self):
+        observation, support, transitions = fixture()
+        observation["host"]["runner_groups"] = ["docker", "runner"]
+        self.observed_source(observation)["sha256"] = FIXTURE_UNKNOWN_DIGEST
+        observation["systemd"]["units"][0]["active_state"] = UNREVIEWED_UNIT_STATE
+        observation["local_control_inventory"]["snapshot"]["tcp_listeners"].pop()
+        self.assertEqual(
+            classify(observation, support, transitions, "audit"),
+            {"run_bundle": True, "classification": "bundle_compatible"},
+        )
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions, "block")
+
+    def test_audit_accepts_bounded_root_owned_sudo_inventory_changes(self):
+        observation, support, transitions = fixture()
+        additional_source = dict(self.observed_source(observation))
+        additional_source.update(
+            {
+                "name": "unreviewed_sha256_" + "a" * 64,
+                "canonical_target": UNREVIEWED_SUDO_SOURCE_TARGET,
+                "sha256": FIXTURE_UNKNOWN_DIGEST,
+                "contains_nopasswd_directive": False,
+                "runner_nopasswd_markers": [],
+            }
+        )
+        sources = observation["sudo"]["policy_source_hashes"]
+        sources.append(additional_source)
+        sources.sort(
+            key=lambda source: (
+                0 if source["path_class"] == "main_policy" else 1,
+                source["name"],
+            )
+        )
+        self.assertTrue(classify(observation, support, transitions, "audit")["run_bundle"])
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions, "block")
+
+    def test_audit_rejects_unsupported_or_malformed_host_observations(self):
+        mutations = {
+            "OS": lambda observation: observation["host"].__setitem__(
+                "os_version_id", UNREVIEWED_OS_VERSION_ID
+            ),
+            "architecture": lambda observation: observation["host"].__setitem__(
+                "architecture", UNREVIEWED_ARCHITECTURE
+            ),
+            "principal": lambda observation: observation["host"].__setitem__(
+                "runner_principal", UNREVIEWED_RUNNER_PRINCIPAL
+            ),
+            "missing evidence": lambda observation: observation.pop(
+                "local_control_inventory"
+            ),
+            "truncated paths": lambda observation: observation["required_paths"].pop(),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                observation, support, transitions = fixture()
+                mutate(observation)
+                with self.assertRaises(ClassificationError):
+                    classify(observation, support, transitions, "audit")
+
+    def test_host_classification_defers_resolver_identity_to_the_rust_resident(self):
+        for mode in ("block", "audit"):
+            with self.subTest(mode=mode):
+                observation, support, transitions = fixture()
+                observation["resolver"]["target_uid"] = 992
+                self.assertTrue(
+                    classify(observation, support, transitions, mode)["run_bundle"]
+                )
+
+    def test_rejects_unknown_host_classification_mode(self):
+        observation, support, transitions = fixture()
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions, "unknown")
+
+    def test_block_defers_safe_sudo_policy_digests_to_the_rust_resident(self):
+        for name in ("README", "runner"):
+            with self.subTest(name=name):
+                observation, support, transitions = fixture()
+                self.observed_source(observation, name)["sha256"] = FIXTURE_UNKNOWN_DIGEST
+                self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
+    def test_block_rejects_changed_sudo_grants_before_resident_activation(self):
+        observation, support, transitions = fixture()
+        source = self.observed_source(observation)
+        source["sha256"] = FIXTURE_UNKNOWN_DIGEST
+        source["runner_nopasswd_markers"] = ["group"]
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions)
+
     def test_accepts_only_reviewed_source_known_transition(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
         self.assertEqual(
             classify(observation, support, transitions),
             {
@@ -1177,14 +1298,14 @@ class ClassificationTests(unittest.TestCase):
 
     def test_empty_transition_set_cannot_skip_activation(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
         transitions["transitions"] = []
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
     def test_rejects_unknown_digest_and_other_drift(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_UNKNOWN_DIGEST
+        self.observed_source(observation, "sudoers")["sha256"] = FIXTURE_UNKNOWN_DIGEST
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
         observation, support, transitions = fixture()
@@ -1203,8 +1324,8 @@ class ClassificationTests(unittest.TestCase):
 
     def test_refreshed_bundle_runs_on_transition_digest(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
-        self.accepted_source(support)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.accepted_source(support, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
         self.assertEqual(
             classify(observation, support, transitions)["classification"],
             "bundle_compatible",
@@ -1620,7 +1741,6 @@ class ClassificationTests(unittest.TestCase):
             "canonical_target": UNREVIEWED_RESOLVER_TARGET,
             "target_type": "unexpected_type",
             "target_mode": "0600",
-            "target_uid": 992,
         }.items():
             with self.subTest(surface="resolver", field=field):
                 observation, support, transitions = fixture()
@@ -1784,7 +1904,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_all_digest_mismatches_must_have_exact_transitions(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
         self.observed_source(observation, "sudoers")["sha256"] = "7" * 64
         transitions["transitions"].append(
             {
@@ -1801,7 +1921,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_transition_cannot_mask_non_digest_drift(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
         observation["required_paths"][0]["mode"] = "0700"
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
@@ -1815,16 +1935,17 @@ def main(arguments):
     if arguments == ["--self-test"]:
         program = unittest.main(argv=[sys.argv[0]], exit=False)
         return 0 if program.result.wasSuccessful() else 1
-    if len(arguments) != 4:
+    if len(arguments) != 5:
         raise SystemExit(
-            "usage: action_bundle_host.py <observation> <bundle-support> <transitions> <github-output>"
+            "usage: action_bundle_host.py <observation> <bundle-support> <transitions> <github-output> <mode>"
         )
-    observation_path, support_path, transitions_path, output_path = arguments
+    observation_path, support_path, transitions_path, output_path, mode = arguments
     try:
         result = classify(
             load_json(observation_path),
             load_json(support_path),
             load_json(transitions_path),
+            mode,
         )
     except (ClassificationError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise SystemExit(f"Action bundle host classification failed: {error}") from error

@@ -330,6 +330,8 @@ jobs:
       - name: classify bundled Action host compatibility
         id: bundle-host
         working-directory: target/action-layout/owner/project/revision
+        env:
+          FENCE_HOST_MODE: audit
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation
@@ -404,6 +406,8 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_HOST_MODE: audit
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation

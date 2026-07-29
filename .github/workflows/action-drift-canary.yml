@@ -2,7 +2,7 @@ name: action drift canary
 
 on:
   schedule:
-    - cron: "23 13 * * *"
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       action_ref:
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.action_ref == '' && '["ubuntu-24.04","ubuntu-latest"]' || '["ubuntu-24.04"]') }}
+        runner: [ubuntu-24.04, ubuntu-latest]
     timeout-minutes: 8
     runs-on: ${{ matrix.runner }}
 
@@ -189,6 +189,25 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$ACTION_REF"
           echo "Canary Action commit: $ACTION_REF"
+
+      - name: record runner image
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_LABEL" in
+            ubuntu-24.04|ubuntu-latest) ;;
+            *) echo "unexpected runner label" >&2; exit 1 ;;
+          esac
+          if ! [[ "${ImageVersion:-}" =~ ^[0-9]{8}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+            echo "runner image version is missing or invalid" >&2
+            exit 1
+          fi
+          {
+            printf '### Runner image\n\n'
+            printf -- '- Label: `%s`\n' "$RUNNER_LABEL"
+            printf -- '- Image version: `%s`\n' "$ImageVersion"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: validate locks
         run: script/validate-locks --ci

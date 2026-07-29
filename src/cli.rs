@@ -76,12 +76,39 @@ impl RunProvider for DisabledRunProvider {
 
 struct SystemRunProvider;
 
+#[cfg(any(target_os = "linux", test))]
+fn protected_lifecycle_failure(code: &'static str, message: &str) -> ErrorDetail {
+    let detail = ErrorDetail::new(code, "protected lifecycle setup failed");
+    if code == "unsupported_host_fingerprint"
+        && matches!(
+            message,
+            "host_identity"
+                | "runner_identity"
+                | "runner_groups"
+                | "trusted_executables"
+                | "sudo_policy"
+                | "sudo_access"
+                | "container_services"
+                | "container_sockets"
+                | "container_workloads"
+                | "local_control"
+                | "resolver_configuration"
+                | "observation_unavailable"
+                | "unstable_observation"
+        )
+    {
+        detail.field(message)
+    } else {
+        detail
+    }
+}
+
 impl RunProvider for SystemRunProvider {
     fn run(&self, config: &Path) -> Result<(), ErrorDetail> {
         #[cfg(target_os = "linux")]
         {
             crate::dns_mediator::run_protected_service(config)
-                .map_err(|error| ErrorDetail::new(error.code, "protected lifecycle setup failed"))
+                .map_err(|error| protected_lifecycle_failure(error.code, &error.message))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -204,6 +231,17 @@ mod tests {
         }
     }
 
+    struct CategorizedRunProvider;
+
+    impl RunProvider for CategorizedRunProvider {
+        fn run(&self, _config: &Path) -> Result<(), ErrorDetail> {
+            Err(protected_lifecycle_failure(
+                "unsupported_host_fingerprint",
+                "sudo_policy",
+            ))
+        }
+    }
+
     fn execute_test(args: &[&str]) -> CommandOutput {
         execute(
             args.iter().map(OsString::from).collect(),
@@ -235,6 +273,74 @@ mod tests {
         assert_eq!(mixed.exit_code, 2);
         assert_eq!(run.exit_code, 1);
         assert!(run.json.contains("enforcement_not_implemented"));
+    }
+
+    #[test]
+    fn protected_lifecycle_failures_preserve_only_reviewed_host_categories() {
+        for category in [
+            "host_identity",
+            "runner_identity",
+            "runner_groups",
+            "trusted_executables",
+            "sudo_policy",
+            "sudo_access",
+            "container_services",
+            "container_sockets",
+            "container_workloads",
+            "local_control",
+            "resolver_configuration",
+            "observation_unavailable",
+            "unstable_observation",
+        ] {
+            let error = protected_lifecycle_failure("unsupported_host_fingerprint", category);
+
+            assert_eq!(error.code, "unsupported_host_fingerprint");
+            assert_eq!(error.message, "protected lifecycle setup failed");
+            assert_eq!(error.field.as_deref(), Some(category));
+            assert_eq!(error.index, None);
+        }
+
+        for (code, message) in [
+            ("unsupported_host_fingerprint", "unreviewed_category"),
+            ("unsupported_host_fingerprint", "/etc/sudoers"),
+            (
+                "unsupported_host_fingerprint",
+                "sudo_policy\n::error::secret",
+            ),
+            ("dns_block_prehydration_failed", "sudo_policy"),
+        ] {
+            let error = protected_lifecycle_failure(code, message);
+
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "protected lifecycle setup failed");
+            assert_eq!(error.field, None);
+            assert_eq!(error.index, None);
+        }
+    }
+
+    #[test]
+    fn host_fingerprint_category_is_preserved_in_the_structured_cli_failure() {
+        let output = execute_with_run_provider(
+            ["fence", "run", "--config", "/must/not/be/read"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &FailResolver,
+            &LinuxProvider,
+            &CategorizedRunProvider,
+        );
+        let response: serde_json::Value = serde_json::from_str(&output.json).unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(response["command"], "run");
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"]["code"], "unsupported_host_fingerprint");
+        assert_eq!(
+            response["error"]["message"],
+            "protected lifecycle setup failed"
+        );
+        assert_eq!(response["error"]["field"], "sudo_policy");
+        assert!(response["error"].get("index").is_none());
     }
 
     #[test]

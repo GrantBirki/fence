@@ -19,7 +19,7 @@ jobs:
 
 Copy the full commit SHA and version from a [published release](https://github.com/openai/fence/releases). Each release includes a ready-to-use pin. The `main` branch does not contain the bundled Action, so it cannot be used directly.
 
-Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is also tested, but GitHub can change the image behind that label.
+Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Both labels are supported while they run Ubuntu 24.04, and Fence checks the runner's security properties when it starts.
 
 ## What Happens By Default?
 

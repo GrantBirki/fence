@@ -8,6 +8,12 @@ Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ub
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 
+If Fence rejects the runner, look for a `FENCE_HOST_DIAGNOSTIC_JSON=` line in the job log. Its `category` explains which check failed, and `image_version` identifies the GitHub runner image when available. For example:
+
+```json
+{"schema_version":1,"code":"unsupported_host_fingerprint","category":"sudo_policy","image_version":"20260726.254.1"}
+```
+
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
 
 ## A Network Request Is Blocked

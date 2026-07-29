@@ -45,9 +45,12 @@ const actionLog = require("./log.cts");
 const { settleResidentReport } = require("./post.cts");
 const {
   fenceErrorCodeFromJournal,
+  fenceErrorFromJournal,
+  hostDiagnosticLine,
   residentServiceArgs,
   run,
   terminalServiceStatus,
+  validatedImageVersion,
 } = require("./main.cts");
 
 function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1086,6 +1089,105 @@ test("recognizes terminal service state and only bounded structured Fence error 
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
   }
+});
+
+test("extracts only reviewed host fingerprint mismatch categories", () => {
+  const failure = (code: string, field: unknown): string => JSON.stringify({
+    schema_version: 1,
+    command: "run",
+    status: "error",
+    fence_version: "0.10.0",
+    error: {
+      code,
+      message: "protected lifecycle setup failed",
+      field,
+    },
+  });
+
+  for (const category of [
+    "host_identity",
+    "runner_identity",
+    "runner_groups",
+    "trusted_executables",
+    "sudo_policy",
+    "sudo_access",
+    "container_services",
+    "container_sockets",
+    "container_workloads",
+    "local_control",
+    "resolver_configuration",
+    "observation_unavailable",
+    "unstable_observation",
+  ]) {
+    assert.deepEqual(
+      fenceErrorFromJournal(failure("unsupported_host_fingerprint", category)),
+      { code: "unsupported_host_fingerprint", category },
+    );
+  }
+
+  for (const category of [
+    "constructor",
+    "toString",
+    "__proto__",
+    "unreviewed_category",
+    "sudo_policy\n::error::injected",
+    "sudo_policy%0A::warning::injected",
+    "/etc/sudoers",
+    "https://example.com/?token=secret",
+    {},
+    null,
+    1,
+  ]) {
+    assert.deepEqual(
+      fenceErrorFromJournal(failure("unsupported_host_fingerprint", category)),
+      { code: "unsupported_host_fingerprint" },
+    );
+  }
+  assert.deepEqual(
+    fenceErrorFromJournal(failure("dns_block_prehydration_failed", "sudo_policy")),
+    { code: "dns_block_prehydration_failed" },
+  );
+});
+
+test("accepts only bounded and valid GitHub runner image versions", () => {
+  for (const version of ["20260720.247.2", "20260726.254.1", "20240229.1.0"]) {
+    assert.equal(validatedImageVersion(version), version);
+  }
+
+  for (const version of [
+    undefined,
+    null,
+    20260726,
+    "19991231.1.0",
+    "20260229.1.0",
+    "20261301.1.0",
+    "20260001.1.0",
+    "20260700.1.0",
+    "20260732.1.0",
+    "20260726.0001.0",
+    "20260726.1234567.0",
+    "20260726.1.12345",
+    "20260726.1",
+    "20260726.1.0\n::error::injected",
+    "20260726.1.0%0Asecret",
+  ]) {
+    assert.equal(validatedImageVersion(version), undefined);
+  }
+});
+
+test("emits bounded host diagnostics without changing the network report schema", () => {
+  const error = { code: "unsupported_host_fingerprint", category: "sudo_policy" };
+  assert.equal(
+    hostDiagnosticLine(error, "20260726.254.1"),
+    'FENCE_HOST_DIAGNOSTIC_JSON={"schema_version":1,"code":"unsupported_host_fingerprint","category":"sudo_policy","image_version":"20260726.254.1"}',
+  );
+  assert.equal(
+    hostDiagnosticLine(error, "20260726.254.1\n::error::injected"),
+    'FENCE_HOST_DIAGNOSTIC_JSON={"schema_version":1,"code":"unsupported_host_fingerprint","category":"sudo_policy"}',
+  );
+  assert.equal(hostDiagnosticLine({ code: "unsupported_host_fingerprint" }), undefined);
+  assert.equal(hostDiagnosticLine({ code: "unsupported_host_fingerprint", category: "__proto__" }), undefined);
+  assert.equal(hostDiagnosticLine({ code: "invalid_configuration", category: "sudo_policy" }), undefined);
 });
 
 test("derives only bounded fixed runtime paths", () => {
