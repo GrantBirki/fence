@@ -64,6 +64,10 @@ Cloud-init constructs the first `90-cloud-init-users` line from its package vers
 
 File ownership and mode alone do not prove what the runner can access when ACLs are present. Fence checks every trusted executable, its parent directories, and accepted sudo sources using pinned `sudo` and `/usr/bin/test` descriptors. The runner must not be able to write those paths or search `/etc/sudoers.d`. Each check verifies the same file identity before and after execution. Hosted tests confirm that an unexpected ACL fails before Fence changes the runner.
 
+### Runner-owned system directories
+
+Some GitHub-hosted Ubuntu images leave `/etc` and `/usr` owned and writable by the `runner` user. Before capturing trusted executable descriptors, Fence repairs only those exact canonical directories when their ownership, primary group, mode, and effective access match the reviewed image condition. It changes them to `root:root`, verifies that the runner cannot write them, and rejects every other unsafe trusted path. Fence never restores writable ownership.
+
 ### Descriptor-pinned privileged commands
 
 Security-critical commands previously had a small replacement window between checking a path and executing it. Fence now opens all twelve reviewed root-owned executables first, verifies their path and file identity before every use, and executes the captured inode through `/proc/self/fd`. Runner-access checks use pinned `sudo` and the pinned target without falling back to an unchecked path.

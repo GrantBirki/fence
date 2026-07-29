@@ -46,6 +46,7 @@ RESIDENT_REVIEWED_SUDO_SOURCES = {
     ("drop_in", "README"),
     ("drop_in", "runner"),
 }
+REPAIRABLE_RUNNER_OWNED_ANCESTORS = {"/etc", "/usr"}
 
 
 def require(condition, message):
@@ -563,19 +564,29 @@ def compare_schema4_observation_to_schema3(observation, accepted):
             item["path_type"] == "directory" and item["target_type"] == "directory",
             "permission ancestor type drifted",
         )
-        require(
-            item["owner_class"] == "root" and item["group_class"] == "root",
-            "permission ancestor ownership drifted",
-        )
         require(item["mode"] == expected["mode"], "permission ancestor mode drifted")
-        require(
-            item["runner_writable"] is False,
-            "permission ancestor became runner writable",
-        )
         require(
             item["runner_searchable"] == expected["runner_searchable"],
             "permission ancestor searchability drifted",
         )
+        repairable_runner_ownership = (
+            item["path"] in REPAIRABLE_RUNNER_OWNED_ANCESTORS
+            and item["owner_class"] == "runner"
+            and item["group_class"] == "runner_primary"
+            and item["mode"] == "0755"
+            and item["runner_writable"] is True
+            and item["runner_searchable"] is True
+            and item["synthetic_create_delete_probe"] == "created_and_removed"
+        )
+        if not repairable_runner_ownership:
+            require(
+                item["owner_class"] == "root" and item["group_class"] == "root",
+                "permission ancestor ownership drifted",
+            )
+            require(
+                item["runner_writable"] is False,
+                "permission ancestor became runner writable",
+            )
 
     resolver = observation["resolver"]
     expected_resolver = accepted["resolver"]
@@ -1284,6 +1295,75 @@ class ClassificationTests(unittest.TestCase):
         source["runner_nopasswd_markers"] = ["group"]
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
+
+    def test_block_defers_only_repairable_runner_owned_host_ancestors(self):
+        for repaired_paths in (("/etc",), ("/usr",), ("/etc", "/usr")):
+            with self.subTest(paths=repaired_paths):
+                observation, support, transitions = fixture()
+                for ancestor in observation["permission_ancestor_directories"]:
+                    if ancestor["path"] in repaired_paths:
+                        ancestor.update(
+                            {
+                                "owner_class": "runner",
+                                "group_class": "runner_primary",
+                                "runner_writable": True,
+                                "synthetic_create_delete_probe": "created_and_removed",
+                            }
+                        )
+                self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
+    def test_block_rejects_unsafe_runner_owned_ancestor_variations(self):
+        def runner_ancestor(observation, path="/etc"):
+            ancestor = next(
+                entry
+                for entry in observation["permission_ancestor_directories"]
+                if entry["path"] == path
+            )
+            ancestor.update(
+                {
+                    "owner_class": "runner",
+                    "group_class": "runner_primary",
+                    "runner_writable": True,
+                    "synthetic_create_delete_probe": "created_and_removed",
+                }
+            )
+            return ancestor
+
+        mutations = {
+            "unreviewed directory": lambda observation: runner_ancestor(
+                observation, "/usr/bin"
+            ),
+            "owner": lambda observation: runner_ancestor(observation).__setitem__(
+                "owner_class", "other"
+            ),
+            "group": lambda observation: runner_ancestor(observation).__setitem__(
+                "group_class", "root"
+            ),
+            "mode": lambda observation: runner_ancestor(observation).__setitem__(
+                "mode", "0775"
+            ),
+            "probe": lambda observation: runner_ancestor(observation).__setitem__(
+                "synthetic_create_delete_probe", "denied"
+            ),
+            "root-cleanup probe": lambda observation: runner_ancestor(
+                observation
+            ).__setitem__("synthetic_create_delete_probe", "created_and_root_removed"),
+            "writeability": lambda observation: runner_ancestor(
+                observation
+            ).__setitem__("runner_writable", False),
+            "searchability": lambda observation: runner_ancestor(
+                observation
+            ).__setitem__("runner_searchable", False),
+            "target": lambda observation: runner_ancestor(observation).__setitem__(
+                "canonical_target", UNREVIEWED_METADATA_TARGET
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                observation, support, transitions = fixture()
+                mutate(observation)
+                with self.assertRaises(ClassificationError):
+                    classify(observation, support, transitions)
 
     def test_accepts_only_reviewed_source_known_transition(self):
         observation, support, transitions = fixture()

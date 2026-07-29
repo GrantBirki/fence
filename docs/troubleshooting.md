@@ -8,6 +8,8 @@ Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ub
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 
+On affected GitHub runner images, Fence first restores `/etc` and `/usr` to root ownership. It refuses other writable or untrusted system paths.
+
 If Fence rejects the runner, look for a `FENCE_HOST_DIAGNOSTIC_JSON=` line in the job log. Its `category` explains which check failed, and `image_version` identifies the GitHub runner image when available. For example:
 
 ```json

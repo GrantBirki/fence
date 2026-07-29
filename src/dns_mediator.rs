@@ -1696,7 +1696,7 @@ fn resolver_layout_is_supported(
 fn trusted_systemd_resolver_uid(path: &Path) -> Option<u32> {
     let source = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let metadata = source.metadata().ok()?;

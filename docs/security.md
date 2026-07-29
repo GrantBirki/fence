@@ -10,7 +10,7 @@ Fence supports GitHub-hosted Ubuntu 24.04 x64 jobs using `ubuntu-24.04` or `ubun
 - GitHub updates its runner images regularly. Fence accepts safe image changes but rejects unsafe runner settings and unsupported Ubuntu versions.
 - Self-hosted runners, container jobs, other architectures, Windows, and macOS are not supported.
 
-Fence checks the runner before changing it. Block mode requires its reviewed privilege and container controls; audit mode accepts safe runner-image variations while preserving and continuously verifying the observed sudo, container, and local-service state. If the selected mode cannot verify its required security properties, setup fails.
+Fence checks the runner before activating. If a supported image leaves `/etc` or `/usr` writable by the runner, Fence restores only those exact directories to root ownership first; other unsafe trusted paths are rejected. Block mode requires its reviewed privilege and container controls, while audit mode preserves and continuously verifies the observed sudo, container, and local-service state. If the selected mode cannot verify its required security properties, setup fails.
 
 Run Fence before checkout and the other steps you want it to protect.
 

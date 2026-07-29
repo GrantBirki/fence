@@ -16,6 +16,8 @@ const MIN_RETAINED_EXECUTABLE_FD: i32 = 3;
 const STANDARD_DESCRIPTOR_RESERVATION_COUNT: usize = 3;
 const PROC_SELF_STAT_PATH: &str = "/proc/self/stat";
 const MAX_PROC_SELF_STAT_BYTES: u64 = 4 * 1024;
+const MAX_HOST_IDENTITY_FILE_BYTES: u64 = 256 * 1024;
+const REVIEWED_HOST_ANCESTORS: [&str; 2] = ["/etc", "/usr"];
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum TrustedExecutable {
@@ -304,6 +306,7 @@ pub(crate) struct TrustedExecutableSet {
 
 impl TrustedExecutableSet {
     pub(crate) fn capture_reviewed_hosted() -> Result<Self, TrustedExecutableError> {
+        normalize_reviewed_host_ancestors()?;
         let specs = reviewed_hosted_specs()?;
         Self::capture(&specs)
     }
@@ -402,6 +405,292 @@ impl TrustedExecutableSet {
     }
 }
 
+#[derive(Debug)]
+struct ReviewedHostDirectory {
+    path: &'static str,
+    descriptor: File,
+    metadata: fs::Metadata,
+}
+
+fn normalize_reviewed_host_ancestors() -> Result<(), TrustedExecutableError> {
+    if std::env::consts::ARCH != "x86_64"
+        || fs::metadata("/proc/self")
+            .map_err(|_| TrustedExecutableError::unavailable())?
+            .uid()
+            != ROOT_UID
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+
+    let root = open_reviewed_directory("/")?;
+    if root.metadata.uid() != ROOT_UID
+        || root.metadata.gid() != ROOT_GID
+        || root.metadata.permissions().mode() & 0o7777 != 0o755
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+
+    let etc = open_reviewed_child_directory(&root.descriptor, "etc", REVIEWED_HOST_ANCESTORS[0])?;
+    let usr = open_reviewed_child_directory(&root.descriptor, "usr", REVIEWED_HOST_ANCESTORS[1])?;
+    let (passwd_descriptor, passwd) = read_reviewed_host_file(&etc.descriptor, "passwd")?;
+    let runner = reviewed_runner_identity(&passwd)?;
+    verify_reviewed_host_image(&usr.descriptor)?;
+
+    for ancestor in [&etc, &usr] {
+        validate_repairable_ancestor(ancestor, runner)?;
+    }
+
+    for ancestor in [&etc, &usr] {
+        if ancestor.metadata.uid() != ROOT_UID || ancestor.metadata.gid() != ROOT_GID {
+            std::os::unix::fs::fchown(&ancestor.descriptor, Some(ROOT_UID), Some(ROOT_GID))
+                .map_err(|_| TrustedExecutableError::unavailable())?;
+        }
+        verify_repaired_ancestor(ancestor)?;
+    }
+
+    let (current_passwd_descriptor, current_passwd) =
+        read_reviewed_host_file(&etc.descriptor, "passwd")?;
+    let previous = passwd_descriptor
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let current = current_passwd_descriptor
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    if previous.dev() != current.dev()
+        || previous.ino() != current.ino()
+        || passwd != current_passwd
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    verify_reviewed_host_image(&usr.descriptor)
+}
+
+fn open_reviewed_directory(
+    path: &'static str,
+) -> Result<ReviewedHostDirectory, TrustedExecutableError> {
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let metadata = descriptor
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    if !metadata.file_type().is_dir()
+        || fs::canonicalize(path).ok().as_deref() != Some(Path::new(path))
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let observed = fs::symlink_metadata(path).map_err(|_| TrustedExecutableError::unavailable())?;
+    if !observed.file_type().is_dir()
+        || observed.dev() != metadata.dev()
+        || observed.ino() != metadata.ino()
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(ReviewedHostDirectory {
+        path,
+        descriptor,
+        metadata,
+    })
+}
+
+fn open_reviewed_child_directory(
+    parent: &File,
+    name: &'static str,
+    expected_path: &'static str,
+) -> Result<ReviewedHostDirectory, TrustedExecutableError> {
+    if !matches!(name, "etc" | "usr")
+        || !REVIEWED_HOST_ANCESTORS.contains(&expected_path)
+        || Path::new(expected_path).parent() != Some(Path::new("/"))
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let descriptor_path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(&descriptor_path)
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let metadata = descriptor
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let current =
+        fs::symlink_metadata(expected_path).map_err(|_| TrustedExecutableError::unavailable())?;
+    if !metadata.file_type().is_dir()
+        || !current.file_type().is_dir()
+        || fs::canonicalize(expected_path).ok().as_deref() != Some(Path::new(expected_path))
+        || metadata.dev() != current.dev()
+        || metadata.ino() != current.ino()
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(ReviewedHostDirectory {
+        path: expected_path,
+        descriptor,
+        metadata,
+    })
+}
+
+fn read_reviewed_host_file(
+    parent: &File,
+    name: &'static str,
+) -> Result<(File, Vec<u8>), TrustedExecutableError> {
+    let path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != ROOT_UID
+        || metadata.gid() != ROOT_GID
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.len() > MAX_HOST_IDENTITY_FILE_BYTES
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let mut contents = Vec::new();
+    (&file)
+        .take(MAX_HOST_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let current = fs::symlink_metadata(path).map_err(|_| TrustedExecutableError::unavailable())?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) != metadata.len()
+        || !current.file_type().is_file()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || current.uid() != metadata.uid()
+        || current.gid() != metadata.gid()
+        || current.permissions().mode() & 0o7777 != metadata.permissions().mode() & 0o7777
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok((file, contents))
+}
+
+fn reviewed_runner_identity(contents: &[u8]) -> Result<(u32, u32), TrustedExecutableError> {
+    let contents =
+        std::str::from_utf8(contents).map_err(|_| TrustedExecutableError::unavailable())?;
+    let mut entries = contents.lines().filter(|line| line.starts_with("runner:"));
+    let fields = entries
+        .next()
+        .ok_or_else(TrustedExecutableError::unavailable)?
+        .split(':')
+        .collect::<Vec<_>>();
+    if entries.next().is_some() || fields.len() != 7 {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let uid = fields[2]
+        .parse::<u32>()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let gid = fields[3]
+        .parse::<u32>()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    if uid == ROOT_UID || gid == ROOT_GID {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let aliases = contents
+        .lines()
+        .filter(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            fields.len() == 7 && fields[2].parse::<u32>().ok() == Some(uid)
+        })
+        .count();
+    if aliases != 1 {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok((uid, gid))
+}
+
+fn verify_reviewed_host_image(usr: &File) -> Result<(), TrustedExecutableError> {
+    let path = format!("/proc/self/fd/{}/lib", usr.as_raw_fd());
+    let lib = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let metadata = lib
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let current =
+        fs::symlink_metadata("/usr/lib").map_err(|_| TrustedExecutableError::unavailable())?;
+    if !metadata.file_type().is_dir()
+        || !current.file_type().is_dir()
+        || metadata.uid() != ROOT_UID
+        || metadata.gid() != ROOT_GID
+        || metadata.permissions().mode() & 0o022 != 0
+        || fs::canonicalize("/usr/lib").ok().as_deref() != Some(Path::new("/usr/lib"))
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    let (_, contents) = read_reviewed_host_file(&lib, "os-release")?;
+    if !reviewed_host_os_release(&contents) {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(())
+}
+
+fn reviewed_host_os_release(contents: &[u8]) -> bool {
+    std::str::from_utf8(contents).ok().is_some_and(|contents| {
+        contents.lines().any(|line| line == "ID=ubuntu")
+            && contents.lines().any(|line| line == "VERSION_ID=\"24.04\"")
+    })
+}
+
+fn validate_repairable_ancestor(
+    ancestor: &ReviewedHostDirectory,
+    runner: (u32, u32),
+) -> Result<(), TrustedExecutableError> {
+    if !REVIEWED_HOST_ANCESTORS.contains(&ancestor.path)
+        || !repairable_ancestor_owner(
+            ancestor.metadata.uid(),
+            ancestor.metadata.gid(),
+            ancestor.metadata.permissions().mode() & 0o7777,
+            runner,
+        )
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(())
+}
+
+fn repairable_ancestor_owner(uid: u32, gid: u32, mode: u32, runner: (u32, u32)) -> bool {
+    mode == 0o755 && (matches!((uid, gid), (ROOT_UID, ROOT_GID)) || (uid, gid) == runner)
+}
+
+fn verify_repaired_ancestor(
+    ancestor: &ReviewedHostDirectory,
+) -> Result<(), TrustedExecutableError> {
+    let metadata = ancestor
+        .descriptor
+        .metadata()
+        .map_err(|_| TrustedExecutableError::unavailable())?;
+    let current =
+        fs::symlink_metadata(ancestor.path).map_err(|_| TrustedExecutableError::unavailable())?;
+    if !metadata.file_type().is_dir()
+        || !current.file_type().is_dir()
+        || metadata.uid() != ROOT_UID
+        || metadata.gid() != ROOT_GID
+        || metadata.permissions().mode() & 0o7777 != 0o755
+        || metadata.dev() != ancestor.metadata.dev()
+        || metadata.ino() != ancestor.metadata.ino()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || current.uid() != ROOT_UID
+        || current.gid() != ROOT_GID
+        || current.permissions().mode() & 0o7777 != 0o755
+    {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(())
+}
+
 fn reviewed_hosted_specs() -> Result<Vec<TrustedExecutableSpec>, TrustedExecutableError> {
     let accepted = hosted_runner_fingerprint_requirement()
         .accepted
@@ -491,6 +780,65 @@ mod tests {
             .find_map(|line| line.strip_prefix("flags:\t"))
             .and_then(|value| u32::from_str_radix(value, 8).ok())
             .is_some_and(|flags| flags & libc::O_CLOEXEC as u32 != 0)
+    }
+
+    #[test]
+    fn ancestor_repair_accepts_only_root_or_the_exact_non_root_runner_identity() {
+        let runner = (1001, 1002);
+        assert!(repairable_ancestor_owner(0, 0, 0o755, runner));
+        assert!(repairable_ancestor_owner(1001, 1002, 0o755, runner));
+        for (uid, gid, mode) in [
+            (1001, 1003, 0o755),
+            (1002, 1002, 0o755),
+            (0, 1002, 0o755),
+            (1001, 0, 0o755),
+            (1001, 1002, 0o775),
+            (1001, 1002, 0o700),
+            (1001, 1002, 0o4755),
+        ] {
+            assert!(!repairable_ancestor_owner(uid, gid, mode, runner));
+        }
+        assert!(REVIEWED_HOST_ANCESTORS.contains(&"/etc"));
+        assert!(REVIEWED_HOST_ANCESTORS.contains(&"/usr"));
+        assert!(!REVIEWED_HOST_ANCESTORS.contains(&"/var"));
+    }
+
+    #[test]
+    fn ancestor_repair_requires_one_unaliased_non_root_runner_account() {
+        let valid =
+            b"root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1002:runner:/home/runner:/bin/bash\n";
+        assert_eq!(reviewed_runner_identity(valid).unwrap(), (1001, 1002));
+        for invalid in [
+            b"root:x:0:0:root:/root:/bin/bash\n".as_slice(),
+            b"runner:x:0:1002:runner:/home/runner:/bin/bash\n".as_slice(),
+            b"runner:x:1001:0:runner:/home/runner:/bin/bash\n".as_slice(),
+            b"runner:x:not-a-uid:1002:runner:/home/runner:/bin/bash\n".as_slice(),
+            b"runner:x:1001:1002:runner:/home/runner\n".as_slice(),
+            b"runner:x:1001:1002:runner:/home/runner:/bin/bash\nrunner:x:1002:1002:runner:/home/runner:/bin/bash\n"
+                .as_slice(),
+            b"runner:x:1001:1002:runner:/home/runner:/bin/bash\nother:x:1001:1002:other:/home/other:/bin/bash\n"
+                .as_slice(),
+        ] {
+            assert_eq!(
+                reviewed_runner_identity(invalid).unwrap_err().code,
+                "trusted_executable_unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn ancestor_repair_requires_exact_ubuntu_24_04_identity() {
+        assert!(reviewed_host_os_release(
+            b"NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n"
+        ));
+        for unsupported in [
+            b"ID=debian\nVERSION_ID=\"24.04\"\n".as_slice(),
+            b"ID=ubuntu\nVERSION_ID=\"26.04\"\n".as_slice(),
+            b"ID=ubuntu\nVERSION_ID=24.04\n".as_slice(),
+            b"ID=ubuntu\n".as_slice(),
+        ] {
+            assert!(!reviewed_host_os_release(unsupported));
+        }
     }
 
     #[test]
