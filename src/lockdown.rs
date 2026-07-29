@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -969,6 +970,12 @@ fn verify_host_capabilities(
         .map_err(|_| unsupported_fingerprint())?;
     verify_runner_identity(executables, &accepted)?;
     let docker_available = runner_docker_available(executables)?;
+    if docker_available {
+        let workloads = runner_docker_ps(executables)?;
+        if !workloads.status.success() || !workloads.stdout.is_empty() {
+            return Err(unsupported_fingerprint());
+        }
+    }
     verify_reviewed_runner_groups(executables, &accepted, docker_available)?;
     verify_runner_access_probes(executables, &accepted)?;
     let sudo_source_pins = capture_sudo_sources(executables)?;
@@ -1618,9 +1625,6 @@ pub(crate) fn runner_docker_available(
     if executables.contains(TrustedExecutable::Docker) {
         let output = runner_docker_ps(executables)?;
         if output.status.success() {
-            if !output.stdout.is_empty() {
-                return Err(unsupported_fingerprint());
-            }
             return Ok(true);
         }
         if output.status.code().is_none() {
@@ -1651,7 +1655,9 @@ fn verify_container_runtime_unavailable(
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Ok(metadata) if metadata.file_type().is_socket() => {
-                if runner_path_writable(executables, OsStr::new(path), SOCKET_PROBE_TIMEOUT)? {
+                if unix_socket_has_listener(Path::new(path))?
+                    && runner_path_writable(executables, OsStr::new(path), SOCKET_PROBE_TIMEOUT)?
+                {
                     return Err(LockdownError::new(
                         "container_lockdown_failed",
                         "a container runtime socket remains accessible to the runner",
@@ -1689,6 +1695,21 @@ fn verify_container_runtime_unavailable(
         ));
     }
     Ok(())
+}
+
+fn unix_socket_has_listener(path: &Path) -> Result<bool, LockdownError> {
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(_) => Err(unsupported_fingerprint()),
+    }
 }
 
 pub(crate) fn runner_path_writable(
