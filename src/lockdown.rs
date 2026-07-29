@@ -539,7 +539,20 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_available(executables)? {
+        let docker_available = if self.containers_masked {
+            if executables.contains(TrustedExecutable::Docker) {
+                let output = runner_docker_ps(executables)?;
+                if output.status.code().is_none() {
+                    return Err(unsupported_fingerprint());
+                }
+                output.status.success()
+            } else {
+                false
+            }
+        } else {
+            runner_docker_available(executables)?
+        };
+        if docker_available {
             return Err(LockdownError::new(
                 "container_lockdown_failed",
                 "runner Docker access remains usable after lockdown",
@@ -557,8 +570,7 @@ impl LockdownControl for SystemLockdownControl {
                 ));
             }
         }
-        verify_container_runtime_unavailable(executables)?;
-        Ok(())
+        verify_container_sockets_unavailable(executables)
     }
 
     fn commit_no_restore(&mut self) {
@@ -1647,26 +1659,7 @@ fn verify_container_runtime_unavailable(
             ));
         }
     }
-    for path in [
-        "/var/run/docker.sock",
-        "/run/docker.sock",
-        "/run/containerd/containerd.sock",
-    ] {
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.file_type().is_socket() => {
-                if unix_socket_has_listener(Path::new(path))?
-                    && runner_path_writable(executables, OsStr::new(path), SOCKET_PROBE_TIMEOUT)?
-                {
-                    return Err(LockdownError::new(
-                        "container_lockdown_failed",
-                        "a container runtime socket remains accessible to the runner",
-                    ));
-                }
-            }
-            Ok(_) | Err(_) => return Err(unsupported_fingerprint()),
-        }
-    }
+    verify_container_sockets_unavailable(executables)?;
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     let socket_access = SystemUnixSocketAccess::new(|path: &OsStr| {
         let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -1693,6 +1686,32 @@ fn verify_container_runtime_unavailable(
             "container_lockdown_failed",
             "root-owned container runtime processes remain available",
         ));
+    }
+    Ok(())
+}
+
+fn verify_container_sockets_unavailable(
+    executables: &TrustedExecutableSet,
+) -> Result<(), LockdownError> {
+    for path in [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/run/containerd/containerd.sock",
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                if unix_socket_has_listener(Path::new(path))?
+                    && runner_path_writable(executables, OsStr::new(path), SOCKET_PROBE_TIMEOUT)?
+                {
+                    return Err(LockdownError::new(
+                        "container_lockdown_failed",
+                        "a container runtime socket remains accessible to the runner",
+                    ));
+                }
+            }
+            Ok(_) | Err(_) => return Err(unsupported_fingerprint()),
+        }
     }
     Ok(())
 }
