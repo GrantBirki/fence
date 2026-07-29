@@ -246,18 +246,6 @@ pub struct LocalControlObservation {
     pub snapshot: LocalControlSnapshot,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct DynamicLocalControlObservation {
-    pub(crate) observation: LocalControlObservation,
-    pub(crate) private_identity_digest: String,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LocalControlIdentityPolicy {
-    Reviewed,
-    Captured,
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FilesystemSocketAccess {
     Reachable { owner_uid: u32 },
@@ -456,28 +444,6 @@ pub fn verify_local_control_observation(
     compare_local_control_snapshots(accepted, &observed.snapshot)
 }
 
-pub(crate) fn verify_dynamic_local_control_observation(
-    accepted: &LocalControlSnapshot,
-    expected_private_identity_digest: &str,
-    observed: &DynamicLocalControlObservation,
-) -> Result<(), LocalControlVerificationError> {
-    verify_local_control_observation(accepted, &observed.observation)?;
-    if observed.private_identity_digest != expected_private_identity_digest {
-        return Err(verification_error(
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Changed),
-            "local_control_inventory_drift",
-            "local control owner identity changed after baseline capture",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_complete_dynamic_local_control_observation(
-    observed: &DynamicLocalControlObservation,
-) -> Result<(), LocalControlVerificationError> {
-    verify_complete_local_control_observation(&observed.observation)
-}
-
 fn verify_complete_local_control_observation(
     observed: &LocalControlObservation,
 ) -> Result<(), LocalControlVerificationError> {
@@ -518,27 +484,22 @@ fn verify_complete_local_control_observation(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn verify_no_additive_local_control_observation(
     accepted_inventory: &AcceptedLocalControlInventoryV2,
     observed: &LocalControlObservation,
 ) -> Result<(), LocalControlVerificationError> {
     let accepted = accepted_local_control_snapshot(accepted_inventory)?;
-    verify_complete_local_control_observation(observed)?;
+    verify_no_additive_local_control_since(accepted_inventory, &accepted, observed)
+}
+
+pub(crate) fn verify_no_additive_local_control_since(
+    accepted_inventory: &AcceptedLocalControlInventoryV2,
+    accepted: &LocalControlSnapshot,
+    observed: &LocalControlObservation,
+) -> Result<(), LocalControlVerificationError> {
+    verify_reviewed_local_control_snapshot(accepted, observed)?;
     let snapshot = &observed.snapshot;
-    let containers_are_subset = root_container_processes_are_subset(
-        &snapshot.root_container_processes,
-        &accepted.root_container_processes,
-    );
-    let tcp_is_subset = tcp_listeners_are_subset(&snapshot.tcp_listeners, &accepted.tcp_listeners);
-    let unix_is_subset =
-        unix_listeners_are_subset(&snapshot.unix_listeners, &accepted.unix_listeners);
-    if !containers_are_subset || !tcp_is_subset || !unix_is_subset {
-        return Err(verification_error(
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
-            "local_control_inventory_additive_drift",
-            "local control inventory gained an endpoint or owner outside the accepted fingerprint",
-        ));
-    }
 
     let reviewed_containers = &accepted.root_container_processes;
     let mut accepted_unix_projection =
@@ -573,6 +534,35 @@ pub fn verify_no_additive_local_control_observation(
         ));
     }
 
+    Ok(())
+}
+
+pub(crate) fn verify_reviewed_local_control_observation(
+    accepted_inventory: &AcceptedLocalControlInventoryV2,
+    observed: &LocalControlObservation,
+) -> Result<(), LocalControlVerificationError> {
+    let accepted = accepted_local_control_snapshot(accepted_inventory)?;
+    verify_reviewed_local_control_snapshot(&accepted, observed)
+}
+
+fn verify_reviewed_local_control_snapshot(
+    accepted: &LocalControlSnapshot,
+    observed: &LocalControlObservation,
+) -> Result<(), LocalControlVerificationError> {
+    verify_complete_local_control_observation(observed)?;
+    let snapshot = &observed.snapshot;
+    if !root_container_processes_are_subset(
+        &snapshot.root_container_processes,
+        &accepted.root_container_processes,
+    ) || !tcp_listeners_are_subset(&snapshot.tcp_listeners, &accepted.tcp_listeners)
+        || !unix_listeners_are_subset(&snapshot.unix_listeners, &accepted.unix_listeners)
+    {
+        return Err(verification_error(
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
+            "local_control_inventory_additive_drift",
+            "local control inventory gained an endpoint or owner outside the accepted fingerprint",
+        ));
+    }
     Ok(())
 }
 
@@ -1234,24 +1224,6 @@ pub fn observe_local_control_inventory(
     )
 }
 
-pub(crate) fn observe_dynamic_local_control_inventory(
-    proc_root: &Path,
-    socket_access: &dyn UnixSocketAccess,
-    current_fence: &dyn CurrentFenceOwner,
-) -> DynamicLocalControlObservation {
-    observe_dynamic_local_control_with(
-        || {
-            collect_private_snapshot_with_policy(
-                proc_root,
-                socket_access,
-                current_fence,
-                LocalControlIdentityPolicy::Captured,
-            )
-        },
-        || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
-    )
-}
-
 fn observe_local_control_with<C, S>(mut capture: C, mut sleep: S) -> LocalControlObservation
 where
     C: FnMut() -> PrivateSnapshot,
@@ -1290,74 +1262,10 @@ where
     }
 }
 
-fn observe_dynamic_local_control_with<C, S>(
-    mut capture: C,
-    mut sleep: S,
-) -> DynamicLocalControlObservation
-where
-    C: FnMut() -> PrivateSnapshot,
-    S: FnMut(),
-{
-    let mut last = PrivateSnapshot::unavailable(UnavailableReason::Proc);
-    for attempt in 1..=STABILITY_ATTEMPTS {
-        let first = capture();
-        sleep();
-        let second = capture();
-        last = second.clone();
-        if first.security_relevant_stability_key() == second.security_relevant_stability_key() {
-            let private_identity_digest = private_local_control_identity_digest(&second);
-            let snapshot =
-                public_snapshot_with_policy(second, LocalControlIdentityPolicy::Captured);
-            let status = match snapshot.scan_status {
-                ScanStatus::WithinBounds => ObservationStatus::Stable,
-                ScanStatus::BoundsExceeded => ObservationStatus::BoundsExceeded,
-                ScanStatus::Unavailable => ObservationStatus::Unavailable,
-            };
-            return DynamicLocalControlObservation {
-                observation: LocalControlObservation {
-                    status,
-                    stable: true,
-                    attempts: attempt,
-                    interval_milliseconds: STABILITY_INTERVAL_MILLISECONDS,
-                    limits: LocalControlLimits::reviewed(),
-                    snapshot,
-                },
-                private_identity_digest,
-            };
-        }
-    }
-    let private_identity_digest = private_local_control_identity_digest(&last);
-    DynamicLocalControlObservation {
-        observation: LocalControlObservation {
-            status: ObservationStatus::Unstable,
-            stable: false,
-            attempts: STABILITY_ATTEMPTS,
-            interval_milliseconds: STABILITY_INTERVAL_MILLISECONDS,
-            limits: LocalControlLimits::reviewed(),
-            snapshot: public_snapshot_with_policy(last, LocalControlIdentityPolicy::Captured),
-        },
-        private_identity_digest,
-    }
-}
-
 fn collect_private_snapshot(
     proc_root: &Path,
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
-) -> PrivateSnapshot {
-    collect_private_snapshot_with_policy(
-        proc_root,
-        socket_access,
-        current_fence,
-        LocalControlIdentityPolicy::Reviewed,
-    )
-}
-
-fn collect_private_snapshot_with_policy(
-    proc_root: &Path,
-    socket_access: &dyn UnixSocketAccess,
-    current_fence: &dyn CurrentFenceOwner,
-    identity_policy: LocalControlIdentityPolicy,
 ) -> PrivateSnapshot {
     let mut unavailable = BTreeSet::new();
     let mut malformed_row_count = 0_u64;
@@ -1422,7 +1330,7 @@ fn collect_private_snapshot_with_policy(
         .map(|listener| listener.inode)
         .chain(all_tcp.iter().map(|listener| listener.inode))
         .collect::<BTreeSet<_>>();
-    let scan = scan_processes(proc_root, &relevant_inodes, identity_policy);
+    let scan = scan_processes(proc_root, &relevant_inodes);
     unavailable.extend(scan.unavailable_inputs.iter().copied());
     let mut bounds = scan.bounds_exceeded.clone();
 
@@ -1707,11 +1615,7 @@ struct ProcessScan {
     unavailable_inputs: BTreeSet<UnavailableReason>,
 }
 
-fn scan_processes(
-    proc_root: &Path,
-    relevant_inodes: &BTreeSet<u64>,
-    identity_policy: LocalControlIdentityPolicy,
-) -> ProcessScan {
+fn scan_processes(proc_root: &Path, relevant_inodes: &BTreeSet<u64>) -> ProcessScan {
     let mut scan = ProcessScan::default();
     let mut process_entries = match numeric_process_entries(proc_root, &mut scan) {
         Some(entries) => entries,
@@ -1825,16 +1729,7 @@ fn scan_processes(
             &after_cgroup,
         );
         let executable_reviewed = before.canonical_executable != UNREVIEWED_EXECUTABLE_PATH;
-        let identity_complete = cgroup_matches
-            && match identity_policy {
-                LocalControlIdentityPolicy::Reviewed => {
-                    before_cgroup.reviewed && executable_reviewed
-                }
-                LocalControlIdentityPolicy::Captured => {
-                    before_cgroup.fingerprint.is_some()
-                        && !before.executable_path_fingerprint.is_empty()
-                }
-            };
+        let identity_complete = before_cgroup.reviewed && cgroup_matches && executable_reviewed;
         let key = PrivateOwnerKey {
             uid: before.uid,
             executable_basename: before.executable_basename.clone(),
@@ -2430,87 +2325,6 @@ fn domain_hash(domain: &[u8], value: &[u8]) -> String {
     encoded
 }
 
-fn private_local_control_identity_digest(snapshot: &PrivateSnapshot) -> String {
-    fn update_field(digest: &mut Sha256, value: &[u8]) {
-        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-        digest.update(value);
-    }
-
-    fn update_owner(digest: &mut Sha256, owner: &PrivateOwner) {
-        digest.update(owner.key.uid.to_be_bytes());
-        update_field(digest, owner.key.executable_basename.as_bytes());
-        update_field(digest, owner.key.executable_path_fingerprint.as_bytes());
-        update_field(
-            digest,
-            owner
-                .key
-                .cgroup_fingerprint
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        digest.update(
-            u64::try_from(owner.process_pins.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        for pin in &owner.process_pins {
-            digest.update(pin.pid.to_be_bytes());
-            digest.update(pin.start_time_ticks.to_be_bytes());
-            digest.update(pin.executable_device.to_be_bytes());
-            digest.update(pin.executable_inode.to_be_bytes());
-        }
-    }
-
-    let mut digest = Sha256::new();
-    digest.update(b"fence-dynamic-local-control-owner-v1\0");
-    for container in &snapshot.root_container_processes {
-        digest.update(b"container\0");
-        digest.update(container.key.uid.to_be_bytes());
-        update_field(
-            &mut digest,
-            container.key.executable_path_fingerprint.as_bytes(),
-        );
-        update_field(
-            &mut digest,
-            container
-                .key
-                .cgroup_fingerprint
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        digest.update(container.process_pin.pid.to_be_bytes());
-        digest.update(container.process_pin.start_time_ticks.to_be_bytes());
-        digest.update(container.process_pin.executable_device.to_be_bytes());
-        digest.update(container.process_pin.executable_inode.to_be_bytes());
-    }
-    for listener in &snapshot.unix_listeners {
-        digest.update(b"unix\0");
-        digest.update(listener.socket_inode.to_be_bytes());
-        update_field(&mut digest, listener.name_sha256.as_bytes());
-        for owner in &listener.owners {
-            update_owner(&mut digest, owner);
-        }
-    }
-    for listener in &snapshot.tcp_listeners {
-        digest.update(b"tcp\0");
-        digest.update(listener.socket_inode.to_be_bytes());
-        digest.update(listener.socket_uid.to_be_bytes());
-        digest.update(listener.port.to_be_bytes());
-        for owner in &listener.owners {
-            update_owner(&mut digest, owner);
-        }
-    }
-    let output = digest.finalize();
-    let mut encoded = String::with_capacity(output.len() * 2);
-    for byte in output {
-        use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing digest into String must succeed");
-    }
-    encoded
-}
-
 fn private_unix_sort(
     left: &PrivateUnixListener,
     right: &PrivateUnixListener,
@@ -2575,27 +2389,6 @@ fn excluded_unix_sort(
 }
 
 fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
-    public_snapshot_with_policy(private, LocalControlIdentityPolicy::Reviewed)
-}
-
-fn public_snapshot_with_policy(
-    private: PrivateSnapshot,
-    identity_policy: LocalControlIdentityPolicy,
-) -> LocalControlSnapshot {
-    let private_identities_complete = private
-        .root_container_processes
-        .iter()
-        .all(|process| process.identity_complete)
-        && private
-            .unix_listeners
-            .iter()
-            .flat_map(|listener| &listener.owners)
-            .all(|owner| owner.identity_complete)
-        && private
-            .tcp_listeners
-            .iter()
-            .flat_map(|listener| &listener.owners)
-            .all(|owner| owner.identity_complete);
     let root_container_processes = aggregate_containers(&private.root_container_processes);
     let unix_listeners = aggregate_unix_listeners(&private.unix_listeners);
     let tcp_listeners = aggregate_tcp_listeners(&private.tcp_listeners);
@@ -2615,28 +2408,23 @@ fn public_snapshot_with_policy(
     if !reachability_complete {
         unavailable_inputs.insert(UnavailableReason::UnixReachability);
     }
-    let identities_complete = match identity_policy {
-        LocalControlIdentityPolicy::Reviewed => {
-            root_container_processes
-                .iter()
-                .all(root_container_identity_reviewed)
-                && unix_listeners
-                    .iter()
-                    .flat_map(|listener| &listener.owners)
-                    .all(owner_identity_reviewed)
-                && tcp_listeners
-                    .iter()
-                    .flat_map(|listener| &listener.owners)
-                    .all(owner_identity_reviewed)
-        }
-        LocalControlIdentityPolicy::Captured => private_identities_complete,
-    };
+    let identities_reviewed = root_container_processes
+        .iter()
+        .all(root_container_identity_reviewed)
+        && unix_listeners
+            .iter()
+            .flat_map(|listener| &listener.owners)
+            .all(owner_identity_reviewed)
+        && tcp_listeners
+            .iter()
+            .flat_map(|listener| &listener.owners)
+            .all(owner_identity_reviewed);
     let ownership_failure = unavailable_inputs
         .iter()
         .any(|reason| reason.is_acquisition() || *reason == UnavailableReason::MalformedRows);
     let ownership_complete = reachability_complete
         && !ownership_failure
-        && identities_complete
+        && identities_reviewed
         && unix_listeners
             .iter()
             .all(|listener| listener.ownership_complete)
@@ -3718,170 +3506,41 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_observation_accepts_complete_unreviewed_owner_and_pins_private_identity() {
-        let mut owner = private_owner(0, false, &[42]);
-        owner.identity_complete = true;
-        owner.key.executable_path_fingerprint = "first-private-executable".to_string();
-        owner.key.cgroup_fingerprint = Some("first-private-cgroup".to_string());
-        let mut private = empty_private();
-        private.tcp_listeners.push(PrivateTcpListener {
-            socket_inode: 42,
-            socket_uid: 0,
-            family: InternetAddressFamily::Ipv4,
-            bind_class: BindClass::Loopback,
-            port: 4242,
-            owners: vec![owner],
-            ownership_complete: true,
-        });
+    fn reviewed_observation_accepts_safe_reductions_but_not_new_control_paths() {
+        let inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let accepted = accepted_observation();
+        verify_reviewed_local_control_observation(&inventory, &accepted).unwrap();
 
-        let observed = observe_dynamic_local_control_with(|| private.clone(), || {});
-        verify_complete_dynamic_local_control_observation(&observed).unwrap();
-        verify_dynamic_local_control_observation(
-            &observed.observation.snapshot,
-            &observed.private_identity_digest,
-            &observed,
-        )
-        .unwrap();
-        assert_eq!(
-            observed.observation.snapshot.tcp_listeners[0].owners[0].canonical_executable,
-            UNREVIEWED_EXECUTABLE_PATH
-        );
+        let mut reduced = accepted.clone();
+        reduced.snapshot.tcp_listeners.pop();
+        verify_reviewed_local_control_observation(&inventory, &reduced).unwrap();
+        verify_no_additive_local_control_since(&inventory, &reduced.snapshot, &reduced).unwrap();
 
-        let mut replaced = private.clone();
-        replaced.tcp_listeners[0].owners[0]
-            .key
-            .executable_path_fingerprint = "second-private-executable".to_string();
-        let drifted = observe_dynamic_local_control_with(|| replaced.clone(), || {});
-        assert_eq!(observed.observation.snapshot, drifted.observation.snapshot);
-        assert_ne!(
-            observed.private_identity_digest,
-            drifted.private_identity_digest
-        );
-        let error = verify_dynamic_local_control_observation(
-            &observed.observation.snapshot,
-            &observed.private_identity_digest,
-            &drifted,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "local_control_inventory_drift");
+        let mut changed = reduced.clone();
+        changed.snapshot.tcp_listeners[0].owners[0].processes += 1;
         assert_eq!(
-            error.kind,
+            verify_local_control_observation(&reduced.snapshot, &changed)
+                .unwrap_err()
+                .kind,
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Changed)
         );
 
-        let mut restarted = private.clone();
-        let previous_pin = restarted.tcp_listeners[0].owners[0]
-            .process_pins
-            .iter()
-            .next()
-            .cloned()
-            .unwrap();
-        restarted.tcp_listeners[0].owners[0]
-            .process_pins
-            .remove(&previous_pin);
-        restarted.tcp_listeners[0].owners[0]
-            .process_pins
-            .insert(ProcessPin {
-                pid: previous_pin.pid + 1,
-                start_time_ticks: previous_pin.start_time_ticks + 1,
-                ..previous_pin
-            });
-        let restarted = observe_dynamic_local_control_with(|| restarted.clone(), || {});
-        assert_eq!(
-            observed.observation.snapshot,
-            restarted.observation.snapshot
-        );
-        assert_ne!(
-            observed.private_identity_digest,
-            restarted.private_identity_digest
-        );
-    }
-
-    #[test]
-    fn dynamic_container_identity_digest_detects_same_shape_process_replacement() {
-        let owner = private_owner(0, true, &[71]);
-        let mut first = empty_private();
-        first.root_container_processes.push(PrivateContainer {
-            key: owner.key.clone(),
-            identity_complete: true,
-            process_pin: owner.process_pins.iter().next().cloned().unwrap(),
-        });
-        let mut replaced = first.clone();
-        replaced.root_container_processes[0].process_pin.pid += 1;
-        replaced.root_container_processes[0]
-            .process_pin
-            .start_time_ticks += 1;
-        let original = observe_dynamic_local_control_with(|| first.clone(), || {});
-        let replacement = observe_dynamic_local_control_with(|| replaced.clone(), || {});
-        assert_eq!(
-            original.observation.snapshot,
-            replacement.observation.snapshot
-        );
-        assert_ne!(
-            original.private_identity_digest,
-            replacement.private_identity_digest
-        );
-        assert_eq!(
-            verify_dynamic_local_control_observation(
-                &original.observation.snapshot,
-                &original.private_identity_digest,
-                &replacement,
-            )
-            .unwrap_err()
-            .kind,
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Changed)
-        );
-    }
-
-    #[test]
-    fn dynamic_observation_still_rejects_incomplete_and_unstable_owners() {
-        let mut private = empty_private();
-        private.tcp_listeners.push(PrivateTcpListener {
-            socket_inode: 42,
-            socket_uid: 0,
+        let mut added = accepted;
+        added.snapshot.tcp_listeners.push(TcpListener {
             family: InternetAddressFamily::Ipv4,
             bind_class: BindClass::Loopback,
             port: 4242,
-            owners: vec![private_owner(0, false, &[42])],
-            ownership_complete: false,
-        });
-        let incomplete = observe_dynamic_local_control_with(|| private.clone(), || {});
-        assert_eq!(
-            verify_complete_dynamic_local_control_observation(&incomplete)
-                .unwrap_err()
-                .kind,
-            LocalControlVerificationErrorKind::Unavailable
-        );
-
-        let mut first = empty_private();
-        first.tcp_listeners.push(PrivateTcpListener {
-            socket_inode: 1,
-            socket_uid: 0,
-            family: InternetAddressFamily::Ipv4,
-            bind_class: BindClass::Loopback,
-            port: 4242,
-            owners: vec![private_owner(0, true, &[1])],
+            owners: vec![systemd_owner()],
             ownership_complete: true,
+            instances: 1,
         });
-        let mut second = first.clone();
-        second.tcp_listeners[0].port = 4243;
-        let mut calls = 0_u32;
-        let unstable = observe_dynamic_local_control_with(
-            || {
-                calls += 1;
-                if calls % 2 == 1 {
-                    first.clone()
-                } else {
-                    second.clone()
-                }
-            },
-            || {},
-        );
         assert_eq!(
-            verify_complete_dynamic_local_control_observation(&unstable)
+            verify_reviewed_local_control_observation(&inventory, &added)
                 .unwrap_err()
                 .kind,
-            LocalControlVerificationErrorKind::Unstable
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
         );
     }
 

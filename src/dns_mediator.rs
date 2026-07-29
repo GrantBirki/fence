@@ -20,12 +20,10 @@ use crate::lifecycle::{
     validate_production_service_context, validate_test_service_context,
 };
 use crate::local_control::{
-    CurrentFenceOwner, DynamicLocalControlObservation, LocalControlObservation,
-    LocalControlSnapshot, NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner,
-    SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess, accepted_local_control_snapshot,
-    observe_dynamic_local_control_inventory, observe_local_control_inventory,
-    verify_complete_dynamic_local_control_observation, verify_dynamic_local_control_observation,
-    verify_local_control_observation, verify_no_additive_local_control_observation,
+    CurrentFenceOwner, LocalControlObservation, LocalControlSnapshot, NoCurrentFenceOwner,
+    OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner, SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess,
+    observe_local_control_inventory, verify_local_control_observation,
+    verify_no_additive_local_control_since, verify_reviewed_local_control_observation,
 };
 use crate::lockdown::{
     LockdownControl, LockdownPosture, SystemLockdownControl, runner_path_writable,
@@ -155,7 +153,6 @@ const MAX_STARTUP_PREHYDRATION_WORKERS: usize = 32;
 const STARTUP_PREHYDRATION_CANCELLATION_INTERVAL: Duration = Duration::from_millis(50);
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
-const MAX_PASSWD_FILE_BYTES: u64 = 256 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 const REQUIRED_RESIDENT_WORKERS: [&str; 5] = [
@@ -1617,10 +1614,7 @@ impl DnsRouting {
             &accepted,
             target_metadata.file_type().is_file(),
             target_metadata.file_type().is_symlink(),
-            (
-                target_metadata.uid(),
-                trusted_systemd_resolver_uid(Path::new("/etc/passwd")),
-            ),
+            target_metadata.uid(),
             target_metadata.permissions().mode() & 0o777,
         ) {
             return Err(DnsMediationError::new(
@@ -1681,80 +1675,15 @@ fn resolver_layout_is_supported(
     accepted: &AcceptedResolverV2,
     target_is_file: bool,
     target_is_symlink: bool,
-    resolver_owner: (u32, Option<u32>),
+    target_uid: u32,
     target_mode: u32,
 ) -> bool {
     resolv_conf_is_symlink
         && canonical_target == Path::new(accepted.canonical_target)
         && target_is_file
         && !target_is_symlink
-        && resolver_owner.0 != 0
-        && Some(resolver_owner.0) == resolver_owner.1
+        && target_uid == accepted.target_uid
         && target_mode == 0o644
-}
-
-fn trusted_systemd_resolver_uid(path: &Path) -> Option<u32> {
-    let source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let metadata = source.metadata().ok()?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.len() > MAX_PASSWD_FILE_BYTES
-    {
-        return None;
-    }
-    let mut contents = Vec::new();
-    source
-        .take(MAX_PASSWD_FILE_BYTES + 1)
-        .read_to_end(&mut contents)
-        .ok()?;
-    if u64::try_from(contents.len()).ok()? != metadata.len() {
-        return None;
-    }
-    let current = fs::symlink_metadata(path).ok()?;
-    if !current.file_type().is_file()
-        || current.uid() != metadata.uid()
-        || current.gid() != metadata.gid()
-        || current.permissions().mode() & 0o7777 != metadata.permissions().mode() & 0o7777
-        || current.dev() != metadata.dev()
-        || current.ino() != metadata.ino()
-        || current.len() != metadata.len()
-    {
-        return None;
-    }
-    let contents = std::str::from_utf8(&contents).ok()?;
-    systemd_resolver_uid_from_passwd(contents)
-}
-
-fn systemd_resolver_uid_from_passwd(contents: &str) -> Option<u32> {
-    fn principal_uid(contents: &str, principal: &str) -> Option<u32> {
-        let mut matches = contents.lines().filter_map(|line| {
-            let fields = line.split(':').collect::<Vec<_>>();
-            (fields.first().copied() == Some(principal)).then(|| {
-                (fields.len() == 7)
-                    .then(|| fields[2].parse::<u32>().ok())
-                    .flatten()
-            })
-        });
-        let uid = matches.next()??;
-        (uid != 0 && matches.next().is_none()).then_some(uid)
-    }
-
-    let resolver_uid = principal_uid(contents, "systemd-resolve")?;
-    let runner_uid = principal_uid(contents, "runner")?;
-    let matching_accounts = contents
-        .lines()
-        .filter(|line| {
-            let fields = line.split(':').collect::<Vec<_>>();
-            fields.len() == 7 && fields[2].parse::<u32>().ok() == Some(resolver_uid)
-        })
-        .count();
-    (resolver_uid != runner_uid && matching_accounts == 1).then_some(resolver_uid)
 }
 
 fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
@@ -1986,15 +1915,6 @@ fn local_control_error(
     DnsMediationError::new(error.code, error.message)
 }
 
-fn accepted_local_control_inventory() -> Result<LocalControlSnapshot, DnsMediationError> {
-    accepted_local_control_snapshot(
-        &hosted_runner_fingerprint_requirement()
-            .accepted
-            .local_control_inventory,
-    )
-    .map_err(local_control_error)
-}
-
 fn observe_local_control(
     executables: &TrustedExecutableSet,
     current_fence: &dyn CurrentFenceOwner,
@@ -2012,93 +1932,44 @@ fn observe_local_control(
     observe_local_control_inventory(Path::new("/proc"), &socket_access, current_fence)
 }
 
-fn observe_dynamic_local_control(
-    executables: &TrustedExecutableSet,
-    current_fence: &dyn CurrentFenceOwner,
-) -> DynamicLocalControlObservation {
-    let deadline = Instant::now() + OBSERVATION_TIMEOUT;
-    let socket_access = SystemUnixSocketAccess::new(|path: &std::ffi::OsStr| {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        let timeout = remaining.min(SOCKET_PROBE_TIMEOUT);
-        if timeout.is_zero() {
-            None
-        } else {
-            runner_path_writable(executables, path, timeout).ok()
-        }
-    });
-    observe_dynamic_local_control_inventory(Path::new("/proc"), &socket_access, current_fence)
-}
-
 fn verify_pre_activation_local_control(
     executables: &TrustedExecutableSet,
-    posture: LockdownPosture,
-) -> Result<(), DnsMediationError> {
-    if posture == LockdownPosture::Audit {
-        let observed = observe_dynamic_local_control(executables, &NoCurrentFenceOwner);
-        return verify_complete_dynamic_local_control_observation(&observed)
-            .map_err(local_control_error);
-    }
-    let accepted = accepted_local_control_inventory()?;
+) -> Result<LocalControlSnapshot, DnsMediationError> {
+    let accepted = hosted_runner_fingerprint_requirement()
+        .accepted
+        .local_control_inventory;
     let observed = observe_local_control(executables, &NoCurrentFenceOwner);
-    verify_local_control_observation(&accepted, &observed).map_err(local_control_error)
-}
-
-struct ResidentLocalControlBaseline {
-    snapshot: LocalControlSnapshot,
-    private_identity_digest: Option<String>,
+    verify_reviewed_local_control_observation(&accepted, &observed).map_err(local_control_error)?;
+    Ok(observed.snapshot)
 }
 
 fn establish_local_control_baseline(
     mediation: &DnsMediationSession,
     posture: LockdownPosture,
-) -> Result<ResidentLocalControlBaseline, DnsMediationError> {
-    if posture == LockdownPosture::Audit {
-        let observed =
-            observe_dynamic_local_control(&mediation.routing.executables, &mediation.fence_owner);
-        verify_complete_dynamic_local_control_observation(&observed)
-            .map_err(local_control_error)?;
-        return Ok(ResidentLocalControlBaseline {
-            snapshot: observed.observation.snapshot,
-            private_identity_digest: Some(observed.private_identity_digest),
-        });
-    }
+    initial: &LocalControlSnapshot,
+) -> Result<LocalControlSnapshot, DnsMediationError> {
     let accepted_inventory = hosted_runner_fingerprint_requirement()
         .accepted
         .local_control_inventory;
     let observed = observe_local_control(&mediation.routing.executables, &mediation.fence_owner);
     match posture {
         LockdownPosture::StandardBlock => {
-            verify_no_additive_local_control_observation(&accepted_inventory, &observed)
+            verify_no_additive_local_control_since(&accepted_inventory, initial, &observed)
         }
-        LockdownPosture::UnsafePreserve => {
-            let accepted = accepted_local_control_snapshot(&accepted_inventory)
-                .map_err(local_control_error)?;
-            verify_local_control_observation(&accepted, &observed)
+        LockdownPosture::UnsafePreserve | LockdownPosture::Audit => {
+            verify_local_control_observation(initial, &observed)
         }
-        LockdownPosture::Audit => unreachable!("dynamic audit baseline handled above"),
     }
     .map_err(local_control_error)?;
-    Ok(ResidentLocalControlBaseline {
-        snapshot: observed.snapshot,
-        private_identity_digest: None,
-    })
+    Ok(observed.snapshot)
 }
 
 fn verify_resident_local_control(
     mediation: &DnsMediationSession,
-    baseline: &ResidentLocalControlBaseline,
+    baseline: &LocalControlSnapshot,
 ) -> Result<(), crate::local_control::LocalControlVerificationError> {
-    if let Some(private_identity_digest) = &baseline.private_identity_digest {
-        let observed =
-            observe_dynamic_local_control(&mediation.routing.executables, &mediation.fence_owner);
-        return verify_dynamic_local_control_observation(
-            &baseline.snapshot,
-            private_identity_digest,
-            &observed,
-        );
-    }
     let observed = observe_local_control(&mediation.routing.executables, &mediation.fence_owner);
-    verify_local_control_observation(&baseline.snapshot, &observed)
+    verify_local_control_observation(baseline, &observed)
 }
 
 struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
@@ -2108,7 +1979,7 @@ struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
     reader: NflogReader,
     runtime: R,
     expected_state: OwnedNftState,
-    local_control_baseline: ResidentLocalControlBaseline,
+    local_control_baseline: LocalControlSnapshot,
     evidence: DnsMediatedAuditEvidence,
     findings: FindingCollection,
     next_verification: Duration,
@@ -2119,6 +1990,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         runtime: R,
         mut mediation: DnsMediationSession,
         plan: &PlanData,
+        initial_local_control: &LocalControlSnapshot,
     ) -> Result<Self, DnsMediationError> {
         let ruleset = render_dns_mediated_ruleset(Mode::Audit, &plan.effective_policy);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
@@ -2151,8 +2023,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
 
         let executables = Arc::clone(&mediation.routing.executables);
         let mut backend = NativeNftBackend::new(SystemNftExecutor::host(Arc::clone(&executables)));
-        let mut lockdown =
-            SystemLockdownControl::new_for_posture(executables, LockdownPosture::Audit);
+        let mut lockdown = SystemLockdownControl::new(executables);
         let reader = match NflogReader::bind(Mode::Audit) {
             Ok(reader) => reader,
             Err(error) => {
@@ -2181,7 +2052,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             evidence.container_status = "preserved_verified";
             evidence.counters.total_violations =
                 backend.total_violation_packets().map_err(backend_error)?;
-            establish_local_control_baseline(&mediation, LockdownPosture::Audit)
+            establish_local_control_baseline(
+                &mediation,
+                LockdownPosture::Audit,
+                initial_local_control,
+            )
         })();
         let local_control_baseline = match setup_result {
             Ok(baseline) => baseline,
@@ -2451,7 +2326,7 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     base_allowances: Vec<EffectiveAllowance>,
     active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     expected_state: OwnedNftState,
-    local_control_baseline: ResidentLocalControlBaseline,
+    local_control_baseline: LocalControlSnapshot,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
     scope: DnsBlockRuntimeScope,
@@ -2466,6 +2341,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         materialization_requests: Receiver<MaterializationRequest>,
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
+        initial_local_control: &LocalControlSnapshot,
     ) -> Result<Self, DnsMediationError> {
         let hostname_policy = mediation.recorder.hostname_policy.clone();
         let prehydrated = match prehydrate_exact_hostnames(&hostname_policy) {
@@ -2573,7 +2449,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 }
                 LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
             }
-            establish_local_control_baseline(&mediation, scope.lockdown_posture())
+            establish_local_control_baseline(
+                &mediation,
+                scope.lockdown_posture(),
+                initial_local_control,
+            )
         })();
         let local_control_baseline = match setup_result {
             Ok(baseline) => baseline,
@@ -3079,28 +2959,12 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             "protected run accepts only reviewed block or audit modes with the hosted workflow-bootstrap profile",
         ));
     }
-    let posture = match (plan.assurance_status, plan.container_policy) {
-        (AssuranceStatus::AuditObservationOnly, None) => LockdownPosture::Audit,
-        (AssuranceStatus::PlannedBlockContainment, Some(ContainerPolicy::Disable)) => {
-            LockdownPosture::StandardBlock
-        }
-        (
-            AssuranceStatus::PlannedBlockDegradedContainerAccess,
-            Some(ContainerPolicy::UnsafePreserve),
-        ) => LockdownPosture::UnsafePreserve,
-        _ => {
-            return Err(DnsMediationError::new(
-                "protected_run_policy_not_activated",
-                "protected run accepts only reviewed block or audit modes with the hosted workflow-bootstrap profile",
-            ));
-        }
-    };
     let hostname_policy = plan.runtime_hostname_policy.clone();
-    let mut fingerprint = SystemLockdownControl::new_for_posture(Arc::clone(&executables), posture);
+    let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
     fingerprint
         .verify_supported_host()
         .map_err(lockdown_error)?;
-    verify_pre_activation_local_control(&executables, posture)?;
+    let initial_local_control = verify_pre_activation_local_control(&executables)?;
 
     match (plan.assurance_status, plan.container_policy) {
         (AssuranceStatus::AuditObservationOnly, None) => {
@@ -3111,7 +2975,12 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 hostname_policy.clone(),
                 None,
             )?;
-            let mut session = DnsMediatedAuditSession::establish(runtime, mediation, &plan)?;
+            let mut session = DnsMediatedAuditSession::establish(
+                runtime,
+                mediation,
+                &plan,
+                &initial_local_control,
+            )?;
             let start = Instant::now();
             loop {
                 session.poll_once(start.elapsed(), RESIDENT_IDLE_INTERVAL)?;
@@ -3146,6 +3015,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 materialization_requests,
                 &plan,
                 scope,
+                &initial_local_control,
             )?;
             let start = Instant::now();
             loop {
@@ -3194,7 +3064,7 @@ pub fn run_selected_profile_runtime_test_service(
     fingerprint
         .verify_supported_host()
         .map_err(lockdown_error)?;
-    verify_pre_activation_local_control(&executables, LockdownPosture::StandardBlock)?;
+    let initial_local_control = verify_pre_activation_local_control(&executables)?;
     let runtime =
         TestRuntimeStore::create(runtime_root, &plan.invocation_id).map_err(runtime_error)?;
     let (materialization_submitter, materialization_requests) = materialization_request_channel();
@@ -3211,6 +3081,7 @@ pub fn run_selected_profile_runtime_test_service(
         materialization_requests,
         plan,
         DnsBlockRuntimeScope::TestEvidence,
+        &initial_local_control,
     )?;
     if inject_worker_failure {
         let failure = session._mediation.inject_test_worker_failure();
@@ -12218,7 +12089,7 @@ mod tests {
             &accepted,
             true,
             false,
-            (991, Some(991)),
+            991,
             0o644,
         ));
         for unsupported in [
@@ -12228,7 +12099,7 @@ mod tests {
                 &accepted,
                 true,
                 false,
-                (991, Some(991)),
+                991,
                 0o644,
             ),
             resolver_layout_is_supported(
@@ -12237,7 +12108,7 @@ mod tests {
                 &accepted,
                 true,
                 false,
-                (991, Some(991)),
+                991,
                 0o644,
             ),
             resolver_layout_is_supported(
@@ -12246,102 +12117,23 @@ mod tests {
                 &accepted,
                 false,
                 false,
-                (991, Some(991)),
+                991,
                 0o644,
             ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                &accepted,
-                true,
-                true,
-                (991, Some(991)),
-                0o644,
-            ),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, true, 991, 0o644),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 0, 0o644),
             resolver_layout_is_supported(
                 true,
                 accepted_target,
                 &accepted,
                 true,
                 false,
-                (0, Some(0)),
+                1000,
                 0o644,
             ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                &accepted,
-                true,
-                false,
-                (1000, Some(991)),
-                0o644,
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                &accepted,
-                true,
-                false,
-                (991, Some(991)),
-                0o666,
-            ),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 991, 0o666),
         ] {
             assert!(!unsupported);
-        }
-        assert!(resolver_layout_is_supported(
-            true,
-            accepted_target,
-            &accepted,
-            true,
-            false,
-            (1000, Some(1000)),
-            0o644,
-        ));
-        assert!(!resolver_layout_is_supported(
-            true,
-            accepted_target,
-            &accepted,
-            true,
-            false,
-            (1000, Some(1001)),
-            0o644,
-        ));
-        assert!(!resolver_layout_is_supported(
-            true,
-            accepted_target,
-            &accepted,
-            true,
-            false,
-            (991, Some(992)),
-            0o644,
-        ));
-        assert!(resolver_layout_is_supported(
-            true,
-            accepted_target,
-            &accepted,
-            true,
-            false,
-            (992, Some(992)),
-            0o644,
-        ));
-    }
-
-    #[test]
-    fn resolver_service_identity_requires_one_non_root_exact_passwd_account() {
-        let valid = "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:992:992::/run/systemd:/usr/sbin/nologin\n";
-        assert_eq!(systemd_resolver_uid_from_passwd(valid), Some(992));
-        for invalid in [
-            "root:x:0:0:root:/root:/bin/bash\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:0:0::/run/systemd:/usr/sbin/nologin\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:not-a-uid:992::/run/systemd:/usr/sbin/nologin\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:992:992::/run/systemd\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:992:992::/run/systemd:/usr/sbin/nologin\nsystemd-resolve:x:993:993::/run/systemd:/usr/sbin/nologin\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve-other:x:992:992::/run/systemd:/usr/sbin/nologin\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:1001:1001::/run/systemd:/usr/sbin/nologin\n",
-            "runner:x:1001:1001:runner:/home/runner:/bin/bash\nsystemd-resolve:x:992:992::/run/systemd:/usr/sbin/nologin\nother:x:992:992:other:/home/other:/bin/bash\n",
-            "systemd-resolve:x:992:992::/run/systemd:/usr/sbin/nologin\n",
-        ] {
-            assert_eq!(systemd_resolver_uid_from_passwd(invalid), None);
         }
     }
 

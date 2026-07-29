@@ -42,11 +42,6 @@ SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 = (
 FIXTURE_ACCEPTED_DIGEST = "0" * 64
 FIXTURE_TRANSITION_DIGEST = "1" * 64
 FIXTURE_UNKNOWN_DIGEST = "2" * 64
-RESIDENT_REVIEWED_SUDO_SOURCES = {
-    ("drop_in", "README"),
-    ("drop_in", "runner"),
-}
-REPAIRABLE_RUNNER_OWNED_ANCESTORS = {"/etc", "/usr"}
 
 
 def require(condition, message):
@@ -487,255 +482,43 @@ def validate_transitions(transitions, accepted_sources):
     return index_by(entries, "path_class", "name", "sha256")
 
 
-def compare_schema4_observation_to_schema3(observation, accepted):
+def validate_host_observation(observation, accepted):
     try:
         validate_schema4_observation(observation)
     except ValueError as error:
         raise ClassificationError(
             f"host schema 4 observation is invalid: {error}"
         ) from error
+
+    host = observation["host"]
+    for actual, expected, message in (
+        ("os_id", "os_id", "host OS identity drifted"),
+        ("os_version_id", "os_version_id", "host OS version drifted"),
+        ("architecture", "architecture", "host architecture drifted"),
+        ("runner_principal", "expected_principal", "runner principal drifted"),
+    ):
+        require(host[actual] == accepted[expected], message)
+
     require(
-        observation["sudo"]["policy_sources_truncated"] is False,
-        "host sudo policy observation is truncated",
-    )
-    require(
-        all(
+        observation["sudo"]["policy_sources_truncated"] is False
+        and all(
             source.get("status") != "oversized"
             for source in observation["sudo"]["policy_source_hashes"]
         ),
-        "host sudo policy observation is oversized",
+        "host sudo policy observation is incomplete",
     )
-
-    host = observation["host"]
-    require(host["os_id"] == accepted["os_id"], "host OS identity drifted")
-    require(
-        host["os_version_id"] == accepted["os_version_id"],
-        "host OS version drifted",
-    )
-    require(
-        host["architecture"] == accepted["architecture"],
-        "host architecture drifted",
-    )
-    require(
-        host["runner_principal"] == accepted["expected_principal"],
-        "runner principal drifted",
-    )
-    require(
-        set(host["runner_groups"]) == set(accepted["required_runner_groups"]),
-        "runner groups drifted",
-    )
-
-    required_paths = index_by(observation["required_paths"], "path")
-    accepted_executables = index_by(accepted["trusted_executables"], "path")
-    require(
-        set(required_paths) == set(accepted_executables),
-        "fixed executable path set drifted",
-    )
-    for key, expected in accepted_executables.items():
-        item = required_paths[key]
-        require(item["present"] is True, "fixed executable is absent")
-        require(
-            item["canonical_target"] == expected["canonical_target"],
-            "fixed executable target drifted",
-        )
-        require(item["path_type"] == "regular", "fixed executable path type drifted")
-        require(item["target_type"] == "regular", "fixed executable target type drifted")
-        require(item["owner_class"] == "root", "fixed executable owner drifted")
-        require(item["group_class"] == "root", "fixed executable group drifted")
-        require(item["mode"] == expected["mode"], "fixed executable mode drifted")
-        require(item["runner_writable"] is False, "fixed executable became runner writable")
-        require(item["executable"] is True, "fixed executable lost execute permission")
-        require(
-            item["runner_executable"] is True,
-            "fixed executable is unavailable to the runner",
-        )
-
-    observed_ancestors = index_by(observation["permission_ancestor_directories"], "path")
-    accepted_ancestors = index_by(accepted["permission_ancestor_directories"], "path")
-    require(set(observed_ancestors) == set(accepted_ancestors), "ancestor path set drifted")
-    for key, expected in accepted_ancestors.items():
-        item = observed_ancestors[key]
-        require(item["present"] is True, "permission ancestor is absent")
-        require(
-            item["canonical_target"] == expected["canonical_target"],
-            "permission ancestor target drifted",
-        )
-        require(
-            item["path_type"] == "directory" and item["target_type"] == "directory",
-            "permission ancestor type drifted",
-        )
-        require(item["mode"] == expected["mode"], "permission ancestor mode drifted")
-        require(
-            item["runner_searchable"] == expected["runner_searchable"],
-            "permission ancestor searchability drifted",
-        )
-        repairable_runner_ownership = (
-            item["path"] in REPAIRABLE_RUNNER_OWNED_ANCESTORS
-            and item["owner_class"] == "runner"
-            and item["group_class"] == "runner_primary"
-            and item["mode"] == "0755"
-            and item["runner_writable"] is True
-            and item["runner_searchable"] is True
-            and item["synthetic_create_delete_probe"] == "created_and_removed"
-        )
-        if not repairable_runner_ownership:
-            require(
-                item["owner_class"] == "root" and item["group_class"] == "root",
-                "permission ancestor ownership drifted",
-            )
-            require(
-                item["runner_writable"] is False,
-                "permission ancestor became runner writable",
-            )
-
-    resolver = observation["resolver"]
-    expected_resolver = accepted["resolver"]
-    require(resolver["status"] == "observed", "resolver observation is unavailable")
-    require(resolver["is_symlink"] is True, "resolver path is not the reviewed symlink")
-    require(
-        resolver["path"] == expected_resolver["resolv_conf_path"],
-        "resolver path drifted",
-    )
-    require(
-        resolver["canonical_target"] == expected_resolver["canonical_target"],
-        "resolver target drifted",
-    )
-    require(resolver["target_type"] == "regular", "resolver target type drifted")
-    require(
-        resolver["target_mode"] == expected_resolver["target_mode"],
-        "resolver target mode drifted",
-    )
-
-    observed_sources = index_by(
-        observation["sudo"]["policy_source_hashes"], "path_class", "name"
-    )
-    accepted_sources = index_by(
-        accepted["sudo_policy_sources"], "path_class", "name"
-    )
-    require(
-        set(observed_sources) == set(accepted_sources),
-        "sudo policy source set drifted",
-    )
-    digest_mismatches = []
-    for key, source in accepted_sources.items():
-        observed = observed_sources[key]
-        require(
-            observed["canonical_target"] == source["canonical_target"],
-            "sudo policy target drifted",
-        )
-        require(observed["target_type"] == "regular", "sudo policy type drifted")
-        require(observed["owner_class"] == "root", "sudo policy owner drifted")
-        require(observed["group_class"] == "root", "sudo policy group drifted")
-        require(observed["mode"] == source["mode"], "sudo policy mode drifted")
-        require(observed["runner_writable"] is False, "sudo policy became runner writable")
-        require(
-            observed["runner_nopasswd_markers"]
-            == source["runner_nopasswd_markers"],
-            "sudo policy marker classification drifted",
-        )
-        if observed["sha256"] != source["sha256"]:
-            digest_mismatches.append((*key, observed["sha256"]))
-
-    observed_units = index_by(observation["systemd"]["units"], "name")
-    accepted_units = index_by(accepted["container_units"], "name")
-    require(
-        set(accepted_units)
-        == set(observed_units) - {(name,) for name in SCHEMA3_EVIDENCE_ONLY_UNITS},
-        "fixed container unit set drifted",
-    )
-    for key, unit in accepted_units.items():
-        observed = observed_units[key]
-        require(
-            (
-                observed["load_state"],
-                observed["active_state"],
-                observed["unit_file_state"],
-            )
-            == (
-                unit["load_state"],
-                unit["active_state"],
-                unit["unit_file_state"],
-            ),
-            "fixed container unit state drifted",
-        )
-
-    observed_sockets = index_by(observation["container_runtime"]["sockets"], "path")
-    accepted_sockets = index_by(accepted["container_sockets"], "path")
-    require(set(observed_sockets) == set(accepted_sockets), "container socket set drifted")
-    for key, socket in accepted_sockets.items():
-        observed = observed_sockets[key]
-        require(
-            observed["present"] == socket["present"],
-            "container socket state drifted",
-        )
-        if not observed["present"]:
-            continue
-        require(
-            (
-                observed["type"],
-                observed["mode"],
-                observed["owner"],
-                observed["group"],
-            )
-            == (
-                socket["kind"],
-                socket["mode"],
-                socket["owner"],
-                socket["group"],
-            ),
-            "container socket state drifted",
-        )
-    require(
-        observation["container_runtime"]["docker_running_workload_count"]
-        == accepted["required_docker_running_workload_count"],
-        "Docker workload count drifted",
-    )
-
     inventory = observation["local_control_inventory"]
     snapshot = inventory["snapshot"]
     require(
-        inventory["status"] == "stable" and inventory["stable"] is True,
-        "local control inventory did not stabilize",
-    )
-    observed_snapshot = {
-        key: value
-        for key, value in snapshot.items()
-        if key != "inaccessible_root_filesystem_listener_count"
-    }
-    require(
-        observed_snapshot
-        == expected_schema3_local_control_snapshot(accepted["local_control_inventory"]),
-        "local control inventory drifted",
-    )
-    return digest_mismatches
-
-
-def compare_audit_observation_to_schema3(observation, accepted):
-    try:
-        validate_schema4_observation(observation)
-    except ValueError as error:
-        raise ClassificationError(
-            f"host schema 4 observation is invalid: {error}"
-        ) from error
-
-    host = observation["host"]
-    require(host["os_id"] == accepted["os_id"], "host OS identity drifted")
-    require(
-        host["os_version_id"] == accepted["os_version_id"],
-        "host OS version drifted",
-    )
-    require(
-        host["architecture"] == accepted["architecture"],
-        "host architecture drifted",
-    )
-    require(
-        host["runner_principal"] == accepted["expected_principal"],
-        "runner principal drifted",
+        inventory["status"] == "stable"
+        and inventory["stable"] is True
+        and snapshot["scan_status"] == "within_bounds"
+        and snapshot["reachability_complete"] is True
+        and snapshot["ownership_complete"] is True,
+        "local control inventory is incomplete",
     )
 
-
-def classify(observation, support, transitions, mode="block"):
-    require(mode in {"block", "audit"}, "host classification mode is invalid")
+def classify(observation, support, transitions):
     require(isinstance(support, dict), "bundle support response is not an object")
     require(support.get("schema_version") == 1, "bundle support schema mismatch")
     require(support.get("command") == "check-support", "bundle support command mismatch")
@@ -747,28 +530,9 @@ def classify(observation, support, transitions, mode="block"):
     )
     fingerprint = data["hosted_runner_fingerprint"]
     accepted = validate_schema3_fingerprint(fingerprint)
-    transition_index = validate_transitions(
-        transitions, accepted["sudo_policy_sources"]
-    )
-    if mode == "audit":
-        compare_audit_observation_to_schema3(observation, accepted)
-        return {"run_bundle": True, "classification": "bundle_compatible"}
-    mismatches = [
-        mismatch
-        for mismatch in compare_schema4_observation_to_schema3(observation, accepted)
-        if mismatch[:2] not in RESIDENT_REVIEWED_SUDO_SOURCES
-    ]
-    if not mismatches:
-        return {"run_bundle": True, "classification": "bundle_compatible"}
-    for mismatch in mismatches:
-        require(
-            mismatch in transition_index,
-            "live host fingerprint drift is not an approved source-known bundle transition",
-        )
-    return {
-        "run_bundle": False,
-        "classification": "source_known_bundle_old_sudo_policy",
-    }
+    validate_transitions(transitions, accepted["sudo_policy_sources"])
+    validate_host_observation(observation, accepted)
+    return {"run_bundle": True, "classification": "bundle_compatible"}
 
 
 def fixture():
@@ -1173,7 +937,7 @@ def fixture():
         "transitions": [
             {
                 "path_class": "drop_in",
-                "name": "90-cloud-init-users",
+                "name": "runner",
                 "sha256": FIXTURE_TRANSITION_DIGEST,
             }
         ],
@@ -1207,46 +971,43 @@ class ClassificationTests(unittest.TestCase):
             {"run_bundle": True, "classification": "bundle_compatible"},
         )
 
-    def test_audit_accepts_safe_host_image_variations(self):
-        observation, support, transitions = fixture()
-        observation["host"]["runner_groups"] = ["docker", "runner"]
-        self.observed_source(observation)["sha256"] = FIXTURE_UNKNOWN_DIGEST
-        observation["systemd"]["units"][0]["active_state"] = UNREVIEWED_UNIT_STATE
-        observation["local_control_inventory"]["snapshot"]["tcp_listeners"].pop()
-        self.assertEqual(
-            classify(observation, support, transitions, "audit"),
-            {"run_bundle": True, "classification": "bundle_compatible"},
-        )
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions, "block")
-
-    def test_audit_accepts_bounded_root_owned_sudo_inventory_changes(self):
-        observation, support, transitions = fixture()
-        additional_source = dict(self.observed_source(observation))
-        additional_source.update(
-            {
-                "name": "unreviewed_sha256_" + "a" * 64,
-                "canonical_target": UNREVIEWED_SUDO_SOURCE_TARGET,
-                "sha256": FIXTURE_UNKNOWN_DIGEST,
-                "contains_nopasswd_directive": False,
-                "runner_nopasswd_markers": [],
-            }
-        )
-        sources = observation["sudo"]["policy_source_hashes"]
-        sources.append(additional_source)
-        sources.sort(
-            key=lambda source: (
-                0 if source["path_class"] == "main_policy" else 1,
-                source["name"],
-            )
-        )
-        self.assertTrue(classify(observation, support, transitions, "audit")["run_bundle"])
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions, "block")
-
-    def test_audit_rejects_unsupported_or_malformed_host_observations(self):
+    def test_safe_image_drift_is_verified_by_the_rust_resident(self):
         mutations = {
-            "OS": lambda observation: observation["host"].__setitem__(
+            "runner groups": lambda observation: observation["host"].__setitem__(
+                "runner_groups", ["runner"]
+            ),
+            "sudo policy": lambda observation: self.observed_source(observation).__setitem__(
+                "sha256", FIXTURE_UNKNOWN_DIGEST
+            ),
+            "service state": lambda observation: observation["systemd"]["units"][0].__setitem__(
+                "active_state", UNREVIEWED_UNIT_STATE
+            ),
+            "local service": lambda observation: observation["local_control_inventory"]["snapshot"][
+                "tcp_listeners"
+            ].pop(),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                observation, support, transitions = fixture()
+                mutate(observation)
+                self.assertEqual(
+                    classify(observation, support, transitions),
+                    {"run_bundle": True, "classification": "bundle_compatible"},
+                )
+
+    def test_source_transitions_never_skip_resident_activation(self):
+        observation, support, transitions = fixture()
+        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        for known in (transitions, {"schema_version": 1, "transitions": []}):
+            with self.subTest(known=bool(known["transitions"])):
+                self.assertTrue(classify(observation, support, known)["run_bundle"])
+
+    def test_rejects_unsupported_runner_identity(self):
+        mutations = {
+            "operating system": lambda observation: observation["host"].__setitem__(
+                "os_id", UNREVIEWED_OS_ID
+            ),
+            "version": lambda observation: observation["host"].__setitem__(
                 "os_version_id", UNREVIEWED_OS_VERSION_ID
             ),
             "architecture": lambda observation: observation["host"].__setitem__(
@@ -1254,108 +1015,6 @@ class ClassificationTests(unittest.TestCase):
             ),
             "principal": lambda observation: observation["host"].__setitem__(
                 "runner_principal", UNREVIEWED_RUNNER_PRINCIPAL
-            ),
-            "missing evidence": lambda observation: observation.pop(
-                "local_control_inventory"
-            ),
-            "truncated paths": lambda observation: observation["required_paths"].pop(),
-        }
-        for label, mutate in mutations.items():
-            with self.subTest(label=label):
-                observation, support, transitions = fixture()
-                mutate(observation)
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions, "audit")
-
-    def test_host_classification_defers_resolver_identity_to_the_rust_resident(self):
-        for mode in ("block", "audit"):
-            with self.subTest(mode=mode):
-                observation, support, transitions = fixture()
-                observation["resolver"]["target_uid"] = 992
-                self.assertTrue(
-                    classify(observation, support, transitions, mode)["run_bundle"]
-                )
-
-    def test_rejects_unknown_host_classification_mode(self):
-        observation, support, transitions = fixture()
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions, "unknown")
-
-    def test_block_defers_safe_sudo_policy_digests_to_the_rust_resident(self):
-        for name in ("README", "runner"):
-            with self.subTest(name=name):
-                observation, support, transitions = fixture()
-                self.observed_source(observation, name)["sha256"] = FIXTURE_UNKNOWN_DIGEST
-                self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_block_rejects_changed_sudo_grants_before_resident_activation(self):
-        observation, support, transitions = fixture()
-        source = self.observed_source(observation)
-        source["sha256"] = FIXTURE_UNKNOWN_DIGEST
-        source["runner_nopasswd_markers"] = ["group"]
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-    def test_block_defers_only_repairable_runner_owned_host_ancestors(self):
-        for repaired_paths in (("/etc",), ("/usr",), ("/etc", "/usr")):
-            with self.subTest(paths=repaired_paths):
-                observation, support, transitions = fixture()
-                for ancestor in observation["permission_ancestor_directories"]:
-                    if ancestor["path"] in repaired_paths:
-                        ancestor.update(
-                            {
-                                "owner_class": "runner",
-                                "group_class": "runner_primary",
-                                "runner_writable": True,
-                                "synthetic_create_delete_probe": "created_and_removed",
-                            }
-                        )
-                self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_block_rejects_unsafe_runner_owned_ancestor_variations(self):
-        def runner_ancestor(observation, path="/etc"):
-            ancestor = next(
-                entry
-                for entry in observation["permission_ancestor_directories"]
-                if entry["path"] == path
-            )
-            ancestor.update(
-                {
-                    "owner_class": "runner",
-                    "group_class": "runner_primary",
-                    "runner_writable": True,
-                    "synthetic_create_delete_probe": "created_and_removed",
-                }
-            )
-            return ancestor
-
-        mutations = {
-            "unreviewed directory": lambda observation: runner_ancestor(
-                observation, "/usr/bin"
-            ),
-            "owner": lambda observation: runner_ancestor(observation).__setitem__(
-                "owner_class", "other"
-            ),
-            "group": lambda observation: runner_ancestor(observation).__setitem__(
-                "group_class", "root"
-            ),
-            "mode": lambda observation: runner_ancestor(observation).__setitem__(
-                "mode", "0775"
-            ),
-            "probe": lambda observation: runner_ancestor(observation).__setitem__(
-                "synthetic_create_delete_probe", "denied"
-            ),
-            "root-cleanup probe": lambda observation: runner_ancestor(
-                observation
-            ).__setitem__("synthetic_create_delete_probe", "created_and_root_removed"),
-            "writeability": lambda observation: runner_ancestor(
-                observation
-            ).__setitem__("runner_writable", False),
-            "searchability": lambda observation: runner_ancestor(
-                observation
-            ).__setitem__("runner_searchable", False),
-            "target": lambda observation: runner_ancestor(observation).__setitem__(
-                "canonical_target", UNREVIEWED_METADATA_TARGET
             ),
         }
         for label, mutate in mutations.items():
@@ -1365,47 +1024,10 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_accepts_only_reviewed_source_known_transition(self):
-        observation, support, transitions = fixture()
-        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
-        self.assertEqual(
-            classify(observation, support, transitions),
-            {
-                "run_bundle": False,
-                "classification": "source_known_bundle_old_sudo_policy",
-            },
-        )
-
-    def test_empty_transition_set_cannot_skip_activation(self):
-        observation, support, transitions = fixture()
-        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
-        transitions["transitions"] = []
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-    def test_rejects_unknown_digest_and_other_drift(self):
-        observation, support, transitions = fixture()
-        self.observed_source(observation, "sudoers")["sha256"] = FIXTURE_UNKNOWN_DIGEST
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-        observation, support, transitions = fixture()
-        observation["host"]["runner_groups"] = ["runner"]
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        socket = observation["container_runtime"]["sockets"][0]
-        observation["container_runtime"]["sockets"][0] = {
-            "path": socket["path"],
-            "present": False,
-        }
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
     def test_refreshed_bundle_runs_on_transition_digest(self):
         observation, support, transitions = fixture()
-        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
-        self.accepted_source(support, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
+        self.accepted_source(support)["sha256"] = FIXTURE_TRANSITION_DIGEST
         self.assertEqual(
             classify(observation, support, transitions)["classification"],
             "bundle_compatible",
@@ -1473,28 +1095,6 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema3_enforces_test_but_not_the_synthetic_probe_result(self):
-        observation, support, transitions = fixture()
-        test_index = next(
-            index
-            for index, item in enumerate(observation["required_paths"])
-            if item["path"] == "/usr/bin/test"
-        )
-        observation["required_paths"][test_index] = {
-            "path": "/usr/bin/test",
-            "present": False,
-            "executable": False,
-            "runner_executable": False,
-        }
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        observation["permission_ancestor_directories"][0][
-            "synthetic_create_delete_probe"
-        ] = "unavailable"
-        self.assertEqual(classify(observation, support, transitions)["run_bundle"], True)
-
     def test_schema3_local_control_projection_matches_the_rust_boundary(self):
         observation, support, _ = fixture()
         inventory = support["data"]["hosted_runner_fingerprint"]["accepted"][
@@ -1557,72 +1157,6 @@ class ClassificationTests(unittest.TestCase):
                 mutate(observation)
                 with self.assertRaises(ValueError):
                     validate_schema4_observation(observation)
-
-    def test_schema4_public_drift_classifications_are_valid_but_incompatible(self):
-        def set_sudo_source(observation):
-            source = self.observed_source(observation)
-            source["name"] = public_sudo_source_name("private-project-policy")
-            source["canonical_target"] = UNREVIEWED_SUDO_SOURCE_TARGET
-
-        mutations = {
-            "OS identity": lambda observation: observation["host"].update(
-                {
-                    "os_id": UNREVIEWED_OS_ID,
-                    "os_version_id": UNREVIEWED_OS_VERSION_ID,
-                    "architecture": UNREVIEWED_ARCHITECTURE,
-                }
-            ),
-            "runner principal": lambda observation: observation["host"].__setitem__(
-                "runner_principal", UNREVIEWED_RUNNER_PRINCIPAL
-            ),
-            "fixed canonical target": lambda observation: observation[
-                "required_paths"
-            ][0].__setitem__("canonical_target", UNREVIEWED_METADATA_TARGET),
-            "resolver target": lambda observation: observation[
-                "resolver"
-            ].__setitem__("canonical_target", UNREVIEWED_RESOLVER_TARGET),
-            "runner group": lambda observation: observation["host"].__setitem__(
-                "runner_groups",
-                sorted([public_runner_group_name("private-project-group")]),
-            ),
-            "systemd state": lambda observation: observation["systemd"]["units"][
-                0
-            ].__setitem__("load_state", UNREVIEWED_UNIT_STATE),
-            "sudo source": set_sudo_source,
-            "socket owner": lambda observation: observation["container_runtime"][
-                "sockets"
-            ][0].__setitem__("owner", UNREVIEWED_SOCKET_OWNER),
-        }
-        for label, mutate in mutations.items():
-            with self.subTest(label=label):
-                observation, support, transitions = fixture()
-                mutate(observation)
-                validate_schema4_observation(observation)
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
-
-    def test_schema3_rejects_local_control_inventory_drift(self):
-        observation, support, transitions = fixture()
-        observation["local_control_inventory"]["snapshot"]["tcp_listeners"] = [
-            {
-                "family": "ipv4",
-                "bind_class": "loopback",
-                "port": 8080,
-                "owners": [
-                    {
-                        "uid": 0,
-                        "executable_basename": "systemd",
-                        "canonical_executable": "/usr/lib/systemd/systemd",
-                        "unified_cgroup": "/init.scope",
-                        "processes": 1,
-                    }
-                ],
-                "ownership_complete": True,
-                "instances": 1,
-            }
-        ]
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
 
     def test_schema3_requires_stable_complete_local_control_inventory(self):
         def unavailable(inventory):
@@ -1751,119 +1285,6 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_schema3_enforces_trusted_executable_metadata_and_access(self):
-        def mutate(field, value):
-            observation, support, transitions = fixture()
-            executable = next(
-                item
-                for item in observation["required_paths"]
-                if item["path"] == "/usr/bin/sudo"
-            )
-            executable[field] = value
-            with self.assertRaises(ClassificationError):
-                classify(observation, support, transitions)
-
-        for field, value in {
-            "canonical_target": UNREVIEWED_METADATA_TARGET,
-            "path_type": "directory",
-            "target_type": "directory",
-            "owner_class": "other",
-            "group_class": "other",
-            "mode": "0755",
-            "runner_writable": True,
-            "executable": False,
-            "runner_executable": False,
-        }.items():
-            with self.subTest(field=field):
-                mutate(field, value)
-
-        observation, support, transitions = fixture()
-        executable = observation["required_paths"][0]
-        executable.update({"device": 99, "inode": 100})
-        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_schema3_enforces_permission_ancestor_metadata_and_access(self):
-        for field, value in {
-            "canonical_target": UNREVIEWED_METADATA_TARGET,
-            "path_type": "regular",
-            "target_type": "regular",
-            "owner_class": "other",
-            "group_class": "other",
-            "mode": "0700",
-            "runner_writable": True,
-            "runner_searchable": False,
-        }.items():
-            with self.subTest(field=field):
-                observation, support, transitions = fixture()
-                ancestor = next(
-                    item
-                    for item in observation["permission_ancestor_directories"]
-                    if item["path"] == "/usr/bin"
-                )
-                ancestor[field] = value
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        ancestor = observation["permission_ancestor_directories"][0]
-        ancestor.update(
-            {
-                "device": 99,
-                "inode": 100,
-                "synthetic_create_delete_probe": "unavailable",
-            }
-        )
-        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_schema3_enforces_resolver_and_sudo_metadata(self):
-        for field, value in {
-            "is_symlink": False,
-            "canonical_target": UNREVIEWED_RESOLVER_TARGET,
-            "target_type": "unexpected_type",
-            "target_mode": "0600",
-        }.items():
-            with self.subTest(surface="resolver", field=field):
-                observation, support, transitions = fixture()
-                observation["resolver"][field] = value
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
-
-        for field, value in {
-            "target_type": "other",
-            "owner_class": "other",
-            "group_class": "other",
-            "mode": "0440",
-            "runner_writable": True,
-            "runner_nopasswd_markers": [],
-        }.items():
-            with self.subTest(surface="sudo", field=field):
-                observation, support, transitions = fixture()
-                self.observed_source(observation)[field] = value
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        self.observed_source(observation).update({"device": 99, "inode": 100})
-        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_schema3_enforces_units_sockets_and_workload_count(self):
-        observation, support, transitions = fixture()
-        observation["systemd"]["units"][0]["load_state"] = UNREVIEWED_UNIT_STATE
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        observation["container_runtime"]["sockets"][0][
-            "owner"
-        ] = UNREVIEWED_SOCKET_OWNER
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-        observation, support, transitions = fixture()
-        observation["container_runtime"]["docker_running_workload_count"] = 1
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
     def test_schema4_azure_identity_remains_validated_observation_evidence(self):
         observation, support, transitions = fixture()
         azure_unit = next(
@@ -1877,57 +1298,6 @@ class ClassificationTests(unittest.TestCase):
         agent["processes"][0]["executable_device"] = 99
         validate_schema4_observation(observation)
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
-
-    def test_schema3_rejects_each_local_control_inventory_class_of_drift(self):
-        mutations = {
-            "container multiplicity": lambda snapshot: snapshot[
-                "root_container_processes"
-            ][0].__setitem__("instances", 2),
-            "TCP endpoint": lambda snapshot: snapshot["tcp_listeners"][0].__setitem__(
-                "port", 23
-            ),
-            "Unix identity": lambda snapshot: snapshot["unix_listeners"][0].__setitem__(
-                "name_sha256", "0" * 64
-            ),
-            "owner multiplicity": lambda snapshot: snapshot["unix_listeners"][0][
-                "owners"
-            ][0].__setitem__("processes", 2),
-            "pre-lockdown reduction": lambda snapshot: snapshot[
-                "root_container_processes"
-            ].pop(),
-        }
-        for label, mutate in mutations.items():
-            with self.subTest(label=label):
-                observation, support, transitions = fixture()
-                mutate(observation["local_control_inventory"]["snapshot"])
-                validate_schema4_observation(observation)
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
-
-    def test_schema3_rejects_added_removed_and_unowned_local_control_endpoints(self):
-        def add_endpoint(snapshot):
-            listener = json.loads(json.dumps(snapshot["unix_listeners"][-1]))
-            listener["name_sha256"] = "f" * 64
-            snapshot["unix_listeners"].append(listener)
-
-        def remove_endpoint(snapshot):
-            snapshot["unix_listeners"].pop()
-
-        def make_endpoint_unowned(snapshot):
-            snapshot["unix_listeners"][0]["owners"] = []
-            snapshot["unix_listeners"][0]["ownership_complete"] = False
-            snapshot["ownership_complete"] = False
-
-        for label, mutate in {
-            "added": add_endpoint,
-            "removed": remove_endpoint,
-            "unowned": make_endpoint_unowned,
-        }.items():
-            with self.subTest(label=label):
-                observation, support, transitions = fixture()
-                mutate(observation["local_control_inventory"]["snapshot"])
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
 
     def test_schema3_ignores_only_bounded_inaccessible_listener_count(self):
         for count in (0, 15):
@@ -1982,31 +1352,6 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_all_digest_mismatches_must_have_exact_transitions(self):
-        observation, support, transitions = fixture()
-        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
-        self.observed_source(observation, "sudoers")["sha256"] = "7" * 64
-        transitions["transitions"].append(
-            {
-                "path_class": "main_policy",
-                "name": "sudoers",
-                "sha256": "7" * 64,
-            }
-        )
-        self.assertFalse(classify(observation, support, transitions)["run_bundle"])
-
-        transitions["transitions"].pop()
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-    def test_transition_cannot_mask_non_digest_drift(self):
-        observation, support, transitions = fixture()
-        self.observed_source(observation, "90-cloud-init-users")["sha256"] = FIXTURE_TRANSITION_DIGEST
-        observation["required_paths"][0]["mode"] = "0700"
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
-
-
 def load_json(path):
     return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 
@@ -2015,27 +1360,23 @@ def main(arguments):
     if arguments == ["--self-test"]:
         program = unittest.main(argv=[sys.argv[0]], exit=False)
         return 0 if program.result.wasSuccessful() else 1
-    if len(arguments) != 5:
+    if len(arguments) != 4:
         raise SystemExit(
-            "usage: action_bundle_host.py <observation> <bundle-support> <transitions> <github-output> <mode>"
+            "usage: action_bundle_host.py <observation> <bundle-support> <transitions> <github-output>"
         )
-    observation_path, support_path, transitions_path, output_path, mode = arguments
+    observation_path, support_path, transitions_path, output_path = arguments
     try:
         result = classify(
             load_json(observation_path),
             load_json(support_path),
             load_json(transitions_path),
-            mode,
         )
     except (ClassificationError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise SystemExit(f"Action bundle host classification failed: {error}") from error
     with pathlib.Path(output_path).open("a", encoding="utf-8") as output:
         output.write(f"run_bundle={'true' if result['run_bundle'] else 'false'}\n")
         output.write(f"classification={result['classification']}\n")
-    if result["run_bundle"]:
-        print("bundled Action host fingerprint is compatible")
-    else:
-        print("bundled Action activation skipped: source-known host fingerprint postdates bundle")
+    print("bundled Action host observation is compatible")
     return 0
 
 

@@ -39,21 +39,6 @@ const CHILD_ENV = {
   LC_ALL: "C.UTF-8",
   PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
 };
-const HOST_FINGERPRINT_MISMATCHES: Readonly<Record<string, string>> = Object.freeze({
-  host_identity: "the operating system or architecture is not supported",
-  runner_identity: "the expected runner account could not be verified",
-  runner_groups: "the runner account has unexpected group access",
-  trusted_executables: "a required system executable could not be trusted",
-  sudo_policy: "the runner's sudo policy is not supported",
-  sudo_access: "the runner's sudo access could not be verified",
-  container_services: "a container service has an unexpected state",
-  container_sockets: "a container socket has unexpected access",
-  container_workloads: "a container workload is already running",
-  local_control: "a privileged local service could not be verified",
-  resolver_configuration: "the system DNS resolver could not be verified",
-  observation_unavailable: "required runner security information is unavailable",
-  unstable_observation: "runner security information changed during verification",
-});
 
 let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
@@ -178,9 +163,7 @@ function terminalServiceStatus(output: string): string | undefined {
     .join("; ");
 }
 
-type FenceResidentError = { code: string; category?: string };
-
-function fenceErrorFromJournal(output: string): FenceResidentError | undefined {
+function fenceErrorCodeFromJournal(output: string): string | undefined {
   for (const line of output.split(/\r?\n/).reverse()) {
     if (line.length === 0 || line.length > 4096) {
       continue;
@@ -195,64 +178,13 @@ function fenceErrorFromJournal(output: string): FenceResidentError | undefined {
         typeof code === "string" &&
         /^[a-z][a-z0-9_]{0,63}$/.test(code)
       ) {
-        const category = document.error.field;
-        if (
-          code === "unsupported_host_fingerprint" &&
-          typeof category === "string" &&
-          Object.prototype.hasOwnProperty.call(HOST_FINGERPRINT_MISMATCHES, category)
-        ) {
-          return { code, category };
-        }
-        return { code };
+        return code;
       }
     } catch {
       // Unit journals also contain systemd messages; only exact Fence JSON is accepted.
     }
   }
   return undefined;
-}
-
-function fenceErrorCodeFromJournal(output: string): string | undefined {
-  return fenceErrorFromJournal(output)?.code;
-}
-
-function validatedImageVersion(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const match = /^(\d{4})(\d{2})(\d{2})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,3})$/.exec(value);
-  if (!match) {
-    return undefined;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  if (
-    year < 2000 ||
-    date.getUTCFullYear() !== year ||
-    date.getUTCMonth() + 1 !== month ||
-    date.getUTCDate() !== day
-  ) {
-    return undefined;
-  }
-  return value;
-}
-
-function hostDiagnosticLine(error: FenceResidentError, imageVersion?: unknown): string | undefined {
-  if (error.code !== "unsupported_host_fingerprint" || !error.category) {
-    return undefined;
-  }
-  if (!Object.prototype.hasOwnProperty.call(HOST_FINGERPRINT_MISMATCHES, error.category)) {
-    return undefined;
-  }
-  const version = validatedImageVersion(imageVersion);
-  return `FENCE_HOST_DIAGNOSTIC_JSON=${JSON.stringify({
-    schema_version: 1,
-    code: error.code,
-    category: error.category,
-    ...(version ? { image_version: version } : {}),
-  })}`;
 }
 
 function captureServiceStatus(unit: string): ReturnType<typeof capture> {
@@ -295,18 +227,9 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
     "--output",
     "cat",
   ]);
-  const error = fenceErrorFromJournal(journal.stdout);
-  if (error !== undefined) {
-    log.warning(`Fence resident error code: ${error.code}`);
-    if (error.category) {
-      const imageVersion = validatedImageVersion(process.env.ImageVersion);
-      const runner = imageVersion ? `runner image ${imageVersion}` : "this runner";
-      log.warning(`Fence rejected ${runner} because ${HOST_FINGERPRINT_MISMATCHES[error.category]}`);
-      const diagnostic = hostDiagnosticLine(error, process.env.ImageVersion);
-      if (diagnostic) {
-        log.info(diagnostic);
-      }
-    }
+  const errorCode = fenceErrorCodeFromJournal(journal.stdout);
+  if (errorCode !== undefined) {
+    log.warning(`Fence resident error code: ${errorCode}`);
   }
   log.debugGroup("Fence debug: service journal", [
     `unit=${paths.unit}`,
@@ -709,13 +632,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = {
-  fenceErrorCodeFromJournal,
-  fenceErrorFromJournal,
-  hostDiagnosticLine,
-  main,
-  residentServiceArgs,
-  run,
-  terminalServiceStatus,
-  validatedImageVersion,
-};
+module.exports = { fenceErrorCodeFromJournal, main, residentServiceArgs, run, terminalServiceStatus };

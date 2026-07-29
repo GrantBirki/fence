@@ -430,8 +430,8 @@ fn normalize_reviewed_host_ancestors() -> Result<(), TrustedExecutableError> {
         return Err(TrustedExecutableError::unavailable());
     }
 
-    let etc = open_reviewed_child_directory(&root.descriptor, "etc", REVIEWED_HOST_ANCESTORS[0])?;
-    let usr = open_reviewed_child_directory(&root.descriptor, "usr", REVIEWED_HOST_ANCESTORS[1])?;
+    let etc = open_reviewed_directory(REVIEWED_HOST_ANCESTORS[0])?;
+    let usr = open_reviewed_directory(REVIEWED_HOST_ANCESTORS[1])?;
     let (passwd_descriptor, passwd) = read_reviewed_host_file(&etc.descriptor, "passwd")?;
     let runner = reviewed_runner_identity(&passwd)?;
     verify_reviewed_host_image(&usr.descriptor)?;
@@ -490,43 +490,6 @@ fn open_reviewed_directory(
     }
     Ok(ReviewedHostDirectory {
         path,
-        descriptor,
-        metadata,
-    })
-}
-
-fn open_reviewed_child_directory(
-    parent: &File,
-    name: &'static str,
-    expected_path: &'static str,
-) -> Result<ReviewedHostDirectory, TrustedExecutableError> {
-    if !matches!(name, "etc" | "usr")
-        || !REVIEWED_HOST_ANCESTORS.contains(&expected_path)
-        || Path::new(expected_path).parent() != Some(Path::new("/"))
-    {
-        return Err(TrustedExecutableError::unavailable());
-    }
-    let descriptor_path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
-    let descriptor = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
-        .open(&descriptor_path)
-        .map_err(|_| TrustedExecutableError::unavailable())?;
-    let metadata = descriptor
-        .metadata()
-        .map_err(|_| TrustedExecutableError::unavailable())?;
-    let current =
-        fs::symlink_metadata(expected_path).map_err(|_| TrustedExecutableError::unavailable())?;
-    if !metadata.file_type().is_dir()
-        || !current.file_type().is_dir()
-        || fs::canonicalize(expected_path).ok().as_deref() != Some(Path::new(expected_path))
-        || metadata.dev() != current.dev()
-        || metadata.ino() != current.ino()
-    {
-        return Err(TrustedExecutableError::unavailable());
-    }
-    Ok(ReviewedHostDirectory {
-        path: expected_path,
         descriptor,
         metadata,
     })

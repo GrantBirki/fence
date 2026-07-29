@@ -1,14 +1,11 @@
 use crate::hosted_runner::{
-    AcceptedHostedRunnerFactsV3, AcceptedPermissionAncestorV2, AcceptedSudoPolicySourceV3,
-    AcceptedTrustedExecutableV2, SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-    SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1, hosted_runner_fingerprint_requirement,
+    AcceptedHostedRunnerFactsV3, AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
+    hosted_runner_fingerprint_requirement,
 };
 use crate::lifecycle::validate_test_service_context;
 use crate::local_control::{
     NoCurrentFenceOwner, OBSERVATION_TIMEOUT, SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess,
-    accepted_local_control_snapshot, observe_dynamic_local_control_inventory,
-    observe_local_control_inventory, verify_complete_dynamic_local_control_observation,
-    verify_local_control_observation,
+    observe_local_control_inventory, verify_reviewed_local_control_observation,
 };
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
@@ -19,8 +16,8 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -31,15 +28,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTAINER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_POLICY_SOURCE_BYTES: u64 = 256 * 1024;
-const MAX_AUDIT_SUDO_POLICY_SOURCES: usize = 64;
+const MAX_SUDO_POLICY_SOURCES: usize = 64;
 const SUDOERS_PATH: &str = "/etc/sudoers";
 const SUDOERS_DROP_IN_ROOT: &str = "/etc/sudoers.d";
 const RUNNER_DROP_IN_PATH: &str = "/etc/sudoers.d/runner";
-const CLOUD_INIT_SUDO_HEADER_PREFIX: &[u8] = b"# Created by cloud-init v. ";
-const CLOUD_INIT_SUDO_BODY_HASH_DOMAIN: &[u8] = b"fence-cloud-init-sudo-body-v1";
 const RESTORED_SUDO_VISUDO_ARGUMENTS: [&str; 3] = ["--check", "--file", SUDOERS_PATH];
 const RUNNER_SUDO_VALIDATION_ARGUMENTS: [&str; 3] =
     ["--non-interactive", "--reset-timestamp", "--validate"];
+const RUNNER_SUDO_POLICY_LIST_ARGUMENTS: [&str; 4] =
+    ["--non-interactive", "--list", "--other-user", "runner"];
 const CONTAINER_UNITS: [&str; 3] = ["docker.socket", "docker.service", "containerd.service"];
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -143,7 +140,6 @@ impl RunnerAccessProbe {
 enum RunnerProbeTarget<'a> {
     TrustedExecutable(&'a AcceptedTrustedExecutableV2),
     PermissionAncestor(&'a AcceptedPermissionAncestorV2),
-    SudoPolicySource(&'a AcceptedSudoPolicySourceV3),
 }
 
 impl RunnerProbeTarget<'_> {
@@ -151,7 +147,6 @@ impl RunnerProbeTarget<'_> {
         match self {
             Self::TrustedExecutable(expected) => expected.path,
             Self::PermissionAncestor(expected) => expected.path,
-            Self::SudoPolicySource(expected) => expected.canonical_target,
         }
     }
 
@@ -171,10 +166,6 @@ impl RunnerProbeTarget<'_> {
                 ReviewedPathKind::Directory,
             )
             .map(RunnerProbeIdentity::Path),
-            Self::SudoPolicySource(expected) => {
-                verify_policy_source(Path::new(expected.canonical_target), expected)
-                    .map(RunnerProbeIdentity::PolicySource)
-            }
         }
     }
 }
@@ -188,7 +179,6 @@ struct RunnerAccessProbeSpec<'a> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum RunnerProbeIdentity {
     Path(ReviewedPathIdentity),
-    PolicySource(SudoPolicySourcePin),
 }
 
 #[derive(Debug, Serialize)]
@@ -378,7 +368,6 @@ enum SudoRollbackState {
 
 pub struct SystemLockdownControl {
     executables: Arc<TrustedExecutableSet>,
-    posture: LockdownPosture,
     sudo_rollback: SudoRollbackState,
     sudo_source_pins: Option<Vec<SudoPolicySourcePin>>,
     containers_masked: bool,
@@ -386,16 +375,8 @@ pub struct SystemLockdownControl {
 
 impl SystemLockdownControl {
     pub(crate) fn new(executables: Arc<TrustedExecutableSet>) -> Self {
-        Self::new_for_posture(executables, LockdownPosture::StandardBlock)
-    }
-
-    pub(crate) fn new_for_posture(
-        executables: Arc<TrustedExecutableSet>,
-        posture: LockdownPosture,
-    ) -> Self {
         Self {
             executables,
-            posture,
             sudo_rollback: SudoRollbackState::Unchanged,
             sudo_source_pins: None,
             containers_masked: false,
@@ -408,13 +389,8 @@ impl LockdownControl for SystemLockdownControl {
         let executables = &self.executables;
         executables
             .verify_all()
-            .map_err(|_| unsupported_fingerprint_category("trusted_executables"))?;
-        self.sudo_source_pins = Some(match self.posture {
-            LockdownPosture::Audit => verify_audit_fingerprint(executables)?,
-            LockdownPosture::StandardBlock | LockdownPosture::UnsafePreserve => {
-                verify_fixed_fingerprint(executables)?
-            }
-        });
+            .map_err(|_| unsupported_fingerprint())?;
+        self.sudo_source_pins = Some(verify_host_capabilities(executables)?);
         Ok(())
     }
 
@@ -422,14 +398,18 @@ impl LockdownControl for SystemLockdownControl {
         let executables = &self.executables;
         executables
             .verify_all()
-            .map_err(|_| unsupported_fingerprint_category("trusted_executables"))?;
-        if self.posture == LockdownPosture::Audit {
-            self.verify_audit_sudo_baseline()?;
-        }
-        if runner_sudo_validate(executables)?.status.success() {
-            if self.posture == LockdownPosture::Audit {
-                self.verify_audit_sudo_baseline()?;
-            }
+            .map_err(|_| unsupported_fingerprint())?;
+        self.verify_sudo_baseline()?;
+        let sudo_available = runner_sudo_validate(executables)?.status.success();
+        let root_can_list_policy = fixed_command(
+            executables,
+            TrustedExecutable::Sudo,
+            &RUNNER_SUDO_POLICY_LIST_ARGUMENTS,
+        )?
+        .status
+        .success();
+        self.verify_sudo_baseline()?;
+        if sudo_available && root_can_list_policy {
             Ok(())
         } else {
             Err(LockdownError::new(
@@ -511,13 +491,19 @@ impl LockdownControl for SystemLockdownControl {
             .sudo_source_pins
             .as_deref()
             .ok_or_else(unsupported_fingerprint)?;
-        verify_locked_sudo_sources(source_pins)?;
+        verify_locked_sudo_sources(executables, source_pins)?;
         let sudo_available = runner_sudo_validate(executables)?.status.success();
-        verify_locked_sudo_sources(source_pins)?;
-        if sudo_available {
+        let policy_listing = fixed_command(
+            executables,
+            TrustedExecutable::Sudo,
+            &RUNNER_SUDO_POLICY_LIST_ARGUMENTS,
+        )?
+        .status;
+        verify_locked_sudo_sources(executables, source_pins)?;
+        if !sudo_privileges_disabled(sudo_available, policy_listing.code()) {
             Err(LockdownError::new(
                 "sudo_lockdown_failed",
-                "runner passwordless sudo remains usable after lockdown",
+                "runner retains sudo privileges after lockdown",
             ))
         } else {
             Ok(())
@@ -578,16 +564,16 @@ impl LockdownControl for SystemLockdownControl {
 }
 
 impl SystemLockdownControl {
-    fn verify_audit_sudo_baseline(&self) -> Result<(), LockdownError> {
+    fn verify_sudo_baseline(&self) -> Result<(), LockdownError> {
         let expected = self
             .sudo_source_pins
             .as_deref()
-            .ok_or_else(|| unsupported_fingerprint_category("sudo_policy"))?;
-        let observed = capture_audit_sudo_sources(&self.executables)?;
+            .ok_or_else(unsupported_fingerprint)?;
+        let observed = capture_sudo_sources(&self.executables)?;
         if observed == expected {
             Ok(())
         } else {
-            Err(unsupported_fingerprint_category("sudo_policy"))
+            Err(unsupported_fingerprint())
         }
     }
 }
@@ -700,9 +686,9 @@ pub fn run_lockdown_test_service(
     );
     validate_test_service_context(unit_name, &executables)
         .map_err(|error| LockdownError::new(error.code, error.message))?;
-    verify_test_local_control_inventory(&executables, posture)?;
+    verify_test_local_control_inventory(&executables)?;
     let runtime = TestRuntimeStore::create(runtime_root, invocation_id)?;
-    let control = SystemLockdownControl::new_for_posture(executables, posture);
+    let control = SystemLockdownControl::new(executables);
     LockdownSession::establish_test_only(runtime, posture, control, inject_pre_ready_failure)
         .map(|session| session.evidence)
 }
@@ -731,7 +717,6 @@ pub fn run_lockdown_acl_rejection_test_service(
 
 fn verify_test_local_control_inventory(
     executables: &TrustedExecutableSet,
-    posture: LockdownPosture,
 ) -> Result<(), LockdownError> {
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     let socket_access = SystemUnixSocketAccess::new(|path: &OsStr| {
@@ -743,34 +728,22 @@ fn verify_test_local_control_inventory(
             runner_path_writable(executables, path, timeout).ok()
         }
     });
-    if posture == LockdownPosture::Audit {
-        let observed = observe_dynamic_local_control_inventory(
-            Path::new("/proc"),
-            &socket_access,
-            &NoCurrentFenceOwner,
-        );
-        return verify_complete_dynamic_local_control_observation(&observed)
-            .map_err(|error| LockdownError::new(error.code, error.message));
-    }
-    let accepted = accepted_local_control_snapshot(
+    let observed =
+        observe_local_control_inventory(Path::new("/proc"), &socket_access, &NoCurrentFenceOwner);
+    verify_reviewed_local_control_observation(
         &hosted_runner_fingerprint_requirement()
             .accepted
             .local_control_inventory,
+        &observed,
     )
-    .map_err(|error| LockdownError::new(error.code, error.message))?;
-    let observed =
-        observe_local_control_inventory(Path::new("/proc"), &socket_access, &NoCurrentFenceOwner);
-    verify_local_control_observation(&accepted, &observed)
-        .map_err(|error| LockdownError::new(error.code, error.message))
+    .map_err(|error| LockdownError::new(error.code, error.message))
 }
 
 fn runner_access_probe_plan(
     accepted: &AcceptedHostedRunnerFactsV3,
 ) -> Vec<RunnerAccessProbeSpec<'_>> {
     let mut plan = Vec::with_capacity(
-        accepted.trusted_executables.len() * 2
-            + accepted.permission_ancestor_directories.len() * 2
-            + accepted.sudo_policy_sources.len(),
+        accepted.trusted_executables.len() * 2 + accepted.permission_ancestor_directories.len() * 2,
     );
     for executable in &accepted.trusted_executables {
         let target = RunnerProbeTarget::TrustedExecutable(executable);
@@ -798,12 +771,6 @@ fn runner_access_probe_plan(
             },
         });
     }
-    for source in &accepted.sudo_policy_sources {
-        plan.push(RunnerAccessProbeSpec {
-            target: RunnerProbeTarget::SudoPolicySource(source),
-            probe: RunnerAccessProbe::NotWritable,
-        });
-    }
     plan
 }
 
@@ -823,9 +790,8 @@ fn collect_runner_probe_baselines<'a>(
             baselines.insert(path, observed);
         }
     }
-    let expected_target_count = accepted.trusted_executables.len()
-        + accepted.permission_ancestor_directories.len()
-        + accepted.sudo_policy_sources.len();
+    let expected_target_count =
+        accepted.trusted_executables.len() + accepted.permission_ancestor_directories.len();
     if baselines.len() != expected_target_count {
         return Err(unsupported_fingerprint());
     }
@@ -928,82 +894,18 @@ fn parse_reviewed_mode(value: &str) -> Result<u32, LockdownError> {
     Ok(mode)
 }
 
-fn verify_fixed_fingerprint(
-    executables: &TrustedExecutableSet,
-) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
-    let accepted = hosted_runner_fingerprint_requirement().accepted;
-    verify_host_identity(&accepted)?;
-    executables
-        .verify_all()
-        .map_err(|_| unsupported_fingerprint_category("trusted_executables"))?;
-    verify_runner_identity(executables, &accepted)?;
-    let groups = fixed_command(
-        executables,
-        TrustedExecutable::Id,
-        &["--groups", "--name", accepted.expected_principal],
-    )
-    .map_err(|error| categorize_unsupported(error, "runner_groups"))?;
-    if !groups.status.success() {
-        return Err(unsupported_fingerprint_category("runner_groups"));
-    }
-    let groups_text = String::from_utf8_lossy(&groups.stdout);
-    let observed_groups = groups_text.split_whitespace().collect::<BTreeSet<_>>();
-    if observed_groups
-        != accepted
-            .required_runner_groups
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-    {
-        return Err(unsupported_fingerprint_category("runner_groups"));
-    }
-    let sudo_source_pins = verify_sudo_sources(&accepted.sudo_policy_sources)
-        .map_err(|error| categorize_unsupported(error, "sudo_policy"))?;
-    verify_runner_access_probes(executables, &accepted)
-        .map_err(|error| categorize_unsupported(error, "sudo_access"))?;
-    executables
-        .verify_all()
-        .map_err(|_| unsupported_fingerprint_category("trusted_executables"))?;
-    if verify_sudo_sources(&accepted.sudo_policy_sources)
-        .map_err(|error| categorize_unsupported(error, "sudo_policy"))?
-        != sudo_source_pins
-    {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
-    }
-    for expected in &accepted.container_units {
-        if observe_unit(executables, expected.name)
-            .map_err(|error| categorize_unsupported(error, "container_services"))?
-            != (UnitObservation {
-                load_state: expected.load_state.to_owned(),
-                active_state: expected.active_state.to_owned(),
-                unit_file_state: expected.unit_file_state.to_owned(),
-            })
-        {
-            return Err(unsupported_fingerprint_category("container_services"));
-        }
-    }
-    verify_socket_fingerprint(executables)
-        .map_err(|error| categorize_unsupported(error, "container_sockets"))?;
-    let docker = runner_docker_ps(executables)
-        .map_err(|error| categorize_unsupported(error, "container_workloads"))?;
-    if !docker.status.success() || !docker.stdout.is_empty() {
-        return Err(unsupported_fingerprint_category("container_workloads"));
-    }
-    Ok(sudo_source_pins)
-}
-
 fn verify_host_identity(accepted: &AcceptedHostedRunnerFactsV3) -> Result<(), LockdownError> {
     if std::env::consts::ARCH != accepted.architecture {
-        return Err(unsupported_fingerprint_category("host_identity"));
+        return Err(unsupported_fingerprint());
     }
-    let os_release = fs::read_to_string("/etc/os-release")
-        .map_err(|_| unsupported_fingerprint_category("host_identity"))?;
+    let os_release =
+        fs::read_to_string("/etc/os-release").map_err(|_| unsupported_fingerprint())?;
     let expected_os_id = format!("ID={}", accepted.os_id);
     let expected_os_version = format!("VERSION_ID=\"{}\"", accepted.os_version_id);
     if !os_release.lines().any(|line| line == expected_os_id)
         || !os_release.lines().any(|line| line == expected_os_version)
     {
-        return Err(unsupported_fingerprint_category("host_identity"));
+        return Err(unsupported_fingerprint());
     }
     Ok(())
 }
@@ -1016,14 +918,12 @@ fn verify_runner_identity(
         executables,
         TrustedExecutable::Id,
         &["--user", "--name", accepted.expected_principal],
-    )
-    .map_err(|error| categorize_unsupported(error, "runner_identity"))?;
+    )?;
     let uid = fixed_command(
         executables,
         TrustedExecutable::Id,
         &["--user", accepted.expected_principal],
-    )
-    .map_err(|error| categorize_unsupported(error, "runner_identity"))?;
+    )?;
     let expected_username = format!("{}\n", accepted.expected_principal);
     let valid_uid = std::str::from_utf8(&uid.stdout)
         .ok()
@@ -1034,85 +934,86 @@ fn verify_runner_identity(
         || !uid.status.success()
         || !valid_uid
     {
-        return Err(unsupported_fingerprint_category("runner_identity"));
+        return Err(unsupported_fingerprint());
     }
     Ok(())
 }
 
-fn verify_audit_fingerprint(
+fn verify_host_capabilities(
     executables: &TrustedExecutableSet,
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
     let accepted = hosted_runner_fingerprint_requirement().accepted;
     verify_host_identity(&accepted)?;
     executables
         .verify_all()
-        .map_err(|_| unsupported_fingerprint_category("trusted_executables"))?;
+        .map_err(|_| unsupported_fingerprint())?;
     verify_runner_identity(executables, &accepted)?;
-    verify_audit_runner_access_probes(executables, &accepted)?;
-    let sudo_source_pins = capture_audit_sudo_sources(executables)?;
+    verify_reviewed_runner_groups(executables, &accepted)?;
+    verify_runner_access_probes(executables, &accepted)?;
+    let sudo_source_pins = capture_sudo_sources(executables)?;
+    if !sudo_source_pins
+        .iter()
+        .any(|pin| pin.path_class == "drop_in" && pin.name == "runner")
+    {
+        return Err(unsupported_fingerprint());
+    }
     let sudo_syntax = fixed_command(
         executables,
         TrustedExecutable::Visudo,
         &RESTORED_SUDO_VISUDO_ARGUMENTS,
-    )
-    .map_err(|error| categorize_unsupported(error, "sudo_policy"))?;
+    )?;
     if !sudo_syntax.status.success() {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
+        return Err(unsupported_fingerprint());
     }
-    if capture_audit_sudo_sources(executables)? != sudo_source_pins {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
+    if capture_sudo_sources(executables)? != sudo_source_pins {
+        return Err(unsupported_fingerprint());
     }
-    let docker = runner_docker_ps(executables)
-        .map_err(|error| categorize_unsupported(error, "container_workloads"))?;
+    let docker = runner_docker_ps(executables)?;
     if !docker.status.success() || !docker.stdout.is_empty() {
-        return Err(unsupported_fingerprint_category("container_workloads"));
+        return Err(unsupported_fingerprint());
     }
     Ok(sudo_source_pins)
 }
 
-fn verify_audit_runner_access_probes(
+fn verify_reviewed_runner_groups(
     executables: &TrustedExecutableSet,
     accepted: &AcceptedHostedRunnerFactsV3,
 ) -> Result<(), LockdownError> {
-    for spec in runner_access_probe_plan(accepted) {
-        if matches!(spec.target, RunnerProbeTarget::SudoPolicySource(_)) {
-            continue;
-        }
-        let baseline = spec
-            .target
-            .observe()
-            .map_err(|error| categorize_unsupported(error, "trusted_executables"))?;
-        verify_identity_bound_probe(
-            &baseline,
-            || spec.target.observe(),
-            |probe| run_runner_access_probe(executables, probe, spec.target.path()),
-            spec.probe,
-        )
-        .map_err(|error| categorize_unsupported(error, "trusted_executables"))?;
+    let groups = fixed_command(
+        executables,
+        TrustedExecutable::Id,
+        &["--groups", "--name", accepted.expected_principal],
+    )?;
+    if !groups.status.success() {
+        return Err(unsupported_fingerprint());
+    }
+    let groups_text = std::str::from_utf8(&groups.stdout).map_err(|_| unsupported_fingerprint())?;
+    let observed = groups_text.split_whitespace().collect::<BTreeSet<_>>();
+    let reviewed = accepted
+        .required_runner_groups
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if !observed.contains("runner")
+        || !observed.contains("docker")
+        || !observed.is_subset(&reviewed)
+    {
+        return Err(unsupported_fingerprint());
     }
     Ok(())
 }
 
-fn verify_sudo_sources(
-    expected: &[AcceptedSudoPolicySourceV3],
-) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
-    verify_sudo_sources_with_runner_state(expected, true)
-}
-
-fn capture_audit_sudo_sources(
+fn capture_sudo_sources(
     executables: &TrustedExecutableSet,
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
-    capture_audit_sudo_sources_at(
+    capture_sudo_sources_at(
         Path::new(SUDOERS_PATH),
         Path::new(SUDOERS_DROP_IN_ROOT),
-        |path| {
-            run_runner_access_probe(executables, RunnerAccessProbe::NotWritable, path)
-                .map_err(|error| categorize_unsupported(error, "sudo_access"))
-        },
+        |path| run_runner_access_probe(executables, RunnerAccessProbe::NotWritable, path),
     )
 }
 
-fn capture_audit_sudo_sources_at<Probe>(
+fn capture_sudo_sources_at<Probe>(
     main_policy: &Path,
     drop_in_root: &Path,
     mut runner_cannot_write: Probe,
@@ -1120,32 +1021,27 @@ fn capture_audit_sudo_sources_at<Probe>(
 where
     Probe: FnMut(&str) -> Result<bool, LockdownError>,
 {
-    let root = fs::symlink_metadata(drop_in_root)
-        .map_err(|_| unsupported_fingerprint_category("sudo_policy"))?;
+    let root = fs::symlink_metadata(drop_in_root).map_err(|_| unsupported_fingerprint())?;
     if !root.file_type().is_dir()
         || root.uid() != 0
         || root.gid() != 0
         || root.permissions().mode() & 0o022 != 0
         || fs::canonicalize(drop_in_root).ok().as_deref() != Some(drop_in_root)
     {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
+        return Err(unsupported_fingerprint());
     }
-    let root_path = drop_in_root
-        .to_str()
-        .ok_or_else(|| unsupported_fingerprint_category("sudo_policy"))?;
+    let root_path = drop_in_root.to_str().ok_or_else(unsupported_fingerprint)?;
     if !runner_cannot_write(root_path)? {
-        return Err(unsupported_fingerprint_category("sudo_access"));
+        return Err(unsupported_fingerprint());
     }
 
     let mut paths = Vec::new();
-    for entry in
-        fs::read_dir(drop_in_root).map_err(|_| unsupported_fingerprint_category("sudo_policy"))?
-    {
-        let entry = entry.map_err(|_| unsupported_fingerprint_category("sudo_policy"))?;
+    for entry in fs::read_dir(drop_in_root).map_err(|_| unsupported_fingerprint())? {
+        let entry = entry.map_err(|_| unsupported_fingerprint())?;
         let name = entry
             .file_name()
             .into_string()
-            .map_err(|_| unsupported_fingerprint_category("sudo_policy"))?;
+            .map_err(|_| unsupported_fingerprint())?;
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -1155,11 +1051,11 @@ where
                 .file_type()
                 .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
         {
-            return Err(unsupported_fingerprint_category("sudo_policy"));
+            return Err(unsupported_fingerprint());
         }
         paths.push((name, entry.path()));
-        if paths.len() >= MAX_AUDIT_SUDO_POLICY_SOURCES {
-            return Err(unsupported_fingerprint_category("sudo_policy"));
+        if paths.len() >= MAX_SUDO_POLICY_SOURCES {
+            return Err(unsupported_fingerprint());
         }
     }
     paths.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1191,8 +1087,7 @@ where
             &mut runner_cannot_write,
         )?);
     }
-    let final_root = fs::symlink_metadata(drop_in_root)
-        .map_err(|_| unsupported_fingerprint_category("sudo_policy"))?;
+    let final_root = fs::symlink_metadata(drop_in_root).map_err(|_| unsupported_fingerprint())?;
     if !final_root.file_type().is_dir()
         || final_root.uid() != root.uid()
         || final_root.gid() != root.gid()
@@ -1200,7 +1095,7 @@ where
         || final_root.dev() != root.dev()
         || final_root.ino() != root.ino()
     {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
+        return Err(unsupported_fingerprint());
     }
     Ok(pins)
 }
@@ -1215,19 +1110,18 @@ fn capture_dynamic_sudo_policy_source<Probe>(
 where
     Probe: FnMut(&str) -> Result<bool, LockdownError>,
 {
-    let (bytes, metadata) = read_bounded_policy_file_with_metadata(path)
-        .map_err(|error| categorize_unsupported(error, "sudo_policy"))?;
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| unsupported_fingerprint_category("sudo_policy"))?;
+    let (bytes, metadata) = read_bounded_policy_file_with_metadata(path)?;
+    let path_text = path.to_str().ok_or_else(unsupported_fingerprint)?;
     if fs::canonicalize(path).ok().as_deref() != Some(path)
         || !policy_source_metadata_is_safe(&metadata)
-        || !audit_sudo_includes_are_bounded(&bytes, allow_drop_in_directory_include)
+        || !sudo_includes_are_bounded(&bytes, allow_drop_in_directory_include)
+        || !sudo_authentication_defaults_are_safe(&bytes)
+        || (path_class == "drop_in" && name == "runner" && !reviewed_runner_sudo_policy(&bytes))
     {
-        return Err(unsupported_fingerprint_category("sudo_policy"));
+        return Err(unsupported_fingerprint());
     }
     if !runner_cannot_write(path_text)? {
-        return Err(unsupported_fingerprint_category("sudo_access"));
+        return Err(unsupported_fingerprint());
     }
     Ok(SudoPolicySourcePin {
         path_class,
@@ -1241,7 +1135,7 @@ where
     })
 }
 
-fn audit_sudo_includes_are_bounded(bytes: &[u8], allow_drop_in_directory_include: bool) -> bool {
+fn sudo_includes_are_bounded(bytes: &[u8], allow_drop_in_directory_include: bool) -> bool {
     if bytes.contains(&b'\\') {
         return false;
     }
@@ -1261,6 +1155,53 @@ fn audit_sudo_includes_are_bounded(bytes: &[u8], allow_drop_in_directory_include
     })
 }
 
+fn sudo_authentication_defaults_are_safe(bytes: &[u8]) -> bool {
+    bytes.split(|byte| *byte == b'\n').all(|line| {
+        let line = trim_ascii_whitespace(line);
+        if !line.starts_with(b"Defaults") {
+            return true;
+        }
+        let effective = line.split(|byte| *byte == b'#').next().unwrap_or_default();
+        [
+            "root_sudo",
+            "verifypw",
+            "listpw",
+            "rootpw",
+            "targetpw",
+            "runaspw",
+            "authenticate",
+        ]
+        .iter()
+        .all(|setting| {
+            !effective
+                .windows(setting.len())
+                .any(|window| window == setting.as_bytes())
+        })
+    })
+}
+
+fn reviewed_runner_sudo_policy(bytes: &[u8]) -> bool {
+    let mut lines = bytes
+        .split(|byte| *byte == b'\n')
+        .map(trim_ascii_whitespace)
+        .filter(|line| {
+            !(line.is_empty()
+                || line.starts_with(b"#") && line.get(1).is_none_or(|byte| !byte.is_ascii_digit()))
+        });
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    let fields = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    fields.len() == 3
+        && fields[0] == b"runner"
+        && matches!(fields[1], b"ALL=(ALL)" | b"ALL=(ALL:ALL)")
+        && fields[2] == b"NOPASSWD:ALL"
+        && lines.next().is_none()
+}
+
 fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -1271,12 +1212,12 @@ fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn verify_locked_sudo_sources(pinned: &[SudoPolicySourcePin]) -> Result<(), LockdownError> {
-    let expected = hosted_runner_fingerprint_requirement()
-        .accepted
-        .sudo_policy_sources;
+fn verify_locked_sudo_sources(
+    executables: &TrustedExecutableSet,
+    pinned: &[SudoPolicySourcePin],
+) -> Result<(), LockdownError> {
     require_policy_source_absent(Path::new(RUNNER_DROP_IN_PATH))?;
-    let observed = verify_sudo_sources_with_runner_state(&expected, false)?;
+    let observed = capture_sudo_sources(executables)?;
     if !remaining_sudo_source_pins_match(&observed, pinned) {
         return Err(unsupported_fingerprint());
     }
@@ -1290,130 +1231,6 @@ fn remaining_sudo_source_pins_match(
     observed.iter().eq(pinned
         .iter()
         .filter(|pin| pin.path_class != "drop_in" || pin.name != "runner"))
-}
-
-fn verify_sudo_sources_with_runner_state(
-    expected: &[AcceptedSudoPolicySourceV3],
-    runner_source_present: bool,
-) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
-    let expected_sources = expected
-        .iter()
-        .filter(|source| {
-            runner_source_present || source.path_class != "drop_in" || source.name != "runner"
-        })
-        .collect::<Vec<_>>();
-    let expected_drop_ins = expected_sources
-        .iter()
-        .filter(|source| source.path_class == "drop_in")
-        .map(|source| source.name)
-        .collect::<Vec<_>>();
-    verify_drop_in_inventory(Path::new(SUDOERS_DROP_IN_ROOT), &expected_drop_ins)?;
-
-    let mut observed = Vec::with_capacity(expected_sources.len());
-    for source in expected_sources {
-        let path = if source.path_class == "main_policy" {
-            PathBuf::from(SUDOERS_PATH)
-        } else {
-            Path::new(SUDOERS_DROP_IN_ROOT).join(source.name)
-        };
-        observed.push(verify_policy_source(&path, source)?);
-    }
-    Ok(observed)
-}
-
-fn verify_drop_in_inventory(root: &Path, expected: &[&str]) -> Result<(), LockdownError> {
-    let mut observed_drop_ins = Vec::new();
-    for entry in fs::read_dir(root).map_err(|_| unsupported_fingerprint())? {
-        let entry = entry.map_err(|_| unsupported_fingerprint())?;
-        if !entry
-            .file_type()
-            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
-        {
-            return Err(unsupported_fingerprint());
-        }
-        observed_drop_ins.push(
-            entry
-                .file_name()
-                .into_string()
-                .map_err(|_| unsupported_fingerprint())?,
-        );
-    }
-    observed_drop_ins.sort();
-    let mut expected_drop_ins = expected
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect::<Vec<_>>();
-    expected_drop_ins.sort();
-    if observed_drop_ins != expected_drop_ins {
-        return Err(unsupported_fingerprint());
-    }
-    Ok(())
-}
-
-fn verify_policy_source(
-    path: &Path,
-    expected: &AcceptedSudoPolicySourceV3,
-) -> Result<SudoPolicySourcePin, LockdownError> {
-    let (bytes, metadata) = read_bounded_policy_file_with_metadata(path)?;
-    let expected_mode = parse_reviewed_mode(expected.mode)?;
-    let policy_sha256 = sudo_policy_sha256(expected.digest_profile, &bytes)?;
-    let raw_sha256 = sha256_bytes(&bytes);
-    if path.to_str() != Some(expected.canonical_target)
-        || fs::canonicalize(path).ok().as_deref() != Some(Path::new(expected.canonical_target))
-        || !policy_source_metadata_is_safe(&metadata)
-        || metadata.permissions().mode() & 0o7777 != expected_mode
-        || (policy_sha256 != expected.sha256
-            && !sudo_policy_semantically_matches_reviewed_source(expected, &bytes))
-    {
-        return Err(unsupported_fingerprint());
-    }
-    Ok(SudoPolicySourcePin {
-        path_class: expected.path_class,
-        name: expected.name.to_owned(),
-        mode: metadata.permissions().mode() & 0o7777,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        sha256: raw_sha256,
-    })
-}
-
-fn sudo_policy_semantically_matches_reviewed_source(
-    expected: &AcceptedSudoPolicySourceV3,
-    bytes: &[u8],
-) -> bool {
-    if expected.path_class != "drop_in" {
-        return false;
-    }
-    let Some(effective_lines) = sudo_policy_effective_lines(bytes) else {
-        return false;
-    };
-    match expected.name {
-        "README" => effective_lines.is_empty(),
-        "runner" => effective_lines == [b"runner ALL=(ALL) NOPASSWD:ALL".as_slice()],
-        _ => false,
-    }
-}
-
-fn sudo_policy_effective_lines(bytes: &[u8]) -> Option<Vec<&[u8]>> {
-    if bytes.contains(&b'\\') {
-        return None;
-    }
-    let mut lines = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        let trimmed = trim_ascii_whitespace(line);
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with(b"#include") || trimmed.starts_with(b"@include") {
-            return None;
-        }
-        if !trimmed.starts_with(b"#") {
-            lines.push(trimmed);
-        }
-    }
-    Some(lines)
 }
 
 fn policy_source_metadata_is_safe(metadata: &fs::Metadata) -> bool {
@@ -1433,58 +1250,18 @@ fn require_policy_source_absent(path: &Path) -> Result<(), LockdownError> {
     }
 }
 
-fn verify_socket_fingerprint(executables: &TrustedExecutableSet) -> Result<(), LockdownError> {
-    let accepted = hosted_runner_fingerprint_requirement().accepted;
-    for expected in accepted.container_sockets {
-        let metadata = fs::metadata(expected.path).map_err(|_| unsupported_fingerprint())?;
-        if !expected.present
-            || !metadata.file_type().is_socket()
-            || metadata.permissions().mode() & 0o777 != 0o660
-            || metadata.uid() != 0
-        {
-            return Err(unsupported_fingerprint());
-        }
-        let ownership = fixed_command(
-            executables,
-            TrustedExecutable::Stat,
-            &["--format=%U:%G:%a:%F", expected.path],
-        )?;
-        let expected_ownership = format!(
-            "{}:{}:{}:socket\n",
-            expected.owner,
-            expected.group,
-            expected.mode.trim_start_matches('0')
-        );
-        if !ownership.status.success() || ownership.stdout != expected_ownership.as_bytes() {
-            return Err(unsupported_fingerprint());
-        }
-    }
-    Ok(())
+fn sudo_privileges_disabled(validation_succeeded: bool, policy_listing_code: Option<i32>) -> bool {
+    !validation_succeeded && policy_listing_code == Some(1)
 }
 
 fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
-    let accepted = hosted_runner_fingerprint_requirement()
-        .accepted
-        .sudo_policy_sources
-        .into_iter()
-        .find(|source| source.path_class == "drop_in" && source.name == "runner")
-        .ok_or_else(|| {
-            LockdownError::new(
-                "unsupported_host_fingerprint",
-                "accepted runner sudo source is not represented in the fingerprint",
-            )
-        })?;
     let (bytes, metadata) = read_bounded_policy_file_with_metadata(Path::new(RUNNER_DROP_IN_PATH))?;
     let mode = metadata.permissions().mode() & 0o7777;
-    let policy_sha256 = sudo_policy_sha256(accepted.digest_profile, &bytes)?;
     let raw_sha256 = sha256_bytes(&bytes);
-    if accepted.canonical_target != RUNNER_DROP_IN_PATH
-        || fs::canonicalize(RUNNER_DROP_IN_PATH).ok().as_deref()
-            != Some(Path::new(accepted.canonical_target))
-        || mode != parse_reviewed_mode(accepted.mode)?
+    if fs::canonicalize(RUNNER_DROP_IN_PATH).ok().as_deref() != Some(Path::new(RUNNER_DROP_IN_PATH))
         || !policy_source_metadata_is_safe(&metadata)
-        || (policy_sha256 != accepted.sha256
-            && !sudo_policy_semantically_matches_reviewed_source(&accepted, &bytes))
+        || !sudo_includes_are_bounded(&bytes, false)
+        || !reviewed_runner_sudo_policy(&bytes)
     {
         return Err(unsupported_fingerprint());
     }
@@ -1568,13 +1345,10 @@ fn verify_restored_runner_sudo_source(
             "trusted executable state changed before restored sudo verification",
         )
     })?;
-    let accepted_sources = hosted_runner_fingerprint_requirement()
-        .accepted
-        .sudo_policy_sources;
-    verify_sudo_sources(&accepted_sources).map_err(|_| {
+    let restored_sources = capture_sudo_sources(executables).map_err(|_| {
         LockdownError::new(
             "sudo_restore_verification_rollback_failed",
-            "restored sudo policy inventory no longer matches the accepted state",
+            "restored sudo policy inventory is unavailable or unsafe",
         )
     })?;
     require_success(
@@ -1613,12 +1387,18 @@ fn verify_restored_runner_sudo_source(
             "trusted executable state changed during restored sudo verification",
         )
     })?;
-    verify_sudo_sources(&accepted_sources).map_err(|_| {
+    let final_sources = capture_sudo_sources(executables).map_err(|_| {
         LockdownError::new(
             "sudo_restore_verification_rollback_failed",
-            "restored sudo policy inventory changed during capability verification",
+            "restored sudo policy inventory could not be verified again",
         )
     })?;
+    if final_sources != restored_sources {
+        return Err(LockdownError::new(
+            "sudo_restore_verification_rollback_failed",
+            "restored sudo policy inventory changed during capability verification",
+        ));
+    }
     Ok(())
 }
 
@@ -1628,116 +1408,9 @@ fn sha256_bounded_file(path: &Path) -> Result<String, LockdownError> {
     Ok(sha256_bytes(&bytes))
 }
 
-fn sudo_policy_sha256(profile: &str, bytes: &[u8]) -> Result<String, LockdownError> {
-    match profile {
-        SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1 => Ok(sha256_bytes(bytes)),
-        SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 => {
-            let body = cloud_init_sudo_body(bytes).ok_or_else(unsupported_fingerprint)?;
-            Ok(domain_separated_sha256(
-                CLOUD_INIT_SUDO_BODY_HASH_DOMAIN,
-                body,
-            ))
-        }
-        _ => Err(unsupported_fingerprint()),
-    }
-}
-
-fn cloud_init_sudo_body(bytes: &[u8]) -> Option<&[u8]> {
-    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
-    let header = &bytes[..newline];
-    let body = &bytes[newline + 1..];
-    if body.is_empty()
-        || !cloud_init_sudo_header_is_valid(header)
-        || body
-            .split(|byte| *byte == b'\n')
-            .any(|line| line.starts_with(CLOUD_INIT_SUDO_HEADER_PREFIX))
-    {
-        return None;
-    }
-    Some(body)
-}
-
-fn cloud_init_sudo_header_is_valid(header: &[u8]) -> bool {
-    let Some(rest) = header.strip_prefix(CLOUD_INIT_SUDO_HEADER_PREFIX) else {
-        return false;
-    };
-    let Some(separator) = rest.windows(4).position(|window| window == b" on ") else {
-        return false;
-    };
-    let version = &rest[..separator];
-    let timestamp = &rest[separator + 4..];
-    let version_is_valid = !version.is_empty()
-        && version.len() <= 64
-        && version.iter().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b':' | b'~' | b'_' | b'-')
-        });
-    version_is_valid && cloud_init_timestamp_is_valid(timestamp)
-}
-
-fn cloud_init_timestamp_is_valid(timestamp: &[u8]) -> bool {
-    if timestamp.len() != 31
-        || &timestamp[3..5] != b", "
-        || timestamp[7] != b' '
-        || timestamp[11] != b' '
-        || timestamp[16] != b' '
-        || timestamp[19] != b':'
-        || timestamp[22] != b':'
-        || timestamp[25] != b' '
-        || &timestamp[26..] != b"+0000"
-    {
-        return false;
-    }
-    let weekday = std::str::from_utf8(&timestamp[..3]).ok();
-    let month = std::str::from_utf8(&timestamp[8..11]).ok();
-    matches!(
-        weekday,
-        Some("Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun")
-    ) && matches!(
-        month,
-        Some(
-            "Jan"
-                | "Feb"
-                | "Mar"
-                | "Apr"
-                | "May"
-                | "Jun"
-                | "Jul"
-                | "Aug"
-                | "Sep"
-                | "Oct"
-                | "Nov"
-                | "Dec"
-        )
-    ) && ascii_decimal_in_range(&timestamp[5..7], 1, 31)
-        && timestamp[12..16].iter().all(u8::is_ascii_digit)
-        && ascii_decimal_in_range(&timestamp[17..19], 0, 23)
-        && ascii_decimal_in_range(&timestamp[20..22], 0, 59)
-        && ascii_decimal_in_range(&timestamp[23..25], 0, 59)
-}
-
-fn ascii_decimal_in_range(bytes: &[u8], minimum: u32, maximum: u32) -> bool {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return false;
-    }
-    let value = bytes
-        .iter()
-        .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0'));
-    (minimum..=maximum).contains(&value)
-}
-
 fn sha256_bytes(bytes: &[u8]) -> String {
-    sha256_chunks(&[bytes])
-}
-
-fn domain_separated_sha256(domain: &[u8], bytes: &[u8]) -> String {
-    sha256_chunks(&[domain, b"\0", bytes])
-}
-
-fn sha256_chunks(chunks: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
-    for chunk in chunks {
-        digest.update(chunk);
-    }
+    digest.update(bytes);
     let mut hexadecimal = String::with_capacity(64);
     for byte in digest.finalize() {
         write!(&mut hexadecimal, "{byte:02x}").expect("writing to a string cannot fail");
@@ -1960,19 +1633,10 @@ fn require_success(
 }
 
 fn unsupported_fingerprint() -> LockdownError {
-    unsupported_fingerprint_category("host_identity")
-}
-
-fn unsupported_fingerprint_category(category: &'static str) -> LockdownError {
-    LockdownError::new("unsupported_host_fingerprint", category)
-}
-
-fn categorize_unsupported(error: LockdownError, category: &'static str) -> LockdownError {
-    if error.code == "unsupported_host_fingerprint" {
-        unsupported_fingerprint_category(category)
-    } else {
-        error
-    }
+    LockdownError::new(
+        "unsupported_host_fingerprint",
+        "host state does not satisfy the reviewed lockdown capability contract",
+    )
 }
 
 #[cfg(test)]
@@ -1981,6 +1645,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2107,9 +1772,7 @@ mod tests {
         }
         assert_eq!(
             by_path.len(),
-            accepted.trusted_executables.len()
-                + accepted.permission_ancestor_directories.len()
-                + accepted.sudo_policy_sources.len()
+            accepted.trusted_executables.len() + accepted.permission_ancestor_directories.len()
         );
         for executable in &accepted.trusted_executables {
             assert_eq!(
@@ -2131,12 +1794,6 @@ mod tests {
                         RunnerAccessProbe::NotExecutable
                     }
                 ]
-            );
-        }
-        for source in &accepted.sudo_policy_sources {
-            assert_eq!(
-                by_path.get(source.canonical_target).unwrap(),
-                &vec![RunnerAccessProbe::NotWritable]
             );
         }
         assert_eq!(
@@ -2162,6 +1819,10 @@ mod tests {
         assert_eq!(
             RUNNER_SUDO_VALIDATION_ARGUMENTS,
             ["--non-interactive", "--reset-timestamp", "--validate"]
+        );
+        assert_eq!(
+            RUNNER_SUDO_POLICY_LIST_ARGUMENTS,
+            ["--non-interactive", "--list", "--other-user", "runner"]
         );
         assert_eq!(
             RESTORED_SUDO_VISUDO_ARGUMENTS,
@@ -2545,142 +2206,12 @@ mod tests {
     }
 
     #[test]
-    fn cloud_init_sudo_digest_ignores_only_one_valid_generated_header() {
-        let body = b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD:ALL\n";
-        let first = [
-            b"# Created by cloud-init v. 24.1.3-0ubuntu3.3 on Mon, 30 Jun 2026 10:11:12 +0000\n"
-                .as_slice(),
-            body,
-        ]
-        .concat();
-        let second = [
-            b"# Created by cloud-init v. 25.1.2-0ubuntu0~24.04.1 on Tue, 13 Jul 2026 21:22:23 +0000\n"
-                .as_slice(),
-            body,
-        ]
-        .concat();
-
-        let first_policy = sudo_policy_sha256(
-            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-            &first,
-        )
-        .unwrap();
-        let second_policy = sudo_policy_sha256(
-            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-            &second,
-        )
-        .unwrap();
-        assert_eq!(first_policy, second_policy);
-        assert_ne!(sha256_bytes(&first), sha256_bytes(&second));
-        assert_ne!(
-            first_policy,
-            sudo_policy_sha256(
-                SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-                &[
-                    b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n"
-                        .as_slice(),
-                    b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD: ALL\n",
-                ]
-                .concat(),
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            sudo_policy_sha256(SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1, &first).unwrap(),
-            sha256_bytes(&first)
-        );
-    }
-
-    #[test]
-    fn cloud_init_sudo_digest_rejects_missing_malformed_duplicate_and_unknown_profiles() {
-        let valid = b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n";
-        let invalid = vec![
-            b"ubuntu ALL=(ALL) NOPASSWD:ALL\n".as_slice(),
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 99:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
-                .as_slice(),
-            b"# Created by cloud-init v. bad version on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
-                .as_slice(),
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:24 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
-                .as_slice(),
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n"
-                .as_slice(),
-        ];
-        for contents in invalid {
-            assert_eq!(
-                sudo_policy_sha256(
-                    SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-                    contents,
-                )
-                .unwrap_err()
-                .code,
-                "unsupported_host_fingerprint"
-            );
-        }
-        assert_eq!(
-            sudo_policy_sha256("unknown_profile", valid)
-                .unwrap_err()
-                .code,
-            "unsupported_host_fingerprint"
-        );
-    }
-
-    #[test]
-    fn reviewed_sudo_sources_allow_only_security_equivalent_comment_and_blank_drift() {
-        let accepted = hosted_runner_fingerprint_requirement().accepted;
-        let runner = accepted
-            .sudo_policy_sources
-            .iter()
-            .find(|source| source.name == "runner")
-            .unwrap();
-        let readme = accepted
-            .sudo_policy_sources
-            .iter()
-            .find(|source| source.name == "README")
-            .unwrap();
-        let main = accepted
-            .sudo_policy_sources
-            .iter()
-            .find(|source| source.path_class == "main_policy")
-            .unwrap();
-
-        assert!(sudo_policy_semantically_matches_reviewed_source(
-            runner,
-            b"# updated image header\n\n  runner ALL=(ALL) NOPASSWD:ALL  \n# trailing note\n",
-        ));
-        assert!(sudo_policy_semantically_matches_reviewed_source(
-            readme,
-            b"# new package documentation\n\n  # another comment\n",
-        ));
-        assert!(!sudo_policy_semantically_matches_reviewed_source(
-            main,
-            b"# documentation\nrunner ALL=(ALL) NOPASSWD:ALL\n",
-        ));
-        for unsafe_policy in [
-            b"runner ALL=(ALL) NOPASSWD: ALL\n".as_slice(),
-            b"runner ALL=(ALL) NOPASSWD:ALL\nother ALL=(ALL) NOPASSWD:ALL\n",
-            b"runner ALL=(ALL) NOPASSWD:ALL\n@include /tmp/unsafe\n",
-            b"runner ALL=(ALL) NOPASSWD:ALL\n#include /tmp/unsafe\n",
-            b"runner ALL=(ALL) NOPASSWD:ALL\n@incl\\\nude /tmp/unsafe\n",
-            b"runner ALL=(ALL) NOPASSWD:ALL\\\n\n",
-        ] {
-            assert!(!sudo_policy_semantically_matches_reviewed_source(
-                runner,
-                unsafe_policy
-            ));
-        }
-        assert!(!sudo_policy_semantically_matches_reviewed_source(
-            readme,
-            b"# README\n@includedir /tmp/unsafe\n"
-        ));
-    }
-
-    #[test]
-    fn audit_sudo_policy_rejects_external_nested_and_continued_include_directives() {
-        assert!(audit_sudo_includes_are_bounded(
+    fn sudo_policy_rejects_external_nested_and_continued_include_directives() {
+        assert!(sudo_includes_are_bounded(
             b"Defaults env_reset\n@includedir /etc/sudoers.d\n",
             true,
         ));
-        assert!(audit_sudo_includes_are_bounded(
+        assert!(sudo_includes_are_bounded(
             b"runner ALL=(ALL) NOPASSWD:ALL\n# documentation\n",
             false,
         ));
@@ -2693,43 +2224,65 @@ mod tests {
             (b"@incl\\\nude /tmp/unsafe\n".as_slice(), true),
             (b"#incl\\\nude /tmp/unsafe\n".as_slice(), true),
         ] {
-            assert!(!audit_sudo_includes_are_bounded(policy, allow_root_include));
+            assert!(!sudo_includes_are_bounded(policy, allow_root_include));
         }
     }
 
     #[test]
-    fn unsupported_fingerprint_diagnostics_use_only_fixed_categories() {
-        for category in [
-            "host_identity",
-            "runner_identity",
-            "runner_groups",
-            "trusted_executables",
-            "sudo_policy",
-            "sudo_access",
-            "container_services",
-            "container_sockets",
-            "container_workloads",
+    fn sudo_policy_rejects_authentication_default_overrides() {
+        assert!(sudo_authentication_defaults_are_safe(
+            b"Defaults env_reset\nDefaults use_pty # listpw is documented here\n"
+        ));
+        for policy in [
+            b"Defaults !root_sudo\n".as_slice(),
+            b"Defaults verifypw=always\n".as_slice(),
+            b"Defaults:runner listpw=always\n".as_slice(),
+            b"Defaults rootpw\n".as_slice(),
+            b"Defaults targetpw\n".as_slice(),
+            b"Defaults runaspw\n".as_slice(),
+            b"Defaults !authenticate\n".as_slice(),
+            b"Defaults !root_sudo\nDefaults verifypw=always\nrunner ALL=(ALL) NOPASSWD:/bin/sh\n",
         ] {
-            let error = unsupported_fingerprint_category(category);
-            assert_eq!(error.code, "unsupported_host_fingerprint");
-            assert_eq!(error.message, category);
+            assert!(!sudo_authentication_defaults_are_safe(policy));
         }
-        let other = LockdownError::new("other_error", "safe detail");
-        assert_eq!(categorize_unsupported(other.clone(), "sudo_policy"), other);
     }
 
     #[test]
-    fn locked_sudo_inventory_requires_exact_files_and_runner_absence() {
+    fn runner_sudo_policy_contains_only_one_reviewed_grant() {
+        for policy in [
+            b"runner ALL=(ALL) NOPASSWD:ALL\n".as_slice(),
+            b"# image metadata\n  runner\tALL=(ALL:ALL)\tNOPASSWD:ALL  \n# note\n",
+        ] {
+            assert!(reviewed_runner_sudo_policy(policy));
+        }
+        for policy in [
+            b"runner ALL=(ALL) NOPASSWD:/bin/sh\n".as_slice(),
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults !root_sudo\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nroot ALL=(ALL) NOPASSWD:ALL\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\n#1001 ALL=(ALL) NOPASSWD:ALL\n",
+            b"ubuntu ALL=(ALL) NOPASSWD:ALL\n",
+        ] {
+            assert!(!reviewed_runner_sudo_policy(policy));
+        }
+    }
+
+    #[test]
+    fn sudo_lockdown_rejects_command_specific_grants_and_listing_errors() {
+        assert!(sudo_privileges_disabled(false, Some(1)));
+        assert!(!sudo_privileges_disabled(true, Some(1)));
+        assert!(!sudo_privileges_disabled(false, Some(0)));
+        assert!(!sudo_privileges_disabled(false, Some(2)));
+        assert!(!sudo_privileges_disabled(false, None));
+    }
+
+    #[test]
+    fn locked_sudo_inventory_requires_runner_absence() {
         let root = PathBuf::from(format!(
             "target/tmp/lockdown-inventory-unit-{}",
             TEST_INDEX.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("README"), b"readme").unwrap();
-        fs::write(root.join("90-cloud-init-users"), b"cloud init").unwrap();
-
-        verify_drop_in_inventory(&root, &["90-cloud-init-users", "README"]).unwrap();
         let runner = root.join("runner");
         require_policy_source_absent(&runner).unwrap();
 
@@ -2737,12 +2290,6 @@ mod tests {
         assert_eq!(
             require_policy_source_absent(&runner).unwrap_err().code,
             "sudo_lockdown_failed"
-        );
-        assert_eq!(
-            verify_drop_in_inventory(&root, &["90-cloud-init-users", "README"])
-                .unwrap_err()
-                .code,
-            "unsupported_host_fingerprint"
         );
         fs::remove_file(&runner).unwrap();
 
@@ -2753,13 +2300,6 @@ mod tests {
             require_policy_source_absent(&runner).unwrap_err().code,
             "sudo_lockdown_failed"
         );
-        assert_eq!(
-            verify_drop_in_inventory(&root, &["90-cloud-init-users", "README", "target"])
-                .unwrap_err()
-                .code,
-            "unsupported_host_fingerprint"
-        );
-
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -190,25 +190,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$ACTION_REF"
           echo "Canary Action commit: $ACTION_REF"
 
-      - name: record runner image
-        env:
-          RUNNER_LABEL: ${{ matrix.runner }}
-        run: |
-          set -euo pipefail
-          case "$RUNNER_LABEL" in
-            ubuntu-24.04|ubuntu-latest) ;;
-            *) echo "unexpected runner label" >&2; exit 1 ;;
-          esac
-          if ! [[ "${ImageVersion:-}" =~ ^[0-9]{8}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
-            echo "runner image version is missing or invalid" >&2
-            exit 1
-          fi
-          {
-            printf '### Runner image\n\n'
-            printf -- '- Label: `%s`\n' "$RUNNER_LABEL"
-            printf -- '- Image version: `%s`\n' "$ImageVersion"
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: validate locks
         run: script/validate-locks --ci
 

@@ -4,13 +4,13 @@ Fence limits where a GitHub Actions job can send network traffic and removes com
 
 ## Supported Runners
 
-Fence supports GitHub-hosted Ubuntu 24.04 x64 jobs using `ubuntu-24.04` or `ubuntu-latest`.
+Fence supports GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`.
 
-- Releases are checked on both runner labels.
-- GitHub updates its runner images regularly. Fence accepts safe image changes but rejects unsafe runner settings and unsupported Ubuntu versions.
+- Releases are validated on `ubuntu-24.04`.
+- `ubuntu-latest` is tested regularly, but GitHub can change the image behind that label.
 - Self-hosted runners, container jobs, other architectures, Windows, and macOS are not supported.
 
-Fence checks the runner before activating. If a supported image leaves `/etc` or `/usr` writable by the runner, Fence restores only those exact directories to root ownership first; other unsafe trusted paths are rejected. Block mode requires its reviewed privilege and container controls, while audit mode preserves and continuously verifies the observed sudo, container, and local-service state. If the selected mode cannot verify its required security properties, setup fails.
+Fence checks the runner before changing it. If the runner does not match a supported configuration, setup fails.
 
 Run Fence before checkout and the other steps you want it to protect.
 

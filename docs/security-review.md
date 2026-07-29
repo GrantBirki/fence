@@ -6,7 +6,7 @@ This review covers Fence's Linux agent, DNS policy, firewall, root-owned runtime
 
 The [threat model](threat-model.md) describes attacker capabilities, trust assumptions, and remaining risks. The [v0 specification](v0.md) defines the full technical contract.
 
-Fence supports GitHub-hosted Ubuntu 24.04 x64 jobs running `ubuntu-24.04` or `ubuntu-latest`. Releases are checked on both labels, and each mode verifies the runner properties it depends on. Standard block mode limits outbound connections, disables passwordless sudo and container access, and keeps those protections active until the job ends. Audit mode accepts bounded, safely observed image changes without claiming containment. Fence is not a sandbox and does not prevent data from being sent to allowed destinations.
+Fence supports GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is tested regularly, but GitHub can change its underlying image. Standard block mode limits outbound connections, disables passwordless sudo and container access, and keeps those protections active until the job ends. Fence is not a sandbox and does not prevent data from being sent to allowed destinations.
 
 The default network policy allows the GitHub and runner services needed for compatibility. `disable_broad_github_domains: true` removes optional GitHub destinations while preserving required job-reporting connections. Fence also permits five reviewed storage endpoints and up to four additional accounts requested by the verified `Runner.Worker`. Enabling `allow_github_artifacts` lets verified descendants of that worker use the same four-account limit; it does not prove GitHub owns an account or that an upload is safe. Fence releases an approved DNS response only after applying and verifying its TCP `443` firewall rule.
 
@@ -14,7 +14,7 @@ The default network policy allows the GitHub and runner services needed for comp
 
 The protected `main` branch contains source code, not the published Action binary or manifest. A reviewed version bump authorizes a release. The workflow builds the Linux x64 agent from signed source commit `M`, creates attestations for `M` and `refs/heads/main`, and assembles the candidate offline with `script/assemble-action-bundle`.
 
-GitHub creates signed distribution commit `D` as the direct child of `M`. Its only changes are the mode-`0644` binary and schema-`4` manifest. The workflow verifies the commit, manifest, and binary, then runs full Action acceptance and a drift canary on both supported runner labels against `D`. After those checks and artifact verification pass, the immutable release tag points to `D`. The `action-release.json` asset records the version, source and distribution commits, binary checksum, manifest schema, and signer. Users pin its full `action_commit` SHA.
+GitHub creates signed distribution commit `D` as the direct child of `M`. Its only changes are the mode-`0644` binary and schema-`4` manifest. The workflow verifies the commit, manifest, and binary, then runs full Action acceptance and the fixed-runner drift canary against `D`. After those checks and artifact verification pass, the immutable release tag points to `D`. The `action-release.json` asset records the version, source and distribution commits, binary checksum, manifest schema, and signer. Users pin its full `action_commit` SHA.
 
 After publication, the workflow downloads the assets again and verifies their checksums, attestations, release mapping, tag, commit relationship, and bundled bytes. The release environment accepts only protected `main`; merging the reviewed version change remains the only release approval. The Action never downloads an agent or policy at runtime. Releases through `v0.6.3` retain their original tag behavior. See GitHub's [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
 
@@ -64,10 +64,6 @@ Cloud-init constructs the first `90-cloud-init-users` line from its package vers
 
 File ownership and mode alone do not prove what the runner can access when ACLs are present. Fence checks every trusted executable, its parent directories, and accepted sudo sources using pinned `sudo` and `/usr/bin/test` descriptors. The runner must not be able to write those paths or search `/etc/sudoers.d`. Each check verifies the same file identity before and after execution. Hosted tests confirm that an unexpected ACL fails before Fence changes the runner.
 
-### Runner-owned system directories
-
-Some GitHub-hosted Ubuntu images leave `/etc` and `/usr` owned and writable by the `runner` user. Before capturing trusted executable descriptors, Fence repairs only those exact canonical directories when their ownership, primary group, mode, and effective access match the reviewed image condition. It changes them to `root:root`, verifies that the runner cannot write them, and rejects every other unsafe trusted path. Fence never restores writable ownership.
-
 ### Descriptor-pinned privileged commands
 
 Security-critical commands previously had a small replacement window between checking a path and executing it. Fence now opens all twelve reviewed root-owned executables first, verifies their path and file identity before every use, and executes the captured inode through `/proc/self/fd`. Runner-access checks use pinned `sudo` and the pinned target without falling back to an unchecked path.
@@ -78,7 +74,7 @@ These checks protect executable identity after capture. They do not authenticate
 
 Checking known Docker and containerd services is not enough: an unexpected root-owned listener can provide another way around runner lockdown. Fence therefore records the accepted root container processes, SSH listeners, and Unix sockets before changing the host.
 
-Standard block mode can remove approved container processes and one specifically identified Docker socket after its owner exits. Audit mode captures a complete, stable baseline from the current image and preserves it; `unsafe_preserve` retains the reviewed protected-host inventory. Fence checks the resulting inventory before startup and every five seconds afterward. Missing ownership information, incomplete scans, and later drift fail closed. Filesystem checks are capped at 40 candidates and share a five-second deadline.
+Standard block mode can remove approved container processes and one specifically identified Docker socket after its owner exits. Audit mode and `unsafe_preserve` must preserve the complete original inventory. Fence checks the resulting inventory before startup and every five seconds afterward. Unexpected listeners, missing ownership information, unreviewed changes, incomplete scans, and later drift fail closed. Filesystem checks are capped at 40 candidates and share a five-second deadline.
 
 ### In-memory pre-ready rollback and no-restore commit
 
@@ -86,7 +82,7 @@ Fence keeps the runner's sudo policy only in bounded memory and checks it again 
 
 ### Source-before-bundle host compatibility
 
-The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `3`. Action acceptance recursively validates the bounded schema-`4` live observation before activation. The block classifier retains reviewed executable, ancestor, resolver target, sudo-marker, group, container, and local-control checks while deferring resolver service identity and harmless README and runner policy digest differences to the Rust resident. The audit classifier checks bounded observation shape and host identity, while the resident alone verifies trusted paths, preserved controls, and complete live sudo and local-service baselines. Both release-canary runner labels require normal block-mode activation; classifier skips, malformed observations, and unsafe drift fail closed.
+The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `3`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, profile-specific sudo source digest, principal, group, unit, socket, workload, and local-control fact before destructive activation. The candidate, release validation, and fixed-runner canary require normal activation and do not accept a classifier skip. Malformed, incomplete, mismatched, and unknown drift fails.
 
 ### Invocation slug consistency
 
@@ -134,5 +130,5 @@ The Action launcher now enforces deadlines for privileged subprocesses. Its depe
 - A malicious workflow step can still intentionally slow down or fail its own job.
 - Process attribution is best effort. Short-lived processes, shared sockets, namespaces, and scan limits can leave ownership unknown or ambiguous.
 - Verified executable capture does not protect against an already compromised runner image, root process, dynamic loader, or shared library.
-- Unsafe or unsupported GitHub-hosted runner changes fail closed; harmless image differences are accepted only when the selected mode's security checks still pass.
+- Unexpected GitHub-hosted runner changes fail closed until the runner fingerprint is reviewed and updated.
 - macOS, Windows, ARM, self-hosted runners, and jobs running inside containers are unsupported.

@@ -46,14 +46,8 @@ protected_bundle="$tmpdir/action/bin/fence"
 script/validate-action-bundle --root "$tmpdir"
 
 "$protected_bundle" check-support >"$support"
-host_mode="${FENCE_HOST_MODE:-block}"
-case "$host_mode" in
-  block|audit) ;;
-  *) die "Action bundle host classification mode must be block or audit" ;;
-esac
 python3 -B -E "$DIR/script/lib/action_bundle_host.py" \
   "$observation" \
   "$support" \
   "$transitions" \
-  "$GITHUB_OUTPUT" \
-  "$host_mode"
+  "$GITHUB_OUTPUT"
