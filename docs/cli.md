@@ -23,7 +23,7 @@ This prints the agent version. Source builds use `Cargo.toml`; published Action 
 fence check-support
 ```
 
-This shows the operating system, architecture, available backend, and expected runner fingerprint. It does not activate Fence or protect the runner.
+This shows the operating system, architecture, available backend, and reference runner profile. It does not check every required security control, activate Fence, or protect the runner.
 
 ## Preview A Policy
 

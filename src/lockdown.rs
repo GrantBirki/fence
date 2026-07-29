@@ -1876,7 +1876,7 @@ fn require_success(
 fn unsupported_fingerprint() -> LockdownError {
     LockdownError::new(
         "unsupported_host_fingerprint",
-        "host state does not satisfy the reviewed lockdown capability contract",
+        "host security controls do not meet Fence's lockdown requirements",
     )
 }
 

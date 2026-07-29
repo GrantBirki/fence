@@ -560,7 +560,7 @@ fn verify_reviewed_local_control_snapshot(
         return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
             "local_control_inventory_additive_drift",
-            "local control inventory gained an endpoint or owner outside the accepted fingerprint",
+            "local control inventory contains an unapproved endpoint or owner",
         ));
     }
     Ok(())
