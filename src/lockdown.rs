@@ -497,10 +497,9 @@ impl LockdownControl for SystemLockdownControl {
             executables,
             TrustedExecutable::Sudo,
             &RUNNER_SUDO_POLICY_LIST_ARGUMENTS,
-        )?
-        .status;
+        )?;
         verify_locked_sudo_sources(executables, source_pins)?;
-        if !sudo_privileges_disabled(sudo_available, policy_listing.code()) {
+        if !sudo_privileges_disabled(sudo_available, &policy_listing) {
             Err(LockdownError::new(
                 "sudo_lockdown_failed",
                 "runner retains sudo privileges after lockdown",
@@ -1250,8 +1249,27 @@ fn require_policy_source_absent(path: &Path) -> Result<(), LockdownError> {
     }
 }
 
-fn sudo_privileges_disabled(validation_succeeded: bool, policy_listing_code: Option<i32>) -> bool {
-    !validation_succeeded && policy_listing_code == Some(1)
+fn sudo_privileges_disabled(validation_succeeded: bool, policy_listing: &Output) -> bool {
+    let Some(hostname) = policy_listing
+        .stdout
+        .strip_prefix(b"User runner is not allowed to run sudo on ")
+        .and_then(|value| value.strip_suffix(b".\n"))
+    else {
+        return false;
+    };
+    !validation_succeeded
+        && policy_listing.status.success()
+        && policy_listing.stderr.is_empty()
+        && (1..=253).contains(&hostname.len())
+        && hostname.split(|byte| *byte == b'.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.first().is_some_and(u8::is_ascii_alphanumeric)
+                && label.last().is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
 }
 
 fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
@@ -1760,7 +1778,6 @@ mod tests {
             plan.len(),
             accepted.trusted_executables.len() * 2
                 + accepted.permission_ancestor_directories.len() * 2
-                + accepted.sudo_policy_sources.len()
         );
 
         let mut by_path = BTreeMap::<&str, Vec<RunnerAccessProbe>>::new();
@@ -2268,11 +2285,39 @@ mod tests {
 
     #[test]
     fn sudo_lockdown_rejects_command_specific_grants_and_listing_errors() {
-        assert!(sudo_privileges_disabled(false, Some(1)));
-        assert!(!sudo_privileges_disabled(true, Some(1)));
-        assert!(!sudo_privileges_disabled(false, Some(0)));
-        assert!(!sudo_privileges_disabled(false, Some(2)));
-        assert!(!sudo_privileges_disabled(false, None));
+        use std::os::unix::process::ExitStatusExt;
+
+        let listing = |status, stdout: &[u8], stderr: &[u8]| Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let denied = b"User runner is not allowed to run sudo on fv-az123-45.\n";
+        assert!(sudo_privileges_disabled(false, &listing(0, denied, b"")));
+        assert!(!sudo_privileges_disabled(true, &listing(0, denied, b"")));
+        assert!(!sudo_privileges_disabled(false, &listing(256, denied, b"")));
+        assert!(!sudo_privileges_disabled(false, &listing(9, denied, b"")));
+        for (stdout, stderr) in [
+            (
+                b"User runner may run the following commands on host:\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (b"User runner is not allowed to run sudo on .\n", b""),
+            (
+                b"User runner is not allowed to run sudo on bad_host.\n",
+                b"",
+            ),
+            (
+                b"User runner is not allowed to run sudo on host.\nextra\n",
+                b"",
+            ),
+            (denied.as_slice(), b"sudo: root is not allowed\n"),
+        ] {
+            assert!(!sudo_privileges_disabled(
+                false,
+                &listing(0, stdout, stderr)
+            ));
+        }
     }
 
     #[test]
