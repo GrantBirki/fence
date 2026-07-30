@@ -67,7 +67,7 @@ Not sure what your workflow needs? Start with audit mode:
     mode: audit
 ```
 
-Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. Use the job summary to build your allowlist, then switch back to block mode.
+Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
 
 ## GitHub Artifacts And Pages 📦
 

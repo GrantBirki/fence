@@ -57,7 +57,7 @@ Not sure which connections your job needs? Start in audit mode:
     mode: audit
 ```
 
-Audit mode records what Fence would block without blocking traffic or disabling `sudo` and Docker. Check the job summary, add the destinations you need, and remove `mode: audit` when you are ready to enforce the allowlist.
+Audit mode records what Fence would block without blocking traffic or disabling `sudo` and Docker. It may still restore root ownership of `/etc` and `/usr`. Check the job summary, add the destinations you need, and remove `mode: audit` when you are ready to enforce the allowlist.
 
 ## Upload Artifacts Or Deploy Pages
 

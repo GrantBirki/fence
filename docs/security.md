@@ -10,7 +10,7 @@ Fence supports GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`.
 - Fence checks the runner's security controls even when GitHub updates its images.
 - Self-hosted runners, container jobs, other architectures, Windows, and macOS are not supported.
 
-Fence checks the runner before changing it. Setup fails if its security controls do not meet Fence's requirements.
+Fence may restore root ownership of `/etc` and `/usr`, including in audit mode. Setup fails if the runner's security controls do not meet Fence's requirements.
 
 Run Fence before checkout and the other steps you want it to protect.
 
