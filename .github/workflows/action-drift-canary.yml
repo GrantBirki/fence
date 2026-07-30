@@ -2,7 +2,7 @@ name: action drift canary
 
 on:
   schedule:
-    - cron: "23 13 * * *"
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       action_ref:
@@ -29,11 +29,12 @@ concurrency:
 
 jobs:
   canary:
-    name: ${{ matrix.runner }} zero-input canary
+    name: ${{ matrix.runner }} ${{ matrix.mode }} canary
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.action_ref == '' && '["ubuntu-24.04","ubuntu-latest"]' || '["ubuntu-24.04"]') }}
+        runner: [ubuntu-24.04, ubuntu-latest]
+        mode: [block, audit]
     timeout-minutes: 8
     runs-on: ${{ matrix.runner }}
 
@@ -287,7 +288,21 @@ jobs:
           fi
 
       - name: activate bundled Fence agent with strict defaults
+        if: matrix.mode == 'block'
         uses: ./
 
-      - name: verify zero-input Action lifecycle
-        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: activate bundled Fence agent in audit mode
+        if: matrix.mode == 'audit'
+        uses: ./
+        with:
+          mode: audit
+
+      - name: verify Action lifecycle
+        env:
+          FENCE_MODE: ${{ matrix.mode }}
+        run: |
+          scenario=standard
+          if [[ "$FENCE_MODE" == "audit" ]]; then
+            scenario=audit
+          fi
+          script/test-action-acceptance "$scenario" "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

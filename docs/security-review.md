@@ -6,7 +6,7 @@ This review covers Fence's Linux agent, DNS policy, firewall, root-owned runtime
 
 The [threat model](threat-model.md) describes attacker capabilities, trust assumptions, and remaining risks. The [v0 specification](v0.md) defines the full technical contract.
 
-Fence supports GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is tested regularly, but GitHub can change its underlying image. Standard block mode limits outbound connections, disables passwordless sudo and container access, and keeps those protections active until the job ends. Fence is not a sandbox and does not prevent data from being sent to allowed destinations.
+Fence supports GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest`. Releases are tested on both runner labels in block and audit mode. Fence verifies actual runner security controls instead of rejecting routine image updates. Standard block mode limits outbound connections, disables passwordless sudo and container access, and keeps those protections active until the job ends. Fence is not a sandbox and does not prevent data from being sent to allowed destinations.
 
 The default network policy allows the GitHub and runner services needed for compatibility. `disable_broad_github_domains: true` removes optional GitHub destinations while preserving required job-reporting connections. Fence also permits five reviewed storage endpoints and up to four additional accounts requested by the verified `Runner.Worker`. Enabling `allow_github_artifacts` lets verified descendants of that worker use the same four-account limit; it does not prove GitHub owns an account or that an upload is safe. Fence releases an approved DNS response only after applying and verifying its TCP `443` firewall rule.
 
@@ -14,7 +14,7 @@ The default network policy allows the GitHub and runner services needed for comp
 
 The protected `main` branch contains source code, not the published Action binary or manifest. A reviewed version bump authorizes a release. The workflow builds the Linux x64 agent from signed source commit `M`, creates attestations for `M` and `refs/heads/main`, and assembles the candidate offline with `script/assemble-action-bundle`.
 
-GitHub creates signed distribution commit `D` as the direct child of `M`. Its only changes are the mode-`0644` binary and schema-`4` manifest. The workflow verifies the commit, manifest, and binary, then runs full Action acceptance and the fixed-runner drift canary against `D`. After those checks and artifact verification pass, the immutable release tag points to `D`. The `action-release.json` asset records the version, source and distribution commits, binary checksum, manifest schema, and signer. Users pin its full `action_commit` SHA.
+GitHub creates signed distribution commit `D` as the direct child of `M`. Its only changes are the mode-`0644` binary and schema-`4` manifest. The workflow verifies the commit, manifest, and binary, then runs full Action acceptance and tests both modes on both supported runner labels against `D`. After those checks and artifact verification pass, the immutable release tag points to `D`. The `action-release.json` asset records the version, source and distribution commits, binary checksum, manifest schema, and signer. Users pin its full `action_commit` SHA.
 
 After publication, the workflow downloads the assets again and verifies their checksums, attestations, release mapping, tag, commit relationship, and bundled bytes. The release environment accepts only protected `main`; merging the reviewed version change remains the only release approval. The Action never downloads an agent or policy at runtime. Releases through `v0.6.3` retain their original tag behavior. See GitHub's [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
 
@@ -52,13 +52,9 @@ Fence can match a network finding to a uniquely owned local socket using bounded
 
 Fence now checks that every opened sudo policy source is a bounded regular file, not a symlink, pipe, device, or another special file.
 
-### Exact hosted sudo-policy variants
+### Hosted runner sudo policy
 
-Earlier hosted evidence showed additional exact whole-file digests for the fixed `90-cloud-init-users` sudo-policy source. During a mixed image rollout, three independent hosted VMs on the new image matched one additional digest while a separate older-image control retained an already accepted variant; after excluding non-enforced volatile device, inode, PID, and start-time identifiers, the complete bounded observations were otherwise identical. Fingerprint schema `2` accepted each reviewed digest as an additional exact value while retaining the same source name, regular-file, ownership, mode, non-writability, marker, unit, socket, resolver, principal, group, and local-control checks.
-
-### Generated cloud-init sudo header normalization
-
-Cloud-init constructs the first `90-cloud-init-users` line from its package version and the current RFC 2822 timestamp before writing the policy body, so whole-file digests turn expected image-build metadata changes into recurring fingerprint maintenance. Cloud-init's own integration coverage compares this file after omitting that first line. Fingerprint schema `3` therefore requires a digest profile for every sudo source: `sudoers`, `README`, and `runner` remain `exact_file_v1`, while only the exact `drop_in` / `90-cloud-init-users` identity may use `cloud_init_generated_header_v1`. That profile accepts exactly one first line matching the reviewed cloud-init version/timestamp grammar, rejects missing, malformed, repeated, or non-UTC headers, and computes a domain-separated SHA-256 over every remaining byte without normalizing comments, whitespace, rules, or line endings. The lockdown path separately pins the raw whole-file SHA-256 after acceptance, so a later header-only or body mutation still fails resident verification. The relevant upstream behavior is public in [cloud-init's header generator](https://github.com/canonical/cloud-init/blob/a97e74661b12f16d1f8554d572698494e62d4fd9/cloudinit/util.py#L2318-L2323) and [its sudo policy integration test](https://github.com/canonical/cloud-init/blob/a97e74661b12f16d1f8554d572698494e62d4fd9/tests/integration_tests/modules/test_users_groups.py#L190-L206).
+GitHub runner images can change sudo policy filenames, comments, or generated headers. Fence discovers bounded, root-owned policy files, checks their permissions and syntax, identifies every sudo grant available to the runner, and pins each file's complete contents. Block mode removes those grants and verifies sudo access is gone. Audit mode preserves the original policy. Later policy changes fail verification.
 
 ### Effective sudo and trusted-path access
 
@@ -74,7 +70,7 @@ These checks protect executable identity after capture. They do not authenticate
 
 Checking known Docker and containerd services is not enough: an unexpected root-owned listener can provide another way around runner lockdown. Fence therefore records the accepted root container processes, SSH listeners, and Unix sockets before changing the host.
 
-Standard block mode can remove approved container processes and one specifically identified Docker socket after its owner exits. Audit mode and `unsafe_preserve` must preserve the complete original inventory. Fence checks the resulting inventory before startup and every five seconds afterward. Unexpected listeners, missing ownership information, unreviewed changes, incomplete scans, and later drift fail closed. Filesystem checks are capped at 40 candidates and share a five-second deadline.
+Standard block mode disables Docker and container access, including on runners where Docker is already absent. Audit mode and `unsafe_preserve` retain available container access. Fence records the actual root-process and socket inventory after setup, then checks it before readiness and every five seconds afterward. Unexpected listeners, missing ownership information, incomplete scans, and later drift fail closed. Filesystem checks are capped at 40 candidates and share a five-second deadline.
 
 ### In-memory pre-ready rollback and no-restore commit
 
@@ -82,7 +78,7 @@ Fence keeps the runner's sudo policy only in bounded memory and checks it again 
 
 ### Source-before-bundle host compatibility
 
-The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `3`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, profile-specific sudo source digest, principal, group, unit, socket, workload, and local-control fact before destructive activation. The candidate, release validation, and fixed-runner canary require normal activation and do not accept a classifier skip. Malformed, incomplete, mismatched, and unknown drift fails.
+The source-built candidate and published Action use the same runner checks. Fence validates complete, bounded runner observations before its agent checks executable identity, sudo access, container controls, and local services. Release validation tests block and audit modes on `ubuntu-24.04` and `ubuntu-latest`; no test can skip agent activation. Malformed observations, incomplete evidence, or unsafe runner changes fail closed.
 
 ### Invocation slug consistency
 
@@ -130,5 +126,5 @@ The Action launcher now enforces deadlines for privileged subprocesses. Its depe
 - A malicious workflow step can still intentionally slow down or fail its own job.
 - Process attribution is best effort. Short-lived processes, shared sockets, namespaces, and scan limits can leave ownership unknown or ambiguous.
 - Verified executable capture does not protect against an already compromised runner image, root process, dynamic loader, or shared library.
-- Unexpected GitHub-hosted runner changes fail closed until the runner fingerprint is reviewed and updated.
+- Runner changes that weaken required security controls fail closed; routine image updates do not require a new fingerprint.
 - macOS, Windows, ARM, self-hosted runners, and jobs running inside containers are unsupported.

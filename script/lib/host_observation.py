@@ -107,7 +107,6 @@ SCHEMA4_FIXED_UNITS = (
     "docker.socket",
     "containerd.service",
     "containerd.socket",
-    "walinuxagent.service",
 )
 SCHEMA4_FIXED_SOCKETS = (
     "/var/run/docker.sock",
@@ -122,27 +121,29 @@ SCHEMA4_PROBE_RESULTS = {
 }
 SCHEMA4_REVIEWED_OS_ID = "ubuntu"
 SCHEMA4_REVIEWED_OS_VERSION_ID = "24.04"
+MIN_REVIEWED_UBUNTU_LTS_YEAR = 24
+MAX_REVIEWED_UBUNTU_LTS_YEAR = 40
 SCHEMA4_REVIEWED_ARCHITECTURE = "x86_64"
 SCHEMA4_REVIEWED_RUNNER_PRINCIPAL = "runner"
 SCHEMA4_REVIEWED_RUNNER_GROUPS = frozenset(
     {"adm", "users", "docker", "systemd-journal", "runner"}
 )
 SCHEMA4_REVIEWED_RESOLVER_TARGET = "/run/systemd/resolve/stub-resolv.conf"
+SCHEMA4_REVIEWED_RESOLVER_TARGETS = frozenset(
+    {SCHEMA4_REVIEWED_RESOLVER_TARGET, "/run/systemd/resolve/resolv.conf"}
+)
+AZURE_PLATFORM_AGENT_UNITS = (
+    "walinuxagent.service",
+    "waagent.service",
+    "azurelinuxagent.service",
+    "azure-vm-agent.service",
+)
 SCHEMA4_REVIEWED_SUDO_SOURCE_TARGETS = {
     "sudoers": "/etc/sudoers",
     "90-cloud-init-users": "/etc/sudoers.d/90-cloud-init-users",
     "README": "/etc/sudoers.d/README",
     "runner": "/etc/sudoers.d/runner",
 }
-CLOUD_INIT_SUDO_HEADER_PREFIX = b"# Created by cloud-init v. "
-CLOUD_INIT_SUDO_BODY_HASH_DOMAIN = b"fence-cloud-init-sudo-body-v1"
-CLOUD_INIT_SUDO_HEADER = re.compile(
-    rb"# Created by cloud-init v\. [A-Za-z0-9.+:~_-]{1,64} on "
-    rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
-    rb"(?:0[1-9]|[12][0-9]|3[01]) "
-    rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
-    rb"[0-9]{4} (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] \+0000"
-)
 SCHEMA4_REVIEWED_UNIT_STATES = {
     "docker.service": {
         "load_state": "loaded",
@@ -163,11 +164,6 @@ SCHEMA4_REVIEWED_UNIT_STATES = {
         "load_state": "not-found",
         "active_state": "inactive",
         "unit_file_state": "",
-    },
-    "walinuxagent.service": {
-        "load_state": "loaded",
-        "active_state": "active",
-        "unit_file_state": "enabled",
     },
 }
 SCHEMA4_REVIEWED_SOCKET_IDENTITIES = {
@@ -291,22 +287,21 @@ def canonical_sudo_sources(sources):
 
 
 def sudo_policy_sha256(name, contents):
-    if name != "90-cloud-init-users":
-        return hashlib.sha256(contents).hexdigest()
-    header, newline, body = contents.partition(b"\n")
-    if (
-        not newline
-        or not body
-        or CLOUD_INIT_SUDO_HEADER.fullmatch(header) is None
-        or any(
-            line.startswith(CLOUD_INIT_SUDO_HEADER_PREFIX)
-            for line in body.splitlines()
-        )
-    ):
-        raise ValueError("cloud-init sudo source has an invalid generated header")
-    return hashlib.sha256(
-        CLOUD_INIT_SUDO_BODY_HASH_DOMAIN + b"\0" + body
-    ).hexdigest()
+    del name
+    return hashlib.sha256(contents).hexdigest()
+
+
+def supported_ubuntu_lts_version(value):
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(r"([0-9]{2})\.04", value)
+    if match is None:
+        return False
+    year = int(match.group(1))
+    return (
+        MIN_REVIEWED_UBUNTU_LTS_YEAR <= year <= MAX_REVIEWED_UBUNTU_LTS_YEAR
+        and year % 2 == 0
+    )
 
 
 def public_host_identity(value, reviewed, unreviewed):
@@ -330,7 +325,7 @@ def public_sudo_source_target(value):
 
 def public_resolver_target(value):
     rendered = str(value)
-    if rendered == SCHEMA4_REVIEWED_RESOLVER_TARGET:
+    if rendered in SCHEMA4_REVIEWED_RESOLVER_TARGETS:
         return rendered
     return UNREVIEWED_RESOLVER_TARGET
 
@@ -361,10 +356,14 @@ def bounded_file_lines(path, maximum_bytes, maximum_lines):
     return lines[:maximum_lines], len(lines) > maximum_lines
 
 
-def bounded_directory_entries(path, maximum_entries):
+def bounded_directory_entries(path, maximum_entries, include=None):
     entries = []
     with os.scandir(path) as candidates:
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
+            if index >= maximum_entries * 2:
+                return sorted(entries), True
+            if include is not None and not include(candidate.name):
+                continue
             if len(entries) >= maximum_entries:
                 return sorted(entries), True
             entries.append(pathlib.Path(candidate.path))
@@ -497,6 +496,23 @@ def _reviewed_executable_path(path):
     return UNREVIEWED_EXECUTABLE_PATH
 
 
+def reviewed_cgroup(value):
+    if not isinstance(value, str):
+        return False
+    if value in REVIEWED_CGROUPS:
+        return True
+    for prefix in ("/system.slice/", "/azure.slice/"):
+        if value.startswith(prefix):
+            service = value[len(prefix) :]
+            return (
+                len(service) <= 128
+                and service.endswith(".service")
+                and not service.startswith(".")
+                and re.fullmatch(r"[A-Za-z0-9._@:+-]+", service) is not None
+            )
+    return False
+
+
 def _classified_cgroup(process_root):
     try:
         encoded = _bounded_read(process_root / "cgroup", 4096)
@@ -514,7 +530,7 @@ def _classified_cgroup(process_root):
             return UNREVIEWED_CGROUP, fingerprint, False
         if hierarchy == "0" and controllers == "":
             unified.append(path)
-    if len(unified) != 1 or unified[0] not in REVIEWED_CGROUPS:
+    if len(unified) != 1 or not reviewed_cgroup(unified[0]):
         return UNREVIEWED_CGROUP, fingerprint, False
     return unified[0], fingerprint, True
 
@@ -1521,7 +1537,7 @@ def _reviewed_reported_path(value):
 def _owner_identity_reviewed(owner):
     return (
         owner["canonical_executable"] in REVIEWED_EXECUTABLE_PATHS
-        and owner["unified_cgroup"] in REVIEWED_CGROUPS
+        and reviewed_cgroup(owner["unified_cgroup"])
     )
 
 
@@ -1585,6 +1601,8 @@ def _validate_schema4_metadata(
 
 
 def _validate_schema4_agent(agent):
+    if agent == {"status": "unavailable"}:
+        return
     required = {
         "name",
         "status",
@@ -1607,29 +1625,26 @@ def _validate_schema4_agent(agent):
     if not isinstance(agent, dict) or set(agent) != required:
         raise ValueError("schema 4 Azure platform agent shape is invalid")
     if (
-        agent["name"] != "walinuxagent.service"
+        agent["name"] not in AZURE_PLATFORM_AGENT_UNITS
         or agent["status"] != "observed"
         or agent["load_state"] != "loaded"
         or agent["active_state"] != "active"
         or agent["sub_state"] != "running"
-        or agent["unit_file_state"]
-        not in {
-            SCHEMA4_REVIEWED_UNIT_STATES["walinuxagent.service"][
-                "unit_file_state"
-            ],
-            UNREVIEWED_UNIT_STATE,
-        }
+        or not isinstance(agent["unit_file_state"], str)
+        or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", agent["unit_file_state"])
+        is None
         or agent["configured_user_class"] != "root_or_default"
-        or agent["control_group"] != "/azure.slice/walinuxagent.service"
+        or not isinstance(agent["control_group"], str)
+        or re.fullmatch(r"/[A-Za-z0-9_.@:/-]{1,255}", agent["control_group"])
+        is None
+        or not agent["control_group"].endswith("/" + agent["name"])
         or agent["process_status"] != "observed"
         or agent["process_owner_class"] != "root"
         or agent["processes_truncated"] is not False
         or not _is_integer(agent["main_pid"], 1)
         or not _is_integer(agent["process_start_time_ticks"], 1)
         or not isinstance(agent["executable_basename"], str)
-        or re.fullmatch(
-            r"python3(?:\.[0-9]+)?", agent["executable_basename"]
-        )
+        or re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", agent["executable_basename"])
         is None
         or not _is_integer(agent["executable_device"])
         or not _is_integer(agent["executable_inode"])
@@ -1658,9 +1673,7 @@ def _validate_schema4_agent(agent):
             or not _is_integer(process["pid"], 1)
             or not _is_integer(process["start_time_ticks"], 1)
             or not isinstance(process["executable_basename"], str)
-            or re.fullmatch(
-                r"python3(?:\.[0-9]+)?", process["executable_basename"]
-            )
+            or re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", process["executable_basename"])
             is None
             or not _is_integer(process["executable_device"])
             or not _is_integer(process["executable_inode"])
@@ -1681,8 +1694,10 @@ def _validate_schema4_host(host):
         raise ValueError("schema 4 host shape is invalid")
     if (
         host["os_id"] not in {SCHEMA4_REVIEWED_OS_ID, UNREVIEWED_OS_ID}
-        or host["os_version_id"]
-        not in {SCHEMA4_REVIEWED_OS_VERSION_ID, UNREVIEWED_OS_VERSION_ID}
+        or not (
+            supported_ubuntu_lts_version(host["os_version_id"])
+            or host["os_version_id"] == UNREVIEWED_OS_VERSION_ID
+        )
         or host["architecture"]
         not in {SCHEMA4_REVIEWED_ARCHITECTURE, UNREVIEWED_ARCHITECTURE}
         or host["runner_principal"]
@@ -1739,7 +1754,7 @@ def _validate_schema4_resolver(resolver):
         resolver["path"] != "/etc/resolv.conf"
         or not _is_bool(resolver["is_symlink"])
         or resolver["canonical_target"]
-        not in {SCHEMA4_REVIEWED_RESOLVER_TARGET, UNREVIEWED_RESOLVER_TARGET}
+        not in SCHEMA4_REVIEWED_RESOLVER_TARGETS | {UNREVIEWED_RESOLVER_TARGET}
         or resolver["target_type"] not in {"regular", "unexpected_type"}
         or not isinstance(resolver["target_mode"], str)
         or re.fullmatch(r"[0-7]{4}", resolver["target_mode"]) is None
@@ -1986,7 +2001,9 @@ def _validate_owner(owner):
     executable = owner["canonical_executable"]
     if not _reviewed_reported_path(executable):
         raise ValueError("local control owner executable is invalid")
-    if owner["unified_cgroup"] not in REVIEWED_CGROUPS | {UNREVIEWED_CGROUP}:
+    if owner["unified_cgroup"] != UNREVIEWED_CGROUP and not reviewed_cgroup(
+        owner["unified_cgroup"]
+    ):
         raise ValueError("local control owner cgroup is invalid")
     if (
         not _is_integer(owner["processes"], 1)
@@ -2277,44 +2294,21 @@ class HostObservationTests(unittest.TestCase):
     def _tcp_header(family="ipv4"):
         return (" ".join(TCP_TABLE_HEADERS[family]) + "\n").encode()
 
-    def test_cloud_init_sudo_digest_ignores_only_one_valid_generated_header(self):
-        body = b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
-        first = (
-            b"# Created by cloud-init v. 24.1.3-0ubuntu3.3 on Mon, 30 Jun 2026 10:11:12 +0000\n"
-            + body
-        )
-        second = (
-            b"# Created by cloud-init v. 25.1.2-0ubuntu0~24.04.1 on Tue, 13 Jul 2026 21:22:23 +0000\n"
-            + body
-        )
-        self.assertEqual(
-            sudo_policy_sha256("90-cloud-init-users", first),
-            sudo_policy_sha256("90-cloud-init-users", second),
-        )
-        self.assertNotEqual(hashlib.sha256(first).digest(), hashlib.sha256(second).digest())
-        self.assertNotEqual(
-            sudo_policy_sha256("90-cloud-init-users", first),
-            sudo_policy_sha256(
-                "90-cloud-init-users",
-                second.replace(b"NOPASSWD:ALL", b"NOPASSWD: ALL"),
-            ),
-        )
-        self.assertEqual(
-            sudo_policy_sha256("runner", first), hashlib.sha256(first).hexdigest()
-        )
+    def test_every_sudo_source_digest_covers_its_complete_contents(self):
+        first = b"# generated by image tooling\nrunner ALL=(ALL) NOPASSWD:ALL\n"
+        second = b"# generated later\nrunner ALL=(ALL) NOPASSWD:ALL\n"
+        for name in ("runner", "90-cloud-init-users", "custom"):
+            with self.subTest(name=name):
+                self.assertEqual(sudo_policy_sha256(name, first), hashlib.sha256(first).hexdigest())
+                self.assertNotEqual(sudo_policy_sha256(name, first), sudo_policy_sha256(name, second))
 
-    def test_cloud_init_sudo_digest_rejects_malformed_or_duplicate_headers(self):
-        invalid = (
-            b"ubuntu ALL=(ALL) NOPASSWD:ALL\n",
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 99:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
-            b"# Created by cloud-init v. bad version on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:24 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
-            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n",
-        )
-        for contents in invalid:
-            with self.subTest(contents=contents):
-                with self.assertRaises(ValueError):
-                    sudo_policy_sha256("90-cloud-init-users", contents)
+    def test_only_bounded_even_year_ubuntu_lts_versions_are_supported(self):
+        for version in ("24.04", "26.04", "40.04"):
+            with self.subTest(version=version):
+                self.assertTrue(supported_ubuntu_lts_version(version))
+        for version in ("22.04", "25.04", "42.04", "24.10", "024.04", "24.04.1", None):
+            with self.subTest(version=version):
+                self.assertFalse(supported_ubuntu_lts_version(version))
 
     @staticmethod
     def _private_owner(
@@ -2595,7 +2589,7 @@ class HostObservationTests(unittest.TestCase):
             self.assertIn("process_fd_readlink", result[5])
 
             (process_root / "cgroup").write_text(
-                "0::/system.slice/unreviewed.service\n", encoding="utf-8"
+                "0::/user.slice/unreviewed.service\n", encoding="utf-8"
             )
             with mock.patch.object(
                 os.sys.modules[__name__],
@@ -2729,6 +2723,8 @@ class HostObservationTests(unittest.TestCase):
             for cgroup in (
                 "/system.slice/multipathd.service",
                 "/system.slice/dbus.service",
+                "/system.slice/hosted-platform.service",
+                "/azure.slice/platform-agent.service",
             ):
                 (process_root / "cgroup").write_text(
                     f"0::{cgroup}\n", encoding="utf-8"
@@ -2738,7 +2734,7 @@ class HostObservationTests(unittest.TestCase):
                 self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
                 self.assertTrue(reviewed)
 
-            private_cgroup = "/system.slice/unreviewed.service"
+            private_cgroup = "/user.slice/unreviewed.service"
             (process_root / "cgroup").write_text(
                 f"0::{private_cgroup}\n", encoding="utf-8"
             )
@@ -2746,6 +2742,16 @@ class HostObservationTests(unittest.TestCase):
             self.assertEqual(classified[0], UNREVIEWED_CGROUP)
             self.assertFalse(classified[2])
             self.assertNotIn(private_cgroup, repr(classified))
+
+        for rejected in (
+            "/user.slice/hosted-agent.service",
+            "/system.slice/../hosted-agent.service",
+            "/system.slice/.hidden.service",
+            "/system.slice/hosted-agent.scope",
+            "/system.slice/hosted/agent.service",
+        ):
+            with self.subTest(cgroup=rejected):
+                self.assertFalse(reviewed_cgroup(rejected))
 
     def test_process_scan_maps_reviewed_root_and_nonroot_coholders(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3027,7 +3033,7 @@ class HostObservationTests(unittest.TestCase):
             "unreviewed cgroup": lambda value: value["snapshot"]["tcp_listeners"][
                 0
             ]["owners"][0].__setitem__(
-                "unified_cgroup", "/system.slice/unreviewed.service"
+                "unified_cgroup", "/user.slice/unreviewed.service"
             ),
             "non-normalized executable": lambda value: value["snapshot"][
                 "tcp_listeners"
@@ -3048,6 +3054,9 @@ class HostObservationTests(unittest.TestCase):
                     validate_local_control_inventory(candidate)
 
     def test_bounded_helpers_cap_output_entries_lines_and_children(self):
+        self.assertIsNone(
+            bounded_command_output(["/definitely-missing-fence-command"])
+        )
         self.assertEqual(
             bounded_command_output(["/usr/bin/printf", "1234"], maximum=4),
             "1234",
@@ -3150,6 +3159,17 @@ os._exit(0 if started.exists() else 2)
             (root / "c").symlink_to(root / "a")
             entries, truncated = bounded_directory_entries(root, 2)
             self.assertEqual(len(entries), 2)
+            self.assertTrue(truncated)
+            policy_root = root / "sudoers"
+            policy_root.mkdir()
+            for name in ["backup.bak", "editor~", "first", "second"]:
+                (policy_root / name).touch()
+            active = lambda name: "." not in name and not name.endswith("~")
+            entries, truncated = bounded_directory_entries(policy_root, 2, active)
+            self.assertEqual([entry.name for entry in entries], ["first", "second"])
+            self.assertFalse(truncated)
+            (policy_root / "extra.bak").touch()
+            _, truncated = bounded_directory_entries(policy_root, 2, active)
             self.assertTrue(truncated)
             lines = root / "lines"
             lines.write_text("1\n2\n3\n", encoding="utf-8")

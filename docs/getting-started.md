@@ -19,7 +19,7 @@ jobs:
 
 Copy the full commit SHA and version from a [published release](https://github.com/openai/fence/releases). Each release includes a ready-to-use pin. The `main` branch does not contain the bundled Action, so it cannot be used directly.
 
-Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Releases are validated on `ubuntu-24.04`; `ubuntu-latest` is also tested, but GitHub can change the image behind that label.
+Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Releases are tested on both, and Fence verifies the runner's security controls even when GitHub updates its images.
 
 ## What Happens By Default?
 
@@ -57,7 +57,7 @@ Not sure which connections your job needs? Start in audit mode:
     mode: audit
 ```
 
-Audit mode records what Fence would block without blocking traffic or disabling `sudo` and Docker. Check the job summary, add the destinations you need, and remove `mode: audit` when you are ready to enforce the allowlist.
+Audit mode records what Fence would block without blocking traffic or disabling `sudo` and Docker. It may still restore root ownership of `/etc` and `/usr`. Check the job summary, add the destinations you need, and remove `mode: audit` when you are ready to enforce the allowlist.
 
 ## Upload Artifacts Or Deploy Pages
 

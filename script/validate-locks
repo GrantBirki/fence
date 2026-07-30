@@ -273,9 +273,10 @@ require(
         "build.yml",
         "acceptance.yml",
         "action-acceptance.yml",
+        "action-acceptance-ubuntu-latest.yml",
         "integration.yml",
     },
-    "Pull requests must run exactly the six reviewed CI workflows",
+    "Pull requests must run the six protected workflows and reviewed ubuntu-latest acceptance",
 )
 pull_request_sources = {
     name: source
@@ -922,10 +923,41 @@ require(
 for fragment in [
     "acceptance_runner: ${{ steps.candidate.outputs.acceptance_runner }}",
     "INPUT_ACCEPTANCE_RUNNER: ${{ inputs.acceptance_runner }}",
+    "PULL_REQUEST_BASE_REF: ${{ github.event.pull_request.base.ref }}",
+    "PULL_REQUEST_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
     'acceptance_runner="${INPUT_ACCEPTANCE_RUNNER:-ubuntu-24.04}"',
     'echo "acceptance_runner=$acceptance_runner" >> "$GITHUB_OUTPUT"',
 ]:
     require(fragment in prepare, "Action acceptance validated runner output contract is incomplete")
+
+select_candidate_environment = indented_block(
+    select_candidate,
+    "        env:",
+    "Action acceptance candidate-selection environment must be unique",
+)
+require_exact_mapping_keys(
+    select_candidate_environment,
+    10,
+    [
+        "INPUT_ACTION_REF",
+        "INPUT_CANDIDATE_KIND",
+        "INPUT_ACCEPTANCE_RUNNER",
+        "PULL_REQUEST_BASE_REF",
+        "PULL_REQUEST_HEAD_REPOSITORY",
+    ],
+    "Action acceptance candidate-selection environment must remain narrowly scoped",
+)
+require(
+    scalar_mapping(select_candidate_environment, 10)
+    == {
+        "INPUT_ACTION_REF": "${{ inputs.action_ref }}",
+        "INPUT_CANDIDATE_KIND": "${{ inputs.candidate_kind }}",
+        "INPUT_ACCEPTANCE_RUNNER": "${{ inputs.acceptance_runner }}",
+        "PULL_REQUEST_BASE_REF": "${{ github.event.pull_request.base.ref }}",
+        "PULL_REQUEST_HEAD_REPOSITORY": "${{ github.event.pull_request.head.repo.full_name }}",
+    },
+    "Action acceptance candidate-selection environment must use only reviewed GitHub metadata",
+)
 
 runner_case_match = re.search(
     r'(?ms)^          case "\$acceptance_runner" in\n(.*?)^          esac$',
@@ -936,8 +968,14 @@ runner_case = runner_case_match.group(1)
 expected_runner_case = (
     "            ubuntu-24.04) ;;\n"
     "            ubuntu-latest)\n"
-    '              if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then\n'
-    '                echo "ubuntu-latest acceptance must run from refs/heads/main" >&2\n'
+    '              if [[ "$GITHUB_REF" != "refs/heads/main" ]] &&\n'
+    '                [[ "$GITHUB_EVENT_NAME" != "pull_request" ||\n'
+    '                   ! "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ||\n'
+    '                   "$PULL_REQUEST_BASE_REF" != "main" ||\n'
+    '                   "$PULL_REQUEST_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ||\n'
+    '                   "$action_ref" != "$GITHUB_SHA" ||\n'
+    '                   "$candidate_kind" != "source" ]]; then\n'
+    '                echo "ubuntu-latest acceptance requires main or its same-repository pull request" >&2\n'
     "                exit 1\n"
     "              fi\n"
     "              ;;\n"
@@ -948,7 +986,7 @@ expected_runner_case = (
 )
 require(
     runner_case == expected_runner_case,
-    "Action acceptance runner allowlist and main-only ubuntu-latest guard must fail closed",
+    "Action acceptance ubuntu-latest guard must permit only main and same-repository source pull requests",
 )
 
 validated_runner = "${{ needs.prepare-candidate.outputs.acceptance_runner }}"
@@ -2119,8 +2157,8 @@ nightly_triggers = indented_block(
 require_exact_mapping_keys(
     nightly_triggers,
     2,
-    ["schedule", "workflow_dispatch"],
-    "Nightly ubuntu-latest may run only on schedule or manual dispatch",
+    ["schedule", "workflow_dispatch", "pull_request"],
+    "Ubuntu-latest acceptance may run only on schedule, manual dispatch, or reviewed pull requests",
 )
 nightly_schedule = indented_block(
     nightly_triggers,
@@ -2153,6 +2191,25 @@ require(
     ),
     "Nightly ubuntu-latest manual dispatch must not accept inputs",
 )
+nightly_pull_request = indented_block(
+    nightly_triggers,
+    "  pull_request:",
+    "Ubuntu-latest acceptance pull-request trigger must be unique",
+)
+require_exact_mapping_keys(
+    nightly_pull_request,
+    4,
+    ["branches"],
+    "Ubuntu-latest acceptance pull-request trigger may contain only its reviewed branch filter",
+)
+require(
+    re.findall(
+        r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
+        nightly_pull_request,
+    )
+    == ["main"],
+    "Ubuntu-latest acceptance pull requests must target main",
+)
 
 nightly_permissions_block = indented_block(
     nightly,
@@ -2184,8 +2241,11 @@ require_exact_mapping_keys(
 nightly_concurrency = scalar_mapping(nightly_concurrency_block, 2)
 require(
     nightly_concurrency
-    == {"group": "nightly-ubuntu-latest", "cancel-in-progress": "false"},
-    "Nightly ubuntu-latest concurrency must be distinct and non-cancelling",
+    == {
+        "group": "nightly-ubuntu-latest-${{ github.event.pull_request.number || 'main' }}",
+        "cancel-in-progress": "false",
+    },
+    "Ubuntu-latest acceptance concurrency must isolate pull requests without cancelling protected jobs",
 )
 
 nightly_jobs = indented_block(
@@ -2207,16 +2267,17 @@ nightly_job = indented_block(
 require_exact_mapping_keys(
     nightly_job,
     4,
-    ["name", "uses", "with"],
-    "Nightly ubuntu-latest caller may contain only its name, reusable call, and reviewed inputs",
+    ["name", "if", "uses", "with"],
+    "Ubuntu-latest caller may contain only its name, trusted-source condition, reusable call, and reviewed inputs",
 )
 require(
     scalar_mapping(nightly_job, 4)
     == {
         "name": "ubuntu-latest action acceptance",
+        "if": "${{ github.event_name != 'pull_request' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository) }}",
         "uses": "./.github/workflows/action-acceptance.yml",
     },
-    "Nightly ubuntu-latest caller job must remain an unconditional local reusable-workflow call",
+    "Ubuntu-latest acceptance must reject fork pull requests before its local reusable-workflow call",
 )
 nightly_with = indented_block(
     nightly_job,
@@ -2329,8 +2390,8 @@ canary_schedule_lines = [
     if line.strip() and not line.lstrip().startswith("#")
 ]
 require(
-    canary_schedule_lines == ['    - cron: "23 13 * * *"'],
-    "Action drift canary schedule must run daily at 13:23 UTC",
+    canary_schedule_lines == ['    - cron: "23 */6 * * *"'],
+    "Action drift canary schedule must run every six hours",
 )
 
 for trigger_name, expected_required in [
@@ -2438,7 +2499,7 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(canary_job, 4)
     == {
-        "name": "${{ matrix.runner }} zero-input canary",
+        "name": "${{ matrix.runner }} ${{ matrix.mode }} canary",
         "timeout-minutes": "8",
         "runs-on": "${{ matrix.runner }}",
     },
@@ -2467,15 +2528,16 @@ canary_matrix = indented_block(
 require_exact_mapping_keys(
     canary_matrix,
     8,
-    ["runner"],
-    "Action drift canary matrix may select only its reviewed runner dimension",
+    ["runner", "mode"],
+    "Action drift canary matrix may select only its reviewed runner and mode dimensions",
 )
 require(
     scalar_mapping(canary_matrix, 8)
     == {
-        "runner": "${{ fromJSON(inputs.action_ref == '' && '[\"ubuntu-24.04\",\"ubuntu-latest\"]' || '[\"ubuntu-24.04\"]') }}",
+        "runner": "[ubuntu-24.04, ubuntu-latest]",
+        "mode": "[block, audit]",
     },
-    "Action drift canary runner matrix must use both reviewed labels only when action_ref is absent",
+    "Action drift canary matrix must test both supported labels in block and audit mode",
 )
 require(
     len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
@@ -2512,10 +2574,10 @@ canary_fragments = [
 for fragment in canary_fragments:
     require(fragment in canary, "Action drift canary contract is incomplete")
 
-require(canary.count("uses: ./") == 1, "Action drift canary must activate the bundle exactly once")
+require(canary.count("uses: ./") == 2, "Action drift canary must define exactly one activation per mode")
 require(
-    canary.count("script/test-action-acceptance standard") == 1,
-    "Action drift canary must validate one standard lifecycle",
+    canary.count('script/test-action-acceptance "$scenario"') == 1,
+    "Action drift canary must validate exactly one mode-selected lifecycle",
 )
 
 for forbidden in [
@@ -2528,18 +2590,25 @@ for forbidden in [
     require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
 require(
     re.findall(r"(?m)^        if:[ \t]*(.+)$", canary)
-    == ["steps.resolve.outputs.mapped_release == 'true'"],
-    "Action drift canary may condition only the mapped-release provenance gate",
+    == [
+        "steps.resolve.outputs.mapped_release == 'true'",
+        "matrix.mode == 'block'",
+        "matrix.mode == 'audit'",
+    ],
+    "Action drift canary may condition only release provenance and exact mode activation",
 )
 
 guard_marker = "\n      - name: require bundled Action activation\n"
 activation_marker = "\n      - name: activate bundled Fence agent with strict defaults\n"
-verification_marker = "\n      - name: verify zero-input Action lifecycle\n"
+audit_activation_marker = "\n      - name: activate bundled Fence agent in audit mode\n"
+verification_marker = "\n      - name: verify Action lifecycle\n"
 require(canary.count(guard_marker) == 1, "Action drift canary classifier guard must be unique")
 require(canary.count(activation_marker) == 1, "Action drift canary activation step must be unique")
+require(canary.count(audit_activation_marker) == 1, "Action drift canary audit activation step must be unique")
 require(canary.count(verification_marker) == 1, "Action drift canary lifecycle step must be unique")
 guard = canary.split(guard_marker, 1)[1].split(activation_marker, 1)[0]
-activation = canary.split(activation_marker, 1)[1].split(verification_marker, 1)[0]
+activation = canary.split(activation_marker, 1)[1].split(audit_activation_marker, 1)[0]
+audit_activation = canary.split(audit_activation_marker, 1)[1].split(verification_marker, 1)[0]
 verification = canary.split(verification_marker, 1)[1]
 expected_guard = (
     "        env:\n"
@@ -2552,11 +2621,28 @@ expected_guard = (
     "          fi\n"
 )
 require(guard == expected_guard, "Action drift canary classifier guard must fail closed")
-require(activation == "        uses: ./\n", "Action drift canary activation must use zero inputs")
+require(
+    activation == "        if: matrix.mode == 'block'\n        uses: ./\n",
+    "Action drift canary block activation must use zero inputs",
+)
+require(
+    audit_activation
+    == "        if: matrix.mode == 'audit'\n        uses: ./\n        with:\n          mode: audit\n",
+    "Action drift canary audit activation must use only its explicit audit input",
+)
 require(
     verification
-    == '        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n',
-    "Action drift canary lifecycle validation must be unconditional",
+    == (
+        "        env:\n"
+        "          FENCE_MODE: ${{ matrix.mode }}\n"
+        "        run: |\n"
+        "          scenario=standard\n"
+        '          if [[ "$FENCE_MODE" == "audit" ]]; then\n'
+        "            scenario=audit\n"
+        "          fi\n"
+        '          script/test-action-acceptance "$scenario" "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n'
+    ),
+    "Action drift canary lifecycle validation must remain unconditional for both modes",
 )
 
 release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")

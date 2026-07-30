@@ -6,6 +6,57 @@ pub const SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1: &str = "exact_file_v1";
 pub const SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1: &str =
     "cloud_init_generated_header_v1";
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn reviewed_ubuntu_lts_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b'.' || &bytes[3..] != b"04" {
+        return false;
+    }
+    let Some(year) = bytes[..2].iter().try_fold(0_u8, |year, byte| {
+        byte.is_ascii_digit()
+            .then_some(year.saturating_mul(10) + byte.saturating_sub(b'0'))
+    }) else {
+        return false;
+    };
+    (24..=40).contains(&year) && year % 2 == 0
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn reviewed_ubuntu_os_release(contents: &str) -> bool {
+    let mut id = None;
+    let mut version = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !matches!(key, "ID" | "VERSION_ID") {
+            continue;
+        }
+        let value = if value.starts_with('"') {
+            let Some(value) = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+            else {
+                return false;
+            };
+            if value.contains('"') {
+                return false;
+            }
+            value
+        } else {
+            if value.contains('"') {
+                return false;
+            }
+            value
+        };
+        let selected = if key == "ID" { &mut id } else { &mut version };
+        if selected.replace(value).is_some() {
+            return false;
+        }
+    }
+    id == Some("ubuntu") && version.is_some_and(reviewed_ubuntu_lts_version)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct HostedRunnerFingerprintV3 {
     pub schema_version: u32,
@@ -493,6 +544,38 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_ubuntu_releases_are_bounded_even_year_lts_versions() {
+        for version in ["24.04", "26.04", "28.04", "40.04"] {
+            assert!(reviewed_ubuntu_lts_version(version));
+            assert!(reviewed_ubuntu_os_release(&format!(
+                "ID=ubuntu\nVERSION_ID=\"{version}\"\n"
+            )));
+        }
+        assert!(reviewed_ubuntu_os_release(
+            "ID=\"ubuntu\"\nVERSION_ID=26.04\n"
+        ));
+        for version in [
+            "22.04", "25.04", "26.10", "42.04", "026.04", "26.4", "26004", "2a.04",
+        ] {
+            assert!(!reviewed_ubuntu_lts_version(version));
+        }
+        for contents in [
+            "NAME=Ubuntu\nVERSION_ID=\"26.04\"\n",
+            "NAME=Ubuntu\nID=ubuntu\n",
+            "ID=debian\nVERSION_ID=\"26.04\"\n",
+            "ID=ubuntu\nVERSION_ID=\"25.04\"\n",
+            "ID=ubuntu\nID=ubuntu\nVERSION_ID=\"26.04\"\n",
+            "ID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION_ID=\"24.04\"\n",
+            "ID=\"ubuntu\nVERSION_ID=\"26.04\"\n",
+            "ID=\"ub\"untu\"\nVERSION_ID=\"26.04\"\n",
+            "ID=ub\"untu\nVERSION_ID=\"26.04\"\n",
+            "not-an-os-release-line\nID=ubuntu\nVERSION_ID=\"26.10\"\n",
+        ] {
+            assert!(!reviewed_ubuntu_os_release(contents));
+        }
+    }
 
     #[test]
     fn fingerprint_v3_preserves_reviewed_host_facts_without_an_active_transition() {
