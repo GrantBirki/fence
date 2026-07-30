@@ -990,9 +990,12 @@ fn verify_host_capabilities(
     }
     verify_reviewed_runner_groups(executables, &accepted, docker_available)?;
     verify_runner_access_probes(executables, &accepted)?;
-    let sudo_source_pins = capture_sudo_sources(executables)?;
-    if discover_runner_sudo_source_names(executables, &sudo_source_pins)?.is_empty() {
-        return Err(unsupported_fingerprint());
+    let sudo_source_pins = capture_sudo_sources(executables).map_err(unsupported_sudo_policy)?;
+    if discover_runner_sudo_source_names(executables, &sudo_source_pins)
+        .map_err(unsupported_sudo_policy)?
+        .is_empty()
+    {
+        return Err(unsupported_sudo_policy(unsupported_fingerprint()));
     }
     let sudo_syntax = fixed_command(
         executables,
@@ -1000,10 +1003,10 @@ fn verify_host_capabilities(
         &RESTORED_SUDO_VISUDO_ARGUMENTS,
     )?;
     if !sudo_syntax.status.success() {
-        return Err(unsupported_fingerprint());
+        return Err(unsupported_sudo_policy(unsupported_fingerprint()));
     }
-    if capture_sudo_sources(executables)? != sudo_source_pins {
-        return Err(unsupported_fingerprint());
+    if capture_sudo_sources(executables).map_err(unsupported_sudo_policy)? != sudo_source_pins {
+        return Err(unsupported_sudo_policy(unsupported_fingerprint()));
     }
     Ok(sudo_source_pins)
 }
@@ -1019,9 +1022,10 @@ fn verify_reviewed_runner_groups(
         &["--groups", "--name", accepted.expected_principal],
     )?;
     if !groups.status.success() {
-        return Err(unsupported_fingerprint());
+        return Err(unsupported_runner_groups());
     }
-    let groups_text = std::str::from_utf8(&groups.stdout).map_err(|_| unsupported_fingerprint())?;
+    let groups_text =
+        std::str::from_utf8(&groups.stdout).map_err(|_| unsupported_runner_groups())?;
     let observed = groups_text.split_whitespace().collect::<BTreeSet<_>>();
     let reviewed = accepted
         .required_runner_groups
@@ -1032,7 +1036,7 @@ fn verify_reviewed_runner_groups(
         || docker_available && !observed.contains("docker")
         || !observed.is_subset(&reviewed)
     {
-        return Err(unsupported_fingerprint());
+        return Err(unsupported_runner_groups());
     }
     Ok(())
 }
@@ -1070,12 +1074,21 @@ where
     }
 
     let mut paths = Vec::new();
-    for entry in fs::read_dir(drop_in_root).map_err(|_| unsupported_fingerprint())? {
+    for (index, entry) in fs::read_dir(drop_in_root)
+        .map_err(|_| unsupported_fingerprint())?
+        .enumerate()
+    {
+        if index >= MAX_SUDO_POLICY_SOURCES * 2 {
+            return Err(unsupported_fingerprint());
+        }
         let entry = entry.map_err(|_| unsupported_fingerprint())?;
         let name = entry
             .file_name()
             .into_string()
             .map_err(|_| unsupported_fingerprint())?;
+        if !active_sudo_drop_in(&name) {
+            continue;
+        }
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -1132,6 +1145,10 @@ where
         return Err(unsupported_fingerprint());
     }
     Ok(pins)
+}
+
+fn active_sudo_drop_in(name: &str) -> bool {
+    !name.contains('.') && !name.ends_with('~')
 }
 
 fn capture_dynamic_sudo_policy_source<Probe>(
@@ -1291,6 +1308,16 @@ fn reviewed_runner_sudo_policy_for_principals(bytes: &[u8], principals: &[String
         let Some(line) = effective_sudo_policy_line(raw) else {
             return false;
         };
+        if line.starts_with(b"Defaults")
+            && line.get(b"Defaults".len()).is_some_and(|separator| {
+                separator.is_ascii_whitespace() || matches!(separator, b':' | b'@' | b'>' | b'!')
+            })
+        {
+            if !sudo_authentication_defaults_are_safe(line) {
+                return false;
+            }
+            continue;
+        }
         if !line.is_empty() && effective.replace(line).is_some() {
             return false;
         }
@@ -1948,6 +1975,24 @@ fn unsupported_fingerprint() -> LockdownError {
     )
 }
 
+fn unsupported_runner_groups() -> LockdownError {
+    LockdownError::new(
+        "unsupported_host_fingerprint",
+        "runner groups are missing required membership or include an unreviewed group",
+    )
+}
+
+fn unsupported_sudo_policy(error: LockdownError) -> LockdownError {
+    if error.code == "unsupported_host_fingerprint" {
+        LockdownError::new(
+            error.code,
+            "sudo policy is unsafe, invalid, changed, or lacks a reviewed runner grant",
+        )
+    } else {
+        error
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2246,6 +2291,20 @@ mod tests {
                 "unsupported_host_fingerprint"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_host_errors_identify_groups_and_sudo_policy() {
+        let groups = unsupported_runner_groups();
+        assert_eq!(groups.code, "unsupported_host_fingerprint");
+        assert!(groups.message.contains("runner groups"));
+
+        let sudo = unsupported_sudo_policy(unsupported_fingerprint());
+        assert_eq!(sudo.code, "unsupported_host_fingerprint");
+        assert!(sudo.message.contains("sudo policy"));
+
+        let original = LockdownError::new("runner_probe_failed", "probe unavailable");
+        assert_eq!(unsupported_sudo_policy(original.clone()), original);
     }
 
     #[test]
@@ -2586,6 +2645,16 @@ mod tests {
     }
 
     #[test]
+    fn sudo_drop_in_names_follow_sudo_backup_file_rules() {
+        for name in ["runner", "90-cloud-init-users", "policy_1"] {
+            assert!(active_sudo_drop_in(name));
+        }
+        for name in ["runner.bak", ".runner", "runner~", "runner.old~"] {
+            assert!(!active_sudo_drop_in(name));
+        }
+    }
+
+    #[test]
     fn sudo_policy_rejects_external_nested_and_continued_include_directives() {
         assert!(sudo_includes_are_bounded(
             b"Defaults env_reset\n@includedir /etc/sudoers.d\n",
@@ -2655,6 +2724,8 @@ mod tests {
             b"# image metadata\n  runner\tALL=(ALL:ALL)\tNOPASSWD:ALL  \n# note\n",
             b"runner ALL=(ALL:ALL) NOPASSWD: ALL\n",
             b"runner ALL=(ALL) NOPASSWD:ALL # Windows C:\\Users\\runner\n",
+            b"Defaults env_reset\nrunner ALL=(ALL) NOPASSWD:ALL\nDefaults use_pty\n",
+            b"Defaults:runner env_keep += \"authenticate, # listpw\"\nrunner ALL=(ALL) NOPASSWD:ALL\n",
         ] {
             assert!(reviewed_runner_sudo_policy(policy));
         }
@@ -2670,8 +2741,15 @@ mod tests {
         for policy in [
             b"runner ALL=(ALL) NOPASSWD:/bin/sh\n".as_slice(),
             b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults !root_sudo\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults env_reset, !authenticate\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults:runner listpw=always\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults env_keep += \"unterminated\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaultsTypo env_reset\n",
             b"runner ALL=(ALL) NOPASSWD:ALL\nroot ALL=(ALL) NOPASSWD:ALL\n",
             b"runner ALL=(ALL) NOPASSWD:ALL\n#1001 ALL=(ALL) NOPASSWD:ALL\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nUser_Alias ADMINS = runner\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\n@includedir /etc/sudoers.d\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults env_reset\\\n!authenticate\n",
             b"runner ALL=(ALL) NOPASSWD:ALL\n#incl\\\nude /tmp/unsafe\n",
             b"ubuntu ALL=(ALL) NOPASSWD:ALL\n",
         ] {

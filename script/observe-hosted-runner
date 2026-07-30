@@ -666,7 +666,9 @@ if drop_in_root_metadata is not None and stat.S_ISDIR(drop_in_root_metadata.st_m
     remaining_sources = max(0, MAX_POLICY_SOURCES - len(sudo_sources))
     try:
         candidates, policy_sources_truncated = bounded_directory_entries(
-            drop_in_root, remaining_sources
+            drop_in_root,
+            remaining_sources,
+            lambda name: "." not in name and not name.endswith("~"),
         )
     except OSError:
         candidates = []

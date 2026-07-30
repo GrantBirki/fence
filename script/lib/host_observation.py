@@ -356,10 +356,14 @@ def bounded_file_lines(path, maximum_bytes, maximum_lines):
     return lines[:maximum_lines], len(lines) > maximum_lines
 
 
-def bounded_directory_entries(path, maximum_entries):
+def bounded_directory_entries(path, maximum_entries, include=None):
     entries = []
     with os.scandir(path) as candidates:
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
+            if index >= maximum_entries * 2:
+                return sorted(entries), True
+            if include is not None and not include(candidate.name):
+                continue
             if len(entries) >= maximum_entries:
                 return sorted(entries), True
             entries.append(pathlib.Path(candidate.path))
@@ -3155,6 +3159,17 @@ os._exit(0 if started.exists() else 2)
             (root / "c").symlink_to(root / "a")
             entries, truncated = bounded_directory_entries(root, 2)
             self.assertEqual(len(entries), 2)
+            self.assertTrue(truncated)
+            policy_root = root / "sudoers"
+            policy_root.mkdir()
+            for name in ["backup.bak", "editor~", "first", "second"]:
+                (policy_root / name).touch()
+            active = lambda name: "." not in name and not name.endswith("~")
+            entries, truncated = bounded_directory_entries(policy_root, 2, active)
+            self.assertEqual([entry.name for entry in entries], ["first", "second"])
+            self.assertFalse(truncated)
+            (policy_root / "extra.bak").touch()
+            _, truncated = bounded_directory_entries(policy_root, 2, active)
             self.assertTrue(truncated)
             lines = root / "lines"
             lines.write_text("1\n2\n3\n", encoding="utf-8")

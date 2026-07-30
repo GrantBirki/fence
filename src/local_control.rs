@@ -560,7 +560,7 @@ fn verify_reviewed_local_control_snapshot(
         return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
             "local_control_inventory_additive_drift",
-            "local control inventory contains an unapproved endpoint or owner",
+            "runner exposes an unreviewed privileged service, endpoint, or owner",
         ));
     }
     Ok(())
@@ -3578,12 +3578,12 @@ mod tests {
             ownership_complete: true,
             instances: 1,
         });
+        let error = verify_reviewed_local_control_observation(&inventory, &added).unwrap_err();
         assert_eq!(
-            verify_reviewed_local_control_observation(&inventory, &added)
-                .unwrap_err()
-                .kind,
+            error.kind,
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
         );
+        assert!(error.message.contains("privileged service"));
     }
 
     #[test]
