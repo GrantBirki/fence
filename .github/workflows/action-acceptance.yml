@@ -53,6 +53,8 @@ jobs:
           INPUT_ACTION_REF: ${{ inputs.action_ref }}
           INPUT_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
           INPUT_ACCEPTANCE_RUNNER: ${{ inputs.acceptance_runner }}
+          PULL_REQUEST_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PULL_REQUEST_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           action_ref="${INPUT_ACTION_REF:-${GITHUB_SHA}}"
@@ -73,8 +75,14 @@ jobs:
           case "$acceptance_runner" in
             ubuntu-24.04) ;;
             ubuntu-latest)
-              if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-                echo "ubuntu-latest acceptance must run from refs/heads/main" >&2
+              if [[ "$GITHUB_REF" != "refs/heads/main" ]] &&
+                [[ "$GITHUB_EVENT_NAME" != "pull_request" ||
+                   ! "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ||
+                   "$PULL_REQUEST_BASE_REF" != "main" ||
+                   "$PULL_REQUEST_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ||
+                   "$action_ref" != "$GITHUB_SHA" ||
+                   "$candidate_kind" != "source" ]]; then
+                echo "ubuntu-latest acceptance requires main or its same-repository pull request" >&2
                 exit 1
               fi
               ;;

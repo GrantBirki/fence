@@ -1169,11 +1169,10 @@ where
 }
 
 fn sudo_includes_are_bounded(bytes: &[u8], allow_drop_in_directory_include: bool) -> bool {
-    if bytes.contains(&b'\\') {
-        return false;
-    }
     bytes.split(|byte| *byte == b'\n').all(|line| {
-        let trimmed = trim_ascii_whitespace(line);
+        let Some(trimmed) = effective_sudo_policy_line(line) else {
+            return false;
+        };
         if !(trimmed.starts_with(b"#include") || trimmed.starts_with(b"@include")) {
             return true;
         }
@@ -1190,27 +1189,95 @@ fn sudo_includes_are_bounded(bytes: &[u8], allow_drop_in_directory_include: bool
 
 fn sudo_authentication_defaults_are_safe(bytes: &[u8]) -> bool {
     bytes.split(|byte| *byte == b'\n').all(|line| {
-        let line = trim_ascii_whitespace(line);
-        if !line.starts_with(b"Defaults") {
+        let Some(line) = effective_sudo_policy_line(line) else {
+            return false;
+        };
+        let Some((directive, settings)) = line
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .map(|index| (&line[..index], &line[index + 1..]))
+        else {
+            return !line.starts_with(b"Defaults");
+        };
+        if !directive.starts_with(b"Defaults") {
             return true;
         }
-        let effective = line.split(|byte| *byte == b'#').next().unwrap_or_default();
-        [
-            "root_sudo",
-            "verifypw",
-            "listpw",
-            "rootpw",
-            "targetpw",
-            "runaspw",
-            "authenticate",
-        ]
-        .iter()
-        .all(|setting| {
-            !effective
-                .windows(setting.len())
-                .any(|window| window == setting.as_bytes())
-        })
+        let mut quoted = false;
+        let mut start = 0;
+        for (index, byte) in settings.iter().copied().enumerate() {
+            if byte == b'"' {
+                quoted = !quoted;
+            }
+            if byte == b',' && !quoted {
+                if forbidden_sudo_authentication_setting(&settings[start..index]) {
+                    return false;
+                }
+                start = index + 1;
+            }
+        }
+        !quoted && !forbidden_sudo_authentication_setting(&settings[start..])
     })
+}
+
+fn effective_sudo_policy_line(line: &[u8]) -> Option<&[u8]> {
+    let line = trim_ascii_whitespace(line);
+    if line.starts_with(b"#")
+        && !line.starts_with(b"#include")
+        && line.get(1).is_none_or(|byte| !byte.is_ascii_digit())
+    {
+        let keyword = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default();
+        let unescaped = keyword
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\\')
+            .collect::<Vec<_>>();
+        if unescaped.starts_with(b"#include")
+            || keyword.ends_with(b"\\") && b"#include".starts_with(&unescaped)
+        {
+            return None;
+        }
+        return Some(&[]);
+    }
+
+    let mut quoted = false;
+    for (index, byte) in line.iter().copied().enumerate() {
+        match byte {
+            b'\\' => return None,
+            b'"' => quoted = !quoted,
+            b'#' if !quoted
+                && index != 0
+                && line
+                    .get(index + 1)
+                    .is_none_or(|next| !next.is_ascii_digit()) =>
+            {
+                return Some(trim_ascii_whitespace(&line[..index]));
+            }
+            _ => {}
+        }
+    }
+    (!quoted).then_some(line)
+}
+
+fn forbidden_sudo_authentication_setting(option: &[u8]) -> bool {
+    let option = trim_ascii_whitespace(option);
+    let option = option.strip_prefix(b"!").unwrap_or(option);
+    let name_end = option
+        .iter()
+        .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        .unwrap_or(option.len());
+    matches!(
+        &option[..name_end],
+        b"root_sudo"
+            | b"verifypw"
+            | b"listpw"
+            | b"rootpw"
+            | b"targetpw"
+            | b"runaspw"
+            | b"authenticate"
+    )
 }
 
 #[cfg(test)]
@@ -1219,14 +1286,16 @@ fn reviewed_runner_sudo_policy(bytes: &[u8]) -> bool {
 }
 
 fn reviewed_runner_sudo_policy_for_principals(bytes: &[u8], principals: &[String]) -> bool {
-    let mut lines = bytes
-        .split(|byte| *byte == b'\n')
-        .map(trim_ascii_whitespace)
-        .filter(|line| {
-            !(line.is_empty()
-                || line.starts_with(b"#") && line.get(1).is_none_or(|byte| !byte.is_ascii_digit()))
-        });
-    let Some(line) = lines.next() else {
+    let mut effective = None;
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        let Some(line) = effective_sudo_policy_line(raw) else {
+            return false;
+        };
+        if !line.is_empty() && effective.replace(line).is_some() {
+            return false;
+        }
+    }
+    let Some(line) = effective else {
         return false;
     };
     let fields = line
@@ -1244,7 +1313,6 @@ fn reviewed_runner_sudo_policy_for_principals(bytes: &[u8], principals: &[String
             policy.as_slice(),
             b"ALL=(ALL)NOPASSWD:ALL" | b"ALL=(ALL:ALL)NOPASSWD:ALL"
         )
-        && lines.next().is_none()
 }
 
 fn discover_runner_sudo_source_names(
@@ -2527,6 +2595,14 @@ mod tests {
             b"runner ALL=(ALL) NOPASSWD:ALL\n# documentation\n",
             false,
         ));
+        assert!(sudo_includes_are_bounded(
+            b"# Windows path C:\\Users\\runner\\notes\n# docs C:\\temp\\\n",
+            false,
+        ));
+        assert!(sudo_includes_are_bounded(
+            b"#1001 ALL=(ALL) NOPASSWD:ALL # Windows C:\\Users\\runner\n",
+            false,
+        ));
         for (policy, allow_root_include) in [
             (b"@include /tmp/unsafe\n".as_slice(), true),
             (b"#include /tmp/unsafe\n".as_slice(), true),
@@ -2535,6 +2611,9 @@ mod tests {
             (b"@includedir /etc/sudoers.d\n".as_slice(), false),
             (b"@incl\\\nude /tmp/unsafe\n".as_slice(), true),
             (b"#incl\\\nude /tmp/unsafe\n".as_slice(), true),
+            (b"#inc\\lude /tmp/unsafe\n".as_slice(), true),
+            (b"#1001 ALL=(ALL) NOPASSWD:ALL\\\n".as_slice(), false),
+            (b"Defaults env_keep += \"unterminated\n".as_slice(), false),
         ] {
             assert!(!sudo_includes_are_bounded(policy, allow_root_include));
         }
@@ -2545,6 +2624,12 @@ mod tests {
         assert!(sudo_authentication_defaults_are_safe(
             b"Defaults env_reset\nDefaults use_pty # listpw is documented here\n"
         ));
+        assert!(sudo_authentication_defaults_are_safe(
+            b"# Windows C:\\Users\\runner\\docs\nDefaults env_keep += \"authenticate, listpw\"\nDefaults authenticate_extra, listpw_extra\n"
+        ));
+        assert!(sudo_authentication_defaults_are_safe(
+            b"Defaults env_keep += \"# authenticate\" # rootpw C:\\Users\\runner\n"
+        ));
         for policy in [
             b"Defaults !root_sudo\n".as_slice(),
             b"Defaults verifypw=always\n".as_slice(),
@@ -2553,6 +2638,10 @@ mod tests {
             b"Defaults targetpw\n".as_slice(),
             b"Defaults runaspw\n".as_slice(),
             b"Defaults !authenticate\n".as_slice(),
+            b"Defaults env_reset, !authenticate\n".as_slice(),
+            b"Defaults env_keep += \"harmless\", listpw=always\n".as_slice(),
+            b"Defaults env_keep += \"unterminated\n".as_slice(),
+            b"Defaults env_reset\\\n!authenticate\n".as_slice(),
             b"Defaults !root_sudo\nDefaults verifypw=always\nrunner ALL=(ALL) NOPASSWD:/bin/sh\n",
         ] {
             assert!(!sudo_authentication_defaults_are_safe(policy));
@@ -2565,6 +2654,7 @@ mod tests {
             b"runner ALL=(ALL) NOPASSWD:ALL\n".as_slice(),
             b"# image metadata\n  runner\tALL=(ALL:ALL)\tNOPASSWD:ALL  \n# note\n",
             b"runner ALL=(ALL:ALL) NOPASSWD: ALL\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL # Windows C:\\Users\\runner\n",
         ] {
             assert!(reviewed_runner_sudo_policy(policy));
         }
@@ -2582,6 +2672,7 @@ mod tests {
             b"runner ALL=(ALL) NOPASSWD:ALL\nDefaults !root_sudo\n",
             b"runner ALL=(ALL) NOPASSWD:ALL\nroot ALL=(ALL) NOPASSWD:ALL\n",
             b"runner ALL=(ALL) NOPASSWD:ALL\n#1001 ALL=(ALL) NOPASSWD:ALL\n",
+            b"runner ALL=(ALL) NOPASSWD:ALL\n#incl\\\nude /tmp/unsafe\n",
             b"ubuntu ALL=(ALL) NOPASSWD:ALL\n",
         ] {
             assert!(!reviewed_runner_sudo_policy(policy));
