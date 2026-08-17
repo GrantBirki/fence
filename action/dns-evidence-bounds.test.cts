@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { validateDnsEvidence } = require("./lib.cts");
+const { validateDnsEvidenceBounds } = require("./post.cts");
 
 function residentHealth() {
   return {
@@ -70,6 +71,10 @@ function dnsEvidence(currentReport, overrides = {}) {
   };
 }
 
+function validateEvidence(evidence, currentReport) {
+  return validateDnsEvidenceBounds(validateDnsEvidence(evidence, currentReport));
+}
+
 test("bounds retained DNS observations to the Rust evidence limit", () => {
   const currentReport = report();
   const observations = Array.from({ length: 256 }, (_, index) => ({
@@ -77,12 +82,12 @@ test("bounds retained DNS observations to the Rust evidence limit", () => {
     policy_classification: "outside_policy",
   }));
 
-  assert.doesNotThrow(() => validateDnsEvidence(
+  assert.doesNotThrow(() => validateEvidence(
     dnsEvidence(currentReport, { observations }),
     currentReport,
   ));
   assert.throws(
-    () => validateDnsEvidence(
+    () => validateEvidence(
       dnsEvidence(currentReport, {
         observations: [
           ...observations,
@@ -91,7 +96,7 @@ test("bounds retained DNS observations to the Rust evidence limit", () => {
       }),
       currentReport,
     ),
-    /bounded DNS observation evidence/,
+    /retained DNS evidence bounds/,
   );
 });
 
@@ -99,7 +104,7 @@ test("bounds retained addresses per DNS observation", () => {
   const currentReport = report();
   const addresses = Array.from({ length: 32 }, (_, index) => `192.0.2.${index + 1}`);
 
-  assert.doesNotThrow(() => validateDnsEvidence(
+  assert.doesNotThrow(() => validateEvidence(
     dnsEvidence(currentReport, {
       observations: [{
         hostname: "api.example.com",
@@ -110,7 +115,7 @@ test("bounds retained addresses per DNS observation", () => {
     currentReport,
   ));
   assert.throws(
-    () => validateDnsEvidence(
+    () => validateEvidence(
       dnsEvidence(currentReport, {
         observations: [{
           hostname: "api.example.com",
@@ -120,6 +125,6 @@ test("bounds retained addresses per DNS observation", () => {
       }),
       currentReport,
     ),
-    /bounded DNS observation evidence/,
+    /retained DNS evidence bounds/,
   );
 });
