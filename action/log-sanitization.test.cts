@@ -14,3 +14,9 @@ test("sanitizes C1 controls and Unicode line separators", () => {
     "first_second_third_fourth%25",
   );
 });
+
+test("keeps workflow command escaping inside the debug-line byte bound", () => {
+  const escaped = actionLog.workflowEscape("%".repeat(4096));
+  assert.ok(Buffer.byteLength(escaped, "utf8") <= 4096);
+  assert.ok(escaped.endsWith("...[truncated]"));
+});
