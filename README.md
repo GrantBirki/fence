@@ -120,7 +120,7 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
-The report includes network destinations, allowed or blocked activity, and warnings. Audit reports also suggest allowlist entries. Anyone who can read the job log can read the report.
+The report includes network destinations, allowed or blocked activity, and warnings. A DNS warning can mean Fence safely refused an answer; it does not always mean protection failed. Audit reports also suggest allowlist entries. Anyone who can read the job log can read the report.
 
 See [Network reports](docs/how-it-works.md#network-reports) for an example.
 
