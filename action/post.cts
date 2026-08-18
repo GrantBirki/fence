@@ -10,8 +10,10 @@ const {
   actionRuntimeFileDigests,
   correlateFindingsToDns,
   findingAttributionDebugLines,
+  materializationRejectionReasons,
   materializationRequestRejections,
   materializationEvidenceCounter,
+  materializationWarning,
   MAX_REPORT_BYTES,
   networkReportLines,
   readJsonBounded,
@@ -274,6 +276,7 @@ function main(): void {
     `source_truncated=${auditSummary.sourceTruncated}`,
     `materialization_batch_count=${materializationEvidenceCounter(dnsEvidence, "materialization_batch_count")}`,
     `materialization_request_rejections=${dnsMaterializationRequestRejections}`,
+    `materialization_rejection_reasons=${JSON.stringify(materializationRejectionReasons(dnsEvidence))}`,
     `materialization_update_max_milliseconds=${materializationEvidenceCounter(dnsEvidence, "materialization_update_max_milliseconds")}`,
     `upstream_request_failures=${materializationEvidenceCounter(dnsEvidence, "upstream_request_failures")}`,
     `user_wildcard_authorizations=${Array.isArray(dnsEvidence?.bounded_user_wildcard_authorizations) ? dnsEvidence.bounded_user_wildcard_authorizations.length : "unknown"}`,
@@ -305,10 +308,9 @@ function main(): void {
   if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
     log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
   }
-  if (dnsMaterializationRequestRejections > 0) {
-    log.warning(
-      `Fence withheld ${dnsMaterializationRequestRejections} DNS answer(s) because firewall update work could not be accepted`,
-    );
+  const dnsWarning = materializationWarning(dnsEvidence);
+  if (dnsWarning) {
+    log.warning(dnsWarning);
   }
   if (userWildcardRequestRejections > 0) {
     log.warning(

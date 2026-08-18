@@ -167,7 +167,7 @@ jobs:
           path: |
             ${{ runner.temp }}/fence-action-candidate/action/bin/fence
             ${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   action:
