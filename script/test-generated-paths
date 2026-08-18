@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-generated-paths"
+fi
+
+tmp_root="$(make_temp_dir fence-generated-paths "$RUNNER_TEMP")"
+link="$DIR/target/generated-path-symlink-$$"
+cleanup() {
+  remove_generated_path "$link" "generated-path regression link" 2>/dev/null || true
+  remove_generated_path "$tmp_root" "generated-path regression root" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mkdir -p "$tmp_root/outside" "$DIR/target"
+ln -s "$tmp_root/outside" "$link"
+
+output=""
+if output="$(clear_generated_dir "$link" "generated-path regression directory" 2>&1)"; then
+  die "clear_generated_dir unexpectedly accepted a symbolic-link directory"
+fi
+if ! grep -Fq "must not be a symbolic link" <<< "$output"; then
+  die "clear_generated_dir did not report the symbolic-link failure"
+fi
+if [[ ! -L "$link" ]]; then
+  die "generated-path regression changed the symbolic-link path"
+fi
+if find "$tmp_root/outside" -mindepth 1 -print -quit | grep -q .; then
+  die "generated-path regression modified the symlink target"
+fi
+
+echo -e "${GREEN}generated path symlink regression passed${OFF}"
