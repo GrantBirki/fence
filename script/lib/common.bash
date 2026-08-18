@@ -137,6 +137,9 @@ clear_generated_dir() {
   local description="$2"
 
   require_generated_path "$path" "$description"
+  if [[ -L "$path" ]]; then
+    die "${description} must not be a symbolic link: $path"
+  fi
   mkdir -p "$path"
   find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
