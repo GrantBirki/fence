@@ -199,8 +199,12 @@ fn send_config_and_wait_for_ack(socket: &Socket, bytes: &[u8]) -> Result<(), Nfl
 fn receive_datagram(socket: &Socket) -> std::io::Result<Vec<u8>> {
     let mut bytes = vec![0_u8; RECEIVE_BUFFER_BYTES];
     let mut output = &mut bytes[..];
-    let length = socket.recv(&mut output, 0)?;
-    if length > RECEIVE_BUFFER_BYTES {
+    let length = socket.recv(&mut output, libc::MSG_TRUNC)?;
+    finish_received_datagram(bytes, length)
+}
+
+fn finish_received_datagram(mut bytes: Vec<u8>, length: usize) -> std::io::Result<Vec<u8>> {
+    if length > bytes.len() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "NFLOG datagram exceeded bounded receive buffer",
@@ -392,6 +396,16 @@ mod tests {
         let length = bytes.len() as u32;
         bytes[..4].copy_from_slice(&length.to_ne_bytes());
         bytes
+    }
+
+    #[test]
+    fn rejects_truncated_datagrams() {
+        assert_eq!(
+            finish_received_datagram(vec![0; RECEIVE_BUFFER_BYTES], RECEIVE_BUFFER_BYTES + 1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]
