@@ -48,10 +48,11 @@ function sanitizeLogText(value: unknown, maximumBytes = MAX_LOG_LINE_BYTES): str
 }
 
 function workflowEscape(value: unknown): string {
-  return sanitizeLogText(value, MAX_DEBUG_LINE_BYTES)
+  const escaped = sanitizeLogText(value, MAX_DEBUG_LINE_BYTES)
     .replace(/%/g, "%25")
     .replace(/\r/g, "%0D")
     .replace(/\n/g, "%0A");
+  return truncateUtf8(escaped, MAX_DEBUG_LINE_BYTES);
 }
 
 function colorize(value: string, color: ColorName, environment: LogEnvironment = process.env): string {
