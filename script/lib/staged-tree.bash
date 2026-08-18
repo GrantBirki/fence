@@ -35,12 +35,12 @@ publish_staged_generated_tree() {
       rm -rf "$backup"
     fi
     return 0
+  else
+    local status="$?"
+    rm -rf "$destination"
+    if [[ "$had_previous" == "true" ]]; then
+      mv "$backup" "$destination" || return 1
+    fi
+    return "$status"
   fi
-
-  local status="$?"
-  rm -rf "$destination"
-  if [[ "$had_previous" == "true" ]]; then
-    mv "$backup" "$destination" || return 1
-  fi
-  return "$status"
 }
