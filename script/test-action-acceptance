@@ -510,6 +510,45 @@ case "$scenario" in
     ;;
 esac
 
+if [[ "$scenario" != "audit" ]]; then
+  if [[ "$scenario" == "standard-opt-out" ]]; then
+    probe_https_once https://productionresultssa19.blob.core.windows.net
+  else
+    probe_https_once https://github.com
+  fi
+  python3 -E - "$scenario" <<'PY'
+import random
+import socket
+import struct
+import sys
+
+hostnames = ["outside-policy.fence.invalid"]
+if sys.argv[1] == "standard-opt-out":
+    hostnames.append("github.com")
+for hostname in hostnames:
+    identifier = random.randrange(65536)
+    question = b"".join(bytes([len(label)]) + label for label in hostname.encode("ascii").split(b"."))
+    question += b"\x00" + struct.pack("!HH", 1, 1)
+    packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.settimeout(2)
+        connection.connect(("127.0.0.1", 53))
+        connection.send(packet)
+        response = connection.recv(4096)
+    if len(response) < 12:
+        raise SystemExit(f"Fence DNS refusal was incomplete: {hostname}")
+    observed_id, flags, questions, answers, authority, additional = struct.unpack("!HHHHHH", response[:12])
+    if not (
+        observed_id == identifier
+        and flags & 0x8000
+        and flags & 0x000F == 5
+        and (questions, answers, authority, additional) == (1, 0, 0, 0)
+        and response[12:] == question
+    ):
+        raise SystemExit(f"Fence did not refuse the outside-policy DNS request: {hostname}")
+PY
+fi
+
 if [[ "$scenario" == "wildcard-docker" ]]; then
   probe_https_once https://auth.docker.io
   probe_https_once https://registry-1.docker.io
@@ -545,6 +584,9 @@ import json
 import pathlib
 import sys
 import time
+
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
 
 expected_workers = [
     {"name": "host_tcp_dns", "status": "running"},
@@ -586,16 +628,7 @@ require(dns["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require(dns["hostname_policy"]["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
 require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
-materialization_rejections = dns.get("materialization_request_rejections")
-require(
-    type(materialization_rejections) is int
-    and 0 <= materialization_rejections <= (1 << 53) - 1,
-    "Fence DNS materialization rejection count must be a bounded nonnegative integer",
-)
-require(
-    materialization_rejections == 0,
-    "Fence Action acceptance must not reject verified DNS materializations",
-)
+validate_materialization_rejections(dns)
 require(dns["user_wildcard_request_rejections"] == 0)
 require(dns["bounded_user_wildcard_authorizations_truncated"] is False)
 wildcard_authorizations = dns["bounded_user_wildcard_authorizations"]
