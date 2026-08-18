@@ -18,7 +18,9 @@ const {
   defaultInlineConfig,
   findingAttributionDebugLines,
   launcherIntegrityDocument,
+  materializationRejectionReasons,
   materializationRequestRejections,
+  materializationWarning,
   materializationWarningLines,
   mountIdFromFdInfo,
   networkReportLines,
@@ -96,6 +98,17 @@ const githubArtifactCompatibilityLimitations = [
   "github_artifact_uploads_remain_an_intentional_data_egress_channel",
 ];
 
+function rejectionReasons(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    invalid_response: 0,
+    authorization_changed: 0,
+    capacity: 0,
+    queue_unavailable: 0,
+    firewall_update_failed: 0,
+    ...overrides,
+  };
+}
+
 function dnsEvidenceFor(
   currentReport: any = report,
   overrides: Record<string, unknown> = {},
@@ -123,6 +136,8 @@ function dnsEvidenceFor(
     },
     observations: [],
     observations_truncated: false,
+    materialization_request_rejections: 0,
+    materialization_rejection_reasons: rejectionReasons(),
     bounded_user_wildcard_authorizations: [],
     bounded_user_wildcard_authorizations_truncated: false,
     user_wildcard_request_rejections: 0,
@@ -3363,6 +3378,7 @@ test("reports bounded firewall, wildcard, and results-storage warning counters",
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 2,
+    materialization_rejection_reasons: rejectionReasons({ capacity: 2 }),
     user_wildcard_request_rejections: 3,
     bounded_user_wildcard_authorizations_truncated: true,
     results_storage_attribution_failures: 4,
@@ -3373,6 +3389,7 @@ test("reports bounded firewall, wildcard, and results-storage warning counters",
   const document = parsedStructuredNetworkReport(report, dnsEvidence);
   assert.equal(document.result, "warning");
   assert.equal(document.warnings.materialization_rejections, 2);
+  assert.deepEqual(document.warnings.materialization_rejection_reasons, rejectionReasons({ capacity: 2 }));
   assert.equal(document.warnings.wildcard_rejections, 3);
   assert.equal(document.warnings.wildcard_authorizations_truncated, true);
   assert.equal(document.warnings.results_storage_attribution_failures, 4);
@@ -3928,24 +3945,126 @@ test("renders DNS materialization request rejection evidence as a non-critical w
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 2,
+    materialization_rejection_reasons: rejectionReasons({
+      invalid_response: 1,
+      authorization_changed: 1,
+    }),
   };
   const structured = parsedStructuredNetworkReport(report, dnsEvidence);
   assert.equal(structured.result, "warning");
   assert.equal(structured.warnings.materialization_rejections, 2);
+  assert.deepEqual(structured.warnings.materialization_rejection_reasons, dnsEvidence.materialization_rejection_reasons);
   assert.equal(structured.warnings.critical_findings, 0);
   assert.equal(materializationRequestRejections(dnsEvidence), 2);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: -1 }), 0);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);
+  assert.equal(materializationWarning(undefined), undefined);
+  assert.equal(
+    materializationWarning(dnsEvidence),
+    "Fence withheld 2 DNS answer(s) after safety checks (invalid DNS reply: 1; expired or changed authorization: 1)",
+  );
   assert.match(
     materializationWarningLines(dnsEvidence).join("\n"),
-    /DNS answers withheld while firewall updates were unavailable \| `2`/,
+    /DNS answers withheld by safety checks .*invalid DNS reply: 1; expired or changed authorization: 1.* \| `2`/,
   );
   const summary = summaryLines(report, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(summary, /🟢/);
   assert.match(summary, /#### Warnings/);
-  assert.match(summary, /DNS answers withheld while firewall updates were unavailable/);
+  assert.match(summary, /DNS answers withheld by safety checks/);
   assert.doesNotMatch(summary, /Critical findings/);
+});
+
+test("validates fixed DNS rejection reasons and preserves critical firewall failures", () => {
+  const valid = dnsEvidenceFor(report, {
+    materialization_request_rejections: 3,
+    materialization_rejection_reasons: rejectionReasons({ invalid_response: 1, capacity: 2 }),
+  });
+  validateDnsEvidence(valid, report);
+  for (const reasons of [
+    undefined,
+    null,
+    [],
+    {},
+    rejectionReasons({ extra: 0 }),
+    rejectionReasons({ invalid_response: -1 }),
+    rejectionReasons({ invalid_response: "3" }),
+    rejectionReasons({ invalid_response: true }),
+    rejectionReasons({ invalid_response: Number.MAX_SAFE_INTEGER + 1 }),
+  ]) {
+    assert.throws(() => validateDnsEvidence({ ...valid, materialization_rejection_reasons: reasons }, report), /invalid rejection reasons/);
+  }
+  for (const [total, reasons] of [
+    [2, rejectionReasons({ invalid_response: 3 })],
+    [Number.MAX_SAFE_INTEGER, rejectionReasons({ invalid_response: Number.MAX_SAFE_INTEGER, capacity: 1 })],
+  ]) {
+    assert.throws(() => validateDnsEvidence({
+      ...valid,
+      materialization_request_rejections: total,
+      materialization_rejection_reasons: reasons,
+    }, report), /do not match the total/);
+  }
+  for (const total of [undefined, -1, "3", true, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => validateDnsEvidence({ ...valid, materialization_request_rejections: total }, report), /invalid rejection reasons/);
+  }
+
+  const reasons = rejectionReasons({ firewall_update_failed: 1 });
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(report, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  }), report), /missing its critical finding/);
+  const critical = {
+    ...report,
+    network_verification_status: "critical_dynamic_update_failed",
+    critical_findings: [{ code: "dns_block_dynamic_update_failed" }],
+    resident_health: residentHealth({ status: "critical" }),
+  };
+  const criticalDns = dnsEvidenceFor(critical, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  });
+  validateDnsEvidence(criticalDns, critical);
+  const structured = parsedStructuredNetworkReport(critical, criticalDns);
+  assert.equal(structured.result, "critical");
+  assert.equal(structured.warnings.materialization_rejection_reasons.firewall_update_failed, 1);
+  assert.throws(() => validateReport(critical), /critical resident findings/);
+
+  const truncatedCritical = {
+    ...critical,
+    network_verification_status: "verified",
+    critical_findings: Array.from({ length: 64 }, (_, index) => ({ code: `earlier_failure_${index}` })),
+    critical_findings_truncated: true,
+  };
+  const truncatedDns = dnsEvidenceFor(truncatedCritical, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  });
+  validateReport(truncatedCritical, false);
+  validateDnsEvidence(truncatedDns, truncatedCritical);
+  const truncated = parsedStructuredNetworkReport(truncatedCritical, truncatedDns);
+  assert.equal(truncated.result, "critical");
+  assert.equal(truncated.omissions.source_truncated, true);
+  assert.equal(truncated.warnings.materialization_rejection_reasons.firewall_update_failed, 1);
+  assert.throws(() => validateReport(truncatedCritical), /critical resident findings/);
+});
+
+test("never renders untrusted DNS rejection labels or values", () => {
+  const injected = {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: {
+      ...rejectionReasons({ capacity: 1 }),
+      invalid_response: "\n::warning::secret-value",
+      "https://example.com/?token=secret-value": 1,
+    },
+  };
+  assert.deepEqual(materializationRejectionReasons(injected), rejectionReasons({ capacity: 1 }));
+  const output = [
+    materializationWarning(injected),
+    ...materializationWarningLines(injected),
+    structuredReportLine(report, injected),
+  ].join("\n");
+  assert.match(output, /capacity limit reached: 1/);
+  assert.doesNotMatch(output, /secret-value|::warning::|https:\/\//);
 });
 
 test("renders bounded results-storage provenance warnings without a healthy indicator", () => {
@@ -3953,6 +4072,7 @@ test("renders bounded results-storage provenance warnings without a healthy indi
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 1,
+    materialization_rejection_reasons: rejectionReasons({ invalid_response: 1 }),
     results_storage_attribution_failures: 2,
     results_storage_request_rejections: 3,
     runner_authorized_results_storage_truncated: true,
