@@ -11,7 +11,7 @@ script/validate-test-tools
 script/test-action-release
 python3 -B -E "$DIR/script/lib/protected_finalization.py" --self-test
 script/test-rust-toolchain-preparation
-script/test-staged-tree
+bash "$DIR/script/test-staged-tree"
 
 case "${1:-}" in
   "" )
