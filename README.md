@@ -137,6 +137,10 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 
 See the [security guide](docs/security.md) for more details.
 
+## Development 🛠️
+
+See [Local development](docs/development.md) for build and test instructions. Hosted CI allows a bounded wait for complete blocked-event evidence without changing enforcement or the protected-finalization deadline.
+
 ## Further Reading 📚
 
 - [Getting started](docs/getting-started.md)
@@ -146,7 +150,6 @@ See the [security guide](docs/security.md) for more details.
 - [Security guide](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release provenance](docs/release-provenance.md)
-- [Local development](docs/development.md)
 - [CLI reference](docs/cli.md)
 - [Security policy](SECURITY.md)
 - [Fence v0 specification](docs/v0.md)
