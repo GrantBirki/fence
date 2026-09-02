@@ -137,6 +137,10 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 
 See the [security guide](docs/security.md) for more details.
 
+## Development 🛠️
+
+See [Local development](docs/development.md) for build and test instructions. The hosted blocked-event check allows up to 10 seconds to collect all 40 test events; Fence's enforcement and 180-second finalization limit are unchanged.
+
 ## Further Reading 📚
 
 - [Getting started](docs/getting-started.md)
@@ -146,7 +150,6 @@ See the [security guide](docs/security.md) for more details.
 - [Security guide](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release provenance](docs/release-provenance.md)
-- [Local development](docs/development.md)
 - [CLI reference](docs/cli.md)
 - [Security policy](SECURITY.md)
 - [Fence v0 specification](docs/v0.md)
