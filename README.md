@@ -139,7 +139,7 @@ See the [security guide](docs/security.md) for more details.
 
 ## Development 🛠️
 
-See [Local development](docs/development.md) for build and test instructions. The hosted blocked-event check allows up to 10 seconds to collect all 40 test events; Fence's enforcement and 180-second finalization limit are unchanged.
+See [Local development](docs/development.md) for build and test instructions. Hosted CI allows a bounded wait for complete blocked-event evidence without changing enforcement or the protected-finalization deadline.
 
 ## Further Reading 📚
 

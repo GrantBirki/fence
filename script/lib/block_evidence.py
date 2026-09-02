@@ -11,7 +11,13 @@ from unittest.mock import MagicMock, patch
 
 
 WAIT_SECONDS = 10
+POLL_SECONDS = 0.01
+MAX_DIAGNOSTIC_DESTINATIONS = 8
 DESTINATIONS = tuple(f"192.0.2.{index}" for index in range(10, 50))
+FINAL_PROBES = (
+    ("192.0.2.1", b"fence-action-final-block-probe"),
+    ("192.0.2.2", b"fence-action-post-block-probe"),
+)
 
 
 def require(condition, message):
@@ -95,9 +101,9 @@ def assert_block_evidence_drains(report_path):
             )
             break
         if now >= deadline:
-            missing_label = ",".join(missing[:8]) or "none"
-            if len(missing) > 8:
-                missing_label += f" (+{len(missing) - 8} more)"
+            missing_label = ",".join(missing[:MAX_DIAGNOSTIC_DESTINATIONS]) or "none"
+            if len(missing) > MAX_DIAGNOSTIC_DESTINATIONS:
+                missing_label += f" (+{len(missing) - MAX_DIAGNOSTIC_DESTINATIONS} more)"
             raise SystemExit(
                 f"blocked-event evidence incomplete after {WAIT_SECONDS}s: "
                 f"matched={len(DESTINATIONS) - len(missing)}/{len(DESTINATIONS)}; "
@@ -105,18 +111,19 @@ def assert_block_evidence_drains(report_path):
                 f"sampled={counter_label(before_sampled)}->{counter_label(sampled)}; "
                 f"missing={missing_label}"
             )
-        time.sleep(min(0.01, deadline - now))
+        time.sleep(min(POLL_SECONDS, deadline - now))
 
-    for suffix, payload in ((1, b"fence-action-final-block-probe"), (2, b"fence-action-post-block-probe")):
+    for destination, payload in FINAL_PROBES:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             try:
-                probe.sendto(payload, (f"192.0.2.{suffix}", 443))
+                probe.sendto(payload, (destination, 443))
             except OSError:
                 pass
 
 
 class BlockEvidenceTests(unittest.TestCase):
-    def evidence(self, count):
+    def evidence(self, count=None):
+        count = len(DESTINATIONS) if count is None else count
         return {
             "mode": "block",
             "network_verification_status": "verified",
@@ -160,43 +167,43 @@ class BlockEvidenceTests(unittest.TestCase):
         return error, elapsed, probe.sendto.call_args_list
 
     def test_complete_evidence_returns_without_waiting(self):
-        error, elapsed, sends = self.run_probe(self.evidence(40))
+        error, elapsed, sends = self.run_probe(self.evidence())
         self.assertIsNone(error)
         self.assertEqual(elapsed, 0)
-        self.assertEqual(len(sends), 42)
-        self.assertEqual(sends[-2].args[1], ("192.0.2.1", 443))
-        self.assertEqual(sends[-1].args[1], ("192.0.2.2", 443))
+        expected = [(b"fence-action-block-probe", (item, 443)) for item in DESTINATIONS]
+        expected.extend((payload, (item, 443)) for item, payload in FINAL_PROBES)
+        self.assertEqual([send.args for send in sends], expected)
 
     def test_delayed_complete_evidence_passes_without_resending(self):
-        for delay in (2, 8, 10):
+        for delay in (WAIT_SECONDS / 2, WAIT_SECONDS - POLL_SECONDS, WAIT_SECONDS):
             with self.subTest(delay=delay):
-                error, elapsed, sends = self.run_probe(self.evidence(40), delay=delay, send_error=True)
+                error, elapsed, sends = self.run_probe(self.evidence(), delay=delay, send_error=True)
                 self.assertIsNone(error)
                 self.assertEqual(elapsed, delay)
-                self.assertEqual(len(sends), 42)
+                self.assertEqual(len(sends), len(DESTINATIONS) + len(FINAL_PROBES))
 
     def test_evidence_after_deadline_fails(self):
-        error, elapsed, sends = self.run_probe(self.evidence(40), delay=10.01)
-        self.assertIn("matched=0/40", error)
-        self.assertEqual(elapsed, 10)
-        self.assertEqual(len(sends), 40)
+        error, elapsed, sends = self.run_probe(self.evidence(), delay=WAIT_SECONDS + POLL_SECONDS)
+        self.assertIn(f"matched=0/{len(DESTINATIONS)}", error)
+        self.assertEqual(elapsed, WAIT_SECONDS)
+        self.assertEqual(len(sends), len(DESTINATIONS))
 
     def test_missing_event_fails_even_with_complete_counters(self):
-        report = self.evidence(40)
+        report = self.evidence()
         report["findings"].pop()
         error, elapsed, sends = self.run_probe(report)
-        self.assertIn("matched=39/40", error)
-        self.assertIn("missing=192.0.2.49", error)
-        self.assertEqual(elapsed, 10)
-        self.assertEqual(len(sends), 40)
+        self.assertIn(f"matched={len(DESTINATIONS) - 1}/{len(DESTINATIONS)}", error)
+        self.assertIn(f"missing={DESTINATIONS[-1]}", error)
+        self.assertEqual(elapsed, WAIT_SECONDS)
+        self.assertEqual(len(sends), len(DESTINATIONS))
 
     def test_each_destination_needs_a_blocked_udp_443_event(self):
         for field, value in (("classification", "allowed"), ("protocol", "tcp"), ("remote_port", 80)):
             with self.subTest(field=field):
-                report = self.evidence(40)
+                report = self.evidence()
                 report["findings"][-1][field] = value
                 report["findings"].append(report["findings"][0])
-                self.assertIn("matched=39/40", self.run_probe(report)[0])
+                self.assertIn(f"matched={len(DESTINATIONS) - 1}/{len(DESTINATIONS)}", self.run_probe(report)[0])
 
     def test_invalid_evidence_never_passes(self):
         cases = [
@@ -206,25 +213,26 @@ class BlockEvidenceTests(unittest.TestCase):
         ]
         for field, value in cases:
             with self.subTest(field=field):
-                report = self.evidence(40)
+                report = self.evidence()
                 report[field] = value
                 self.assertIsNotNone(self.run_probe(report)[0])
         for field in ("total_violations", "sampled_violations"):
-            for value in (-1, True, "40", None, 39, 1 << 64):
+            for value in (-1, True, str(len(DESTINATIONS)), None, len(DESTINATIONS) - 1, 1 << 64):
                 with self.subTest(field=field, value=value):
-                    report = self.evidence(40)
+                    report = self.evidence()
                     report["counters"][field] = value
                     self.assertIsNotNone(self.run_probe(report)[0])
 
     def test_counter_reset_requires_new_firewall_epoch(self):
         initial = self.evidence(0)
-        initial["counters"] = {"total_violations": 100, "sampled_violations": 100}
-        report = self.evidence(40)
-        report["counters"]["sampled_violations"] = 140
+        baseline = len(DESTINATIONS) * 2
+        initial["counters"] = {"total_violations": baseline, "sampled_violations": baseline}
+        report = self.evidence()
+        report["counters"]["sampled_violations"] = baseline + len(DESTINATIONS)
         self.assertIsNotNone(self.run_probe(report, initial=initial)[0])
         report["ruleset_hash"] = "b" * 64
         self.assertIsNone(self.run_probe(report, initial=initial)[0])
-        report["counters"]["sampled_violations"] = 40
+        report["counters"]["sampled_violations"] = len(DESTINATIONS)
         self.assertIsNotNone(self.run_probe(report, initial=initial)[0])
 
     def test_diagnostics_are_bounded_and_do_not_echo_report_text(self):
@@ -235,19 +243,21 @@ class BlockEvidenceTests(unittest.TestCase):
         report["findings"] = [{"remote_address": untrusted, "message": untrusted}]
         error, _, _ = self.run_probe(report)
         self.assertIn("total=0->invalid; sampled=0->invalid", error)
-        self.assertIn("(+32 more)", error)
+        omitted = len(DESTINATIONS) - MAX_DIAGNOSTIC_DESTINATIONS
+        if omitted > 0:
+            self.assertIn(f"(+{omitted} more)", error)
         self.assertLess(len(error), 512)
         self.assertNotRegex(error, r"[\x00-\x1f\x7f]|::error::|untrusted-report-text")
 
     def test_payload_leak_and_invalid_baseline_fail(self):
-        report = self.evidence(40)
+        report = self.evidence()
         report["message"] = "fence-action-block-probe"
         self.assertIn("retained packet payload", self.run_probe(report)[0])
         for field, value in (("mode", "audit"), ("counters", None), ("ruleset_hash", "invalid")):
             with self.subTest(field=field):
                 initial = self.evidence(0)
                 initial[field] = value
-                error, elapsed, sends = self.run_probe(self.evidence(40), initial=initial)
+                error, elapsed, sends = self.run_probe(self.evidence(), initial=initial)
                 self.assertIsNotNone(error)
                 self.assertEqual((elapsed, len(sends)), (0, 0))
 
