@@ -16,6 +16,8 @@ script/build
 
 Once the toolchain is ready, `script/bootstrap`, `script/test`, `script/lint`, and `script/build` run offline using the checked-in dependencies and toolchain locks.
 
+`script/test` includes offline tests for the hosted blocked-event check. That check waits up to ten seconds for all 40 test events, allowing DNS refreshes and security checks to finish between batches. Missing events still fail the check; Fence's enforcement and 180-second finalization limit are unchanged.
+
 ## Update Dependencies
 
 These update scripts need network access:

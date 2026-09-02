@@ -142,7 +142,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test`
   - Validates the release-tool lockfile and manifest before running tests.
   - Validates the test-tool lockfile and manifest before running tests.
-  - Runs the offline Action release-state and protected-finalization regression suites before Rust tests.
+  - Runs the offline Action release-state, protected-finalization, and blocked-event evidence regression suites before Rust tests.
   - Runs `cargo test --frozen` by default.
   - `--coverage`, `--cov`, or `-c` requires `cargo-llvm-cov` from `script/install-test-tools` and `llvm-tools-preview` from `script/prepare-rust`.
   - Coverage mode writes text, JSON, LCOV, and HTML reports under `coverage/`.
@@ -263,7 +263,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.
   - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Standard block also proves the root-owned Action runtime is mounted read-only, `nodev`, and `nosuid`, and that runner-user overwrite, unlink, chmod, rename, and replacement attempts fail for every executable wrapper file and the bundled agent. The registered pathname is protected separately by writable self-bind guards on every runner-renameable ancestor. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
   - Hosted DNS checks must prove their own allowed and denied requests, validate the bounded refusal reasons, and reject firewall-update failures. A safely refused background runner lookup must not fail the suite by itself. Keep the quiet finalization replicas free of synthetic traffic.
-  - Standard block also proves a bounded 40-packet denied direct-IP burst and its final rejected packet appear promptly in root-owned NFLOG evidence without retaining packet payloads. Keep this synthetic traffic outside all three quiet finalization replicas.
+  - Standard block also proves a bounded 40-packet denied direct-IP burst and its final rejected packet appear in root-owned NFLOG evidence without retaining packet payloads. Allow up to ten seconds for the burst evidence, returning as soon as all 40 events and counters are verified; never resend the burst or accept partial evidence. Timeout diagnostics may print only bounded counters and up to eight missing fixed test destinations. Keep this synthetic traffic outside all three quiet finalization replicas and preserve the 180-second protected-finalization deadline.
   - The `github-artifacts` scenario activates block mode with `allow_github_artifacts: true`, resolves one exact reviewed results-storage fixture as the runner user, uploads one small innocuous one-day-retained file through the full-SHA-pinned official artifact action, and verifies the resulting opt-in account provenance and unchanged firewall, sudo, and container controls.
   - The `wildcard-docker` scenario builds a local scratch image without network access and repeatedly creates, starts, stops, and removes containers across at least three resident verification intervals without weakening local-control checks.
   - Must not stop the service, restore controls, download an agent, or fetch policy.
